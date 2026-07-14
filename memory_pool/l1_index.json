@@ -38,7 +38,9 @@
   },
   "tabular_deep_learning": {
     "description": "Neural networks designed specifically for tabular data (MLPs, Attention architectures).",
-    "l2_pointers": []
+    "l2_pointers": [
+      "gradient_reversal_domain_adaptation"
+    ]
   },
   "blending_stacking": {
     "description": "Meta-ensembling techniques including rank blending and stacking algorithms.",

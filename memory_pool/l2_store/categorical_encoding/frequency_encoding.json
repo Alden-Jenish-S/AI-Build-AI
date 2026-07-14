@@ -21,5 +21,6 @@
     "source_url_or_run_id": "manual"
   },
   "verified": true,
-  "verification_log": "Passed sandbox verification at 2026-07-09 20:53:05.\nOutput:\nSUCCESS"
+  "verification_log": "Passed subprocess verification at 2026-07-14 14:13:07.\nOutput:\nFunction returned type: tuple\nResult length: 2\nTuple of 2 elements\nSUCCESS",
+  "verification_level": "shape-only-mock-data"
 }

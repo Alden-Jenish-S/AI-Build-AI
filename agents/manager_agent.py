@@ -1,5 +1,6 @@
 import os
 import json
+import math
 from pathlib import Path
 from typing import Dict, Any, List
 from tree.node import NodeState
@@ -10,11 +11,20 @@ from .technique_agent import TechniqueAgent
 from .implementation_agent import ImplementationAgent
 from .setup_agent import SetupAgent
 from memory_pool.builder.l2_builder import L2Builder
+from runtime_utils import validate_path_component
 
 class ManagerAgent:
-    def __init__(self, task_name: str, total_budget: int = 10, venv_path: str = "./.venv/bin/python", baseline_score: float = None, model_name: str = None):
-        self.task_name = task_name
+    def __init__(self, task_name: str, total_budget: int = 10, venv_path: str = "./.venv/bin/python", baseline_score: float = None, model_name: str = None, run_suffix: str = None):
+        self.task_name = validate_path_component(task_name, "task_name")
+        if run_suffix is not None:
+            run_suffix = validate_path_component(run_suffix, "run_suffix")
+        if not isinstance(total_budget, int) or isinstance(total_budget, bool) or total_budget < 1:
+            raise ValueError(f"total_budget must be a positive integer, got {total_budget!r}")
         self.total_budget = total_budget
+        if baseline_score is not None:
+            baseline_score = float(baseline_score)
+            if not math.isfinite(baseline_score):
+                raise ValueError("baseline_score must be finite")
         self.baseline_score = baseline_score
         self.model_name = model_name
         
@@ -44,8 +54,13 @@ class ManagerAgent:
         else:
             self.venv_path = resolved_path
         
-        self.task_dir = self.project_root / "tasks" / task_name
-        self.run_root = self.project_root / "runs" / task_name
+        self.task_dir = self.project_root / "tasks" / self.task_name
+        if not self.task_dir.is_dir():
+            raise FileNotFoundError(f"Task directory does not exist: {self.task_dir}")
+        if run_suffix:
+            self.run_root = self.project_root / "runs" / self.task_name / run_suffix
+        else:
+            self.run_root = self.project_root / "runs" / self.task_name
         self.run_root.mkdir(parents=True, exist_ok=True)
         
         # Core components
@@ -71,6 +86,21 @@ class ManagerAgent:
                 self.subprocess_timeout = task_config.get("subprocess_timeout", 300)
             except Exception as e:
                 print(f"ManagerAgent WARNING: Failed to parse task_config.json: {e}")
+        if self.metric_direction not in {"maximize", "minimize"}:
+            raise ValueError(
+                f"task_config metric_direction must be 'maximize' or 'minimize', "
+                f"got {self.metric_direction!r}"
+            )
+        if (
+            not isinstance(self.subprocess_timeout, (int, float))
+            or isinstance(self.subprocess_timeout, bool)
+            or not math.isfinite(self.subprocess_timeout)
+            or self.subprocess_timeout <= 0
+        ):
+            raise ValueError(
+                f"task_config subprocess_timeout must be positive and finite, "
+                f"got {self.subprocess_timeout!r}"
+            )
         
         # Load clean task description for web search queries (Bug 3: prevents branch bias leakage)
         self.task_description = f"Tabular ML task: {task_name}"
@@ -88,6 +118,68 @@ class ManagerAgent:
         self.node_counter += 1
         return f"node_{self.node_counter}"
 
+    def _node_payload(self, node: NodeState) -> Dict[str, Any]:
+        """Return the durable, compact representation used by files and plots."""
+        result = None
+        if node.result:
+            result = {
+                "score": node.result.get("score"),
+                "status": node.result.get("status"),
+            }
+            diagnostics = node.result.get("diagnostics")
+            if diagnostics:
+                result["diagnostics_tail"] = str(diagnostics)[-4000:]
+        return {
+            "node_id": node.node_id,
+            "parent_id": node.parent_id,
+            "node_type": node.node_type,
+            "plan": node.plan,
+            "code": node.code,
+            "config": node.config,
+            "result": result,
+            "executed": node.executed,
+            "status": (
+                "pending"
+                if not node.executed
+                else (result or {}).get("status", "completed")
+            ),
+            "visits": node.visits,
+            "total_reward": node.total_reward,
+            "children_ids": list(node.children_ids),
+        }
+
+    def _persist_node(self, node_id: str) -> None:
+        """Persist every agent node, including pending technique/frontier nodes."""
+        if node_id == "root" or node_id not in self.all_nodes:
+            return
+        node = self.all_nodes[node_id]
+        node_dir = self.run_root / node_id
+        node_dir.mkdir(parents=True, exist_ok=True)
+        with open(node_dir / "node_state.json", "w", encoding="utf-8") as f:
+            json.dump(self._node_payload(node), f, indent=2, default=str)
+        if node.node_type == "technique":
+            with open(node_dir / "technique_plan.md", "w", encoding="utf-8") as f:
+                f.write((node.plan or "") + "\n")
+        technique_record = (node.config or {}).get("technique_record")
+        if technique_record:
+            with open(node_dir / "technique_record.json", "w", encoding="utf-8") as f:
+                json.dump(technique_record, f, indent=2, default=str)
+
+    def _persist_tree_state(self) -> None:
+        """Write the canonical tree used to generate method_tree.png."""
+        payload = {
+            "task_name": self.task_name,
+            "metric_direction": self.metric_direction,
+            "baseline_score": self.baseline_score,
+            "budget": self.total_budget,
+            "nodes": {
+                node_id: self._node_payload(node)
+                for node_id, node in self.all_nodes.items()
+            },
+        }
+        with open(self.run_root / "tree_state.json", "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, default=str)
+
     def initialize_task(self, temperature: float = 0.2):
         """
         Deletes any pre-existing initial algorithms/dataloaders and calls the 
@@ -97,14 +189,26 @@ class ManagerAgent:
         
         loader_path = self.task_dir / "initial_dataloader.py"
         algo_path = self.task_dir / "initial_algorithm.py"
-        
-        if loader_path.exists():
-            loader_path.unlink()
-        if algo_path.exists():
-            algo_path.unlink()
-            
-        initial_agent = InitialAgent(model_name=self.model_name)
-        initial_agent.generate_initial_code(self.task_dir, temperature=temperature)
+
+        original_files = {
+            path: path.read_bytes() for path in (loader_path, algo_path) if path.exists()
+        }
+        try:
+            for path in (loader_path, algo_path):
+                if path.exists() or path.is_symlink():
+                    path.unlink()
+
+            initial_agent = InitialAgent(model_name=self.model_name)
+            initial_agent.generate_initial_code(self.task_dir, temperature=temperature)
+            if not loader_path.is_file() or not algo_path.is_file():
+                raise RuntimeError("InitialAgent did not produce both required baseline files")
+        except Exception:
+            for path in (loader_path, algo_path):
+                if path.exists() or path.is_symlink():
+                    path.unlink()
+                if path in original_files:
+                    path.write_bytes(original_files[path])
+            raise
         print("ManagerAgent: Baseline generated successfully!")
 
     def run_tree_search(self) -> str:
@@ -130,16 +234,12 @@ class ManagerAgent:
             executed=True
         )
         
-        # 2. Spawn 3 initial strategic branches dynamically
-        try:
-            dynamic_approaches = self.technique_agent.generate_initial_approaches(self.task_description)
-        except Exception as e:
-            print(f"ManagerAgent WARNING: Failed to generate initial approaches: {e}. Falling back to default directions.")
-            dynamic_approaches = [
-                {"name": "Branch_A_Ensembling", "plan": "Stronger GBDT ensembling: bias queries towards GBDT ensembling and stacking."},
-                {"name": "Branch_B_Features", "plan": "Richer feature engineering: bias queries towards feature engineering, category encoding, and imputation."},
-                {"name": "Branch_C_DeepLearning", "plan": "Alternative model family: bias queries towards tabular deep learning and neural models."}
-            ]
+        # 2. Spawn 3 initial strategic branches authored by the LLM.
+        # If ideation fails, stop clearly instead of silently biasing the run with canned defaults.
+        dynamic_approaches = self.technique_agent.generate_initial_approaches(self.task_description)
+        print("ManagerAgent: LLM initial branch ideas:")
+        for idx, app in enumerate(dynamic_approaches, start=1):
+            print(f"  {idx}. {app.get('name', 'unnamed_branch')}: {app.get('plan', '')}")
         
         root_node = self.all_nodes[root_id]
         
@@ -155,7 +255,10 @@ class ManagerAgent:
             )
             self.all_nodes[node_id] = child_node
             root_node.children_ids.append(node_id)
+            self._persist_node(node_id)
             print(f"ManagerAgent: Spawned branch {node_id}: {name} (Plan: {plan[:60]}...)")
+
+        self._persist_tree_state()
 
         # Load L1 index for the technique agents
         l1_path = self.project_root / "memory_pool" / "l1_index.json"
@@ -169,6 +272,9 @@ class ManagerAgent:
             
             # Select node to execute/expand using UCB1 scheduler
             selected_id = self.scheduler.select_next_node(root_id, self.all_nodes)
+            if selected_id is None:
+                print("ManagerAgent: Search tree is exhausted; stopping early.")
+                break
             node = self.all_nodes[selected_id]
             print(f"ManagerAgent: Selected Node {selected_id} (Type: {node.node_type})")
             
@@ -181,9 +287,15 @@ class ManagerAgent:
                 traceback.print_exc()
                 # Mark node as executed-but-failed so we don't re-select it
                 node.executed = True
-                node.result = {"score": None, "diagnostics": f"Node exception: {e}"}
+                node.result = {
+                    "score": None,
+                    "status": "failed",
+                    "diagnostics": f"Node exception: {e}",
+                }
                 # Backpropagate zero reward so UCB1 stats stay consistent
                 self.scheduler.backpropagate(selected_id, 0.0, self.all_nodes)
+                self._persist_node(selected_id)
+                self._persist_tree_state()
                 continue
                 
         # Find best leaf node (skip failed nodes with score=None)
@@ -210,6 +322,9 @@ class ManagerAgent:
             
         # Save final method tree image
         try:
+            for node_id in self.all_nodes:
+                self._persist_node(node_id)
+            self._persist_tree_state()
             tree_img_path = self.run_root / "method_tree.png"
             self.save_tree_image(tree_img_path)
         except Exception as e:
@@ -221,6 +336,10 @@ class ManagerAgent:
         """Executes a single node (technique or implementation). Extracted for try/except isolation."""
         if node.node_type == "technique":
             print(f"ManagerAgent: Running Technique Agent on {selected_id}...")
+
+            # Pool additions from earlier nodes in this same run must be visible.
+            with open(l1_path, 'r', encoding='utf-8') as f:
+                l1_index = json.load(f)
             
             # Fetch sibling/parent records from global memory
             context = self.global_memory.get_default_context(selected_id, self.all_nodes)
@@ -232,11 +351,22 @@ class ManagerAgent:
                 global_memory_context=context,
                 l1_index=l1_index
             )
+            node.config = {"technique_record": tech_record}
+            self._persist_node(selected_id)
             
             # Pre-allocate child Implementation node ID and create its directory
             child_id = self.get_new_node_id()
             node_dir = self.run_root / child_id
             node_dir.mkdir(parents=True, exist_ok=True)
+            child_node = NodeState(
+                node_id=child_id,
+                parent_id=selected_id,
+                node_type="implementation",
+                config={"technique_record": tech_record}
+            )
+            self.all_nodes[child_id] = child_node
+            node.children_ids.append(child_id)
+            self._persist_node(child_id)
             
             # If pool miss, dynamically build and verify locally in child's node_dir!
             if tech_record.get("status") == "pool_miss":
@@ -251,13 +381,48 @@ class ManagerAgent:
                 
                 if success:
                     print(f"ManagerAgent: Successfully verified local artifact {artifact_id} in category '{category}'!")
-                    tech_record["status"] = "pool_miss_pending"  # Wait for run to complete successfully and exceed baseline
                     tech_record["artifact_id"] = artifact_id
                     tech_record["category"] = category
                     tech_record["model_card"] = model_card
                     tech_record["plan"] = f"Import and use local bootstrapped artifact {artifact_id} from category {category}."
+                    tech_record["status"] = "local_verified"
+
+                    # A verified reusable method belongs in the memory pool even
+                    # before it beats this task's baseline. Task performance is
+                    # recorded separately after implementation.
+                    use_pool = os.environ.get("ABLATION_USE_POOL", "1") != "0"
+                    if use_pool:
+                        committed = builder.commit_artifact(
+                            category=category,
+                            artifact_id=artifact_id,
+                            local_code_file=node_dir / f"{artifact_id}.py",
+                            local_card_file=node_dir / f"{artifact_id}.json",
+                        )
+                        tech_record["pool_committed"] = committed
+                        if committed:
+                            tech_record["status"] = "pool_added"
+                            print(
+                                f"ManagerAgent: Added verified web artifact {artifact_id} "
+                                "to the global memory pool."
+                            )
                 else:
-                    print("ManagerAgent WARNING: Failed to verify bootstrapped web technique locally. Will fall back to standard baseline algorithm.")
+                    tech_record["status"] = "bootstrap_failed"
+                    tech_record["candidate_artifact"] = {
+                        "category": category,
+                        "artifact_id": artifact_id,
+                        "model_card": model_card,
+                    }
+                    tech_record["plan"] = (
+                        "Use a self-contained baseline improvement because the web-derived "
+                        f"artifact {artifact_id or '<unknown>'} failed verification."
+                    )
+                    print(
+                        "ManagerAgent WARNING: Web-derived artifact failed verification; "
+                        "preserved it in the node directory and will use a self-contained fallback."
+                    )
+
+            node.config = {"technique_record": tech_record}
+            child_node.config = {"technique_record": tech_record}
             
             # Record to global memory
             self.global_memory.record_technique(selected_id, tech_record.get("plan", ""), "succeeded")
@@ -267,16 +432,9 @@ class ManagerAgent:
             
             # Reward for technique node is epsilon (0.01)
             self.scheduler.backpropagate(selected_id, 0.01, self.all_nodes)
-            
-            # Spawn child Implementation node
-            child_node = NodeState(
-                node_id=child_id,
-                parent_id=selected_id,
-                node_type="implementation",
-                config={"technique_record": tech_record}
-            )
-            self.all_nodes[child_id] = child_node
-            node.children_ids.append(child_id)
+            self._persist_node(selected_id)
+            self._persist_node(child_id)
+            self._persist_tree_state()
             print(f"ManagerAgent: Technique Node {selected_id} resolved. Spawned Implementation Node {child_id}")
             
         elif node.node_type == "implementation":
@@ -311,55 +469,56 @@ class ManagerAgent:
             
             if status == "failed":
                 print(f"ManagerAgent: Implementation Node {selected_id} FAILED. No score produced.")
+                if tech_record.get("pool_committed"):
+                    L2Builder(
+                        project_root=self.project_root,
+                        model_name=self.model_name,
+                        venv_path=self.venv_path,
+                    ).record_task_validation(
+                        tech_record.get("category"),
+                        tech_record.get("artifact_id"),
+                        {
+                            "task_name": self.task_name,
+                            "node_id": selected_id,
+                            "score": None,
+                            "metric_direction": self.metric_direction,
+                            "status": "failed",
+                        },
+                    )
                 # Record failure to global memory
                 self.global_memory.record_implementation(selected_id, {"node_id": selected_id}, 0.0, "failed")
                 # Backpropagate zero reward
                 self.scheduler.backpropagate(selected_id, 0.0, self.all_nodes)
+                self._persist_node(selected_id)
+                self._persist_tree_state()
                 # Do NOT spawn follow-up technique nodes from failed implementations
                 return
-            
-            # Check if we should commit this local technique to the global memory pool
-            use_pool = os.environ.get("ABLATION_USE_POOL", "1") != "0"
-            if use_pool and tech_record.get("status") == "pool_miss_pending" and score is not None:
-                # Exceeds baseline performance check
-                exceeds = False
-                if self.baseline_score is not None:
-                    if self.metric_direction == "maximize":
-                        exceeds = score > self.baseline_score
-                    else:
-                        exceeds = score < self.baseline_score
-                else:
-                    # If baseline_score is None, treat it as exceeding so we don't lose it (safe default)
-                    exceeds = True
-                    
-                if exceeds:
-                    print(f"ManagerAgent: Score {score:.5f} exceeds baseline performance ({self.baseline_score}). Committing to memory pool...")
-                    builder = L2Builder(project_root=self.project_root, model_name=self.model_name, venv_path=self.venv_path)
-                    category = tech_record.get("category")
-                    artifact_id = tech_record.get("artifact_id")
-                    
-                    local_code_file = node_dir / f"{artifact_id}.py"
-                    local_card_file = node_dir / f"{artifact_id}.json"
-                    
-                    if local_code_file.exists() and local_card_file.exists():
-                        commit_success = builder.commit_artifact(
-                            category=category,
-                            artifact_id=artifact_id,
-                            local_code_file=local_code_file,
-                            local_card_file=local_card_file
-                        )
-                        if commit_success:
-                            # Update status so downstream branches query it as pool_hit
-                            tech_record["status"] = "pool_hit"
-                            # Also update the card verified flag in local copy
-                            tech_record["model_card"]["verified"] = True
-                            print(f"ManagerAgent: Successfully committed {artifact_id} to global pool!")
-                        else:
-                            print(f"ManagerAgent WARNING: Failed to commit {artifact_id} to global pool.")
-                    else:
-                        print(f"ManagerAgent WARNING: Local technique files not found at {local_code_file} or {local_card_file}!")
-                else:
-                    print(f"ManagerAgent: Score {score:.5f} did not exceed baseline performance ({self.baseline_score}). Will NOT commit {tech_record.get('artifact_id')} to global pool.")
+
+            if tech_record.get("pool_committed"):
+                L2Builder(
+                    project_root=self.project_root,
+                    model_name=self.model_name,
+                    venv_path=self.venv_path,
+                ).record_task_validation(
+                    tech_record.get("category"),
+                    tech_record.get("artifact_id"),
+                    {
+                        "task_name": self.task_name,
+                        "node_id": selected_id,
+                        "score": score,
+                        "metric_direction": self.metric_direction,
+                        "status": status,
+                        "improved_over_baseline": (
+                            None
+                            if self.baseline_score is None
+                            else (
+                                score > self.baseline_score
+                                if self.metric_direction == "maximize"
+                                else score < self.baseline_score
+                            )
+                        ),
+                    },
+                )
             
             # Record to global memory
             self.global_memory.record_implementation(selected_id, {"node_id": selected_id}, score, "completed")
@@ -367,6 +526,8 @@ class ManagerAgent:
             # Normalize reward for UCB1 backpropagation.
             normalized_reward = score if self.metric_direction == "maximize" else -score
             self.scheduler.backpropagate(selected_id, normalized_reward, self.all_nodes)
+            self._persist_node(selected_id)
+            self._persist_tree_state()
             print(f"ManagerAgent: Implementation Node {selected_id} completed. Score: {score:.5f} (Normalized Reward: {normalized_reward:.5f})")
             
             # Spawn a new technique child so tree keeps growing
@@ -418,6 +579,9 @@ Propose a single advanced technique to improve it.
             )
             self.all_nodes[new_tech_id] = new_tech_node
             node.children_ids.append(new_tech_id)
+            self._persist_node(selected_id)
+            self._persist_node(new_tech_id)
+            self._persist_tree_state()
             print(f"ManagerAgent: Spawned follow-up Technique Node {new_tech_id} with plan: '{proposal_plan}'")
 
     def generate_final_submission(self, best_node_id: str):
@@ -427,10 +591,9 @@ Propose a single advanced technique to improve it.
         """
         if not best_node_id:
             print("ManagerAgent: No best node found to generate final submission.")
-            return
+            return False
             
         import pandas as pd
-        import shutil
         
         best_node_dir = self.run_root / best_node_id
         generated_sub_path = best_node_dir / "submission" / "submission.csv"
@@ -438,7 +601,7 @@ Propose a single advanced technique to improve it.
         
         if not generated_sub_path.exists():
             print(f"ManagerAgent WARNING: Generated submission file not found at {generated_sub_path}")
-            return
+            return False
             
         # Target output paths
         task_output_path = self.task_dir / "submission.csv"
@@ -449,32 +612,63 @@ Propose a single advanced technique to improve it.
             try:
                 sample_df = pd.read_csv(sample_sub_path)
                 generated_df = pd.read_csv(generated_sub_path)
+                if sample_df.empty or generated_df.empty:
+                    raise ValueError("submission files must not be empty")
                 
-                # Check column names
                 id_col = sample_df.columns[0]
+                prediction_cols = list(sample_df.columns[1:])
+                if not prediction_cols:
+                    raise ValueError("sample submission has no prediction columns")
+                if sample_df[id_col].duplicated().any():
+                    raise ValueError(f"sample submission contains duplicate {id_col!r} values")
+                missing_prediction_cols = [
+                    col for col in prediction_cols if col not in generated_df.columns
+                ]
+                if missing_prediction_cols:
+                    raise ValueError(
+                        f"generated submission is missing columns: {missing_prediction_cols}"
+                    )
                 
                 if id_col in generated_df.columns:
-                    # Merge generated predictions into the sample submission order
-                    merged_df = sample_df[[id_col]].merge(generated_df, on=id_col, how='left')
-                    for col in sample_df.columns:
-                        if col not in merged_df.columns:
-                            merged_df[col] = sample_df[col]
-                    final_df = merged_df[sample_df.columns].fillna(0)
+                    if generated_df[id_col].duplicated().any():
+                        raise ValueError(f"generated submission contains duplicate {id_col!r} values")
+                    if set(generated_df[id_col]) != set(sample_df[id_col]):
+                        raise ValueError("generated IDs do not exactly match sample submission IDs")
+                    aligned = generated_df.set_index(id_col).reindex(sample_df[id_col])
+                    final_df = sample_df[[id_col]].copy()
+                    for col in prediction_cols:
+                        final_df[col] = aligned[col].to_numpy()
                 else:
-                    print("ManagerAgent WARNING: ID column not found in generated submission. Falling back to direct copy.")
-                    final_df = generated_df
-                    
+                    if len(generated_df) != len(sample_df):
+                        raise ValueError(
+                            "generated submission has no ID column and its row count differs from the sample"
+                        )
+                    final_df = sample_df[[id_col]].copy()
+                    for col in prediction_cols:
+                        final_df[col] = generated_df[col].to_numpy()
+
+                if final_df[prediction_cols].isnull().any().any():
+                    raise ValueError("generated predictions contain missing values")
+
                 final_df.to_csv(task_output_path, index=False)
                 final_df.to_csv(run_output_path, index=False)
                 print(f"ManagerAgent: Aligned final submission saved to {task_output_path} and {run_output_path}")
+                return True
             except Exception as e:
-                print(f"ManagerAgent ERROR: Failed to align submission: {e}. Falling back to direct copy.")
-                shutil.copy(generated_sub_path, task_output_path)
-                shutil.copy(generated_sub_path, run_output_path)
+                print(f"ManagerAgent ERROR: Refusing invalid final submission: {e}")
+                return False
         else:
             print("ManagerAgent: No sample submission found. Copying best node submission directly.")
-            shutil.copy(generated_sub_path, task_output_path)
-            shutil.copy(generated_sub_path, run_output_path)
+            try:
+                generated_df = pd.read_csv(generated_sub_path)
+                if generated_df.empty or generated_df.isnull().any().any():
+                    raise ValueError("generated submission is empty or contains missing values")
+                generated_df.to_csv(task_output_path, index=False)
+                generated_df.to_csv(run_output_path, index=False)
+                return True
+            except Exception as e:
+                print(f"ManagerAgent ERROR: Refusing invalid final submission: {e}")
+                return False
 
     def save_tree_image(self, output_path: Path):
         """
@@ -504,33 +698,62 @@ Propose a single advanced technique to improve it.
         # --- Helper: prepare display text for a node and compute wrapped line count ---
         def get_node_display(node_id, node):
             if node_id == "root":
-                title = "Root (Baseline)"
-                desc = "Initial baseline search node"
+                title = "Search Root"
+                desc = "Virtual orchestration node"
                 color, border = "#E0E0E0", "#616161"
             elif node.node_type == "technique":
                 title = f"{node_id} (Technique)"
-                plan_text = node.plan or ""
-                if "plan=" in plan_text:
-                    plan_text = plan_text.split("plan=")[-1]
-                desc = plan_text
-                color, border = "#E3F2FD", "#1565C0"
+                if not node.executed:
+                    desc = f"PENDING — not executed within budget\n{node.plan or ''}"
+                    color, border = "#FFF8E1", "#F9A825"
+                else:
+                    tech_record = (node.config or {}).get("technique_record", {})
+                    tech_status = tech_record.get("status", "completed")
+                    artifact_id = tech_record.get("artifact_id")
+                    if tech_status == "pool_hit":
+                        desc = f"Pool hit: {artifact_id}"
+                    elif tech_status == "pool_added":
+                        desc = f"Web artifact added to pool: {artifact_id}"
+                    elif tech_status == "bootstrap_failed":
+                        candidate = tech_record.get("candidate_artifact", {}).get("artifact_id")
+                        desc = f"Candidate failed verification: {candidate}\nFallback plan retained"
+                    else:
+                        desc = node.plan or tech_record.get("plan", "Technique completed")
+                    color, border = "#E3F2FD", "#1565C0"
             else:  # implementation
                 res = node.result or {}
                 score = res.get("score")
                 status = res.get("status", "completed")
                 title = f"{node_id} (Implementation)"
-                if status == "failed" or score is None:
+                if not node.executed:
+                    desc = "PENDING — not executed within budget"
+                    color, border = "#FFF8E1", "#F9A825"
+                elif status == "failed" or score is None:
                     desc = "FAILED / Crashed"
                     color, border = "#FFEBEE", "#C62828"
                 else:
-                    desc = f"Score: {score:.5f}"
+                    tech_record = node.config.get("technique_record", {}) if node.config else {}
+                    artifact_id = tech_record.get("artifact_id")
+                    if artifact_id:
+                        desc = f"Use: {artifact_id}\nScore: {score:.5f}"
+                    elif tech_record.get("status") == "bootstrap_failed":
+                        desc = f"Use: Self-contained fallback\nScore: {score:.5f}"
+                    else:
+                        desc = f"Score: {score:.5f}"
                     color, border = "#E8F5E9", "#2E7D32"
 
             # Truncate very long descriptions
             if len(desc) > MAX_DESC_CHARS:
                 desc = desc[:MAX_DESC_CHARS] + "..."
 
-            wrapped_lines = textwrap.wrap(desc, width=WRAP_WIDTH) or [""]
+            desc_lines = desc.split("\n")
+            wrapped_lines = []
+            for d_line in desc_lines:
+                wrapped = textwrap.wrap(d_line, width=WRAP_WIDTH)
+                if wrapped:
+                    wrapped_lines.extend(wrapped)
+                else:
+                    wrapped_lines.append("")
             return title, wrapped_lines, color, border
 
         # --- Compute how tall each node's box is ---

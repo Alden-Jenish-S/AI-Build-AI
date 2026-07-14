@@ -4,13 +4,16 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import StratifiedKFold
 
 def train_and_predict(X_train, y_train, X_test):
+    X_train = np.asarray(X_train)
+    X_test = np.asarray(X_test)
+    y_train = np.asarray(y_train)
     # define base models
     from catboost import CatBoostClassifier
     from lightgbm import LGBMClassifier
     base_models = [
-        ("catboost", CatBoostClassifier()),
-        ("lgbm", LGBMClassifier()),
-        ("lr", LogisticRegression())
+        ("catboost", CatBoostClassifier(verbose=False, random_seed=42)),
+        ("lgbm", LGBMClassifier(verbose=-1, random_state=42)),
+        ("lr", LogisticRegression(max_iter=1000, random_state=42))
     ]
     n_folds = 5
     oof = np.zeros((X_train.shape[0], len(base_models)))
@@ -23,7 +26,7 @@ def train_and_predict(X_train, y_train, X_test):
             fold_model.fit(X_tr, y_tr)
             oof[hold_idx, i] = fold_model.predict_proba(X_ho)[:, 1]
         model.fit(X_train, y_train)
-    meta = LogisticRegression()
+    meta = LogisticRegression(max_iter=1000, random_state=42)
     meta.fit(oof, y_train)
     base_probs = np.column_stack([m.predict_proba(X_test)[:, 1] for _, m in base_models])
     meta_prob = meta.predict_proba(base_probs)[:, 1]

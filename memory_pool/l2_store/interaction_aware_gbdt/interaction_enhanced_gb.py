@@ -46,22 +46,13 @@ class InteractionEnhancedGB(BaseEstimator, ClassifierMixin):
         and return the top K pairs.
         """
         n_features = mi_scores.shape[0]
-        # Compute pair scores efficiently using broadcasting
-        # score(i,j) = mi[i] + mi[j]
-        pair_scores = mi_scores[:, None] + mi_scores[None, :]  # shape (n,n)
-        np.fill_diagonal(pair_scores, -np.inf)  # ignore i==j
-        # Get indices of the top K pairs (avoid duplicates i<j)
-        flat_idx = np.argpartition(pair_scores.ravel(), -self.top_k_interactions)[-self.top_k_interactions:]
-        # Convert flat indices to (i,j) and keep only i<j
-        pairs = np.column_stack(np.unravel_index(flat_idx, pair_scores.shape))
-        # Ensure ordering i<j to avoid duplicate (j,i)
-        ordered = np.sort(pairs, axis=1)
-        # Remove possible duplicates caused by symmetric scores
-        unique_pairs = np.unique(ordered, axis=0)
-        # If we have more than K after deduplication, trim
-        if len(unique_pairs) > self.top_k_interactions:
-            unique_pairs = unique_pairs[: self.top_k_interactions]
-        return [tuple(pair) for pair in unique_pairs]
+        if n_features < 2 or self.top_k_interactions <= 0:
+            return []
+        rows, cols = np.triu_indices(n_features, k=1)
+        scores = mi_scores[rows] + mi_scores[cols]
+        k = min(self.top_k_interactions, len(scores))
+        top_indices = np.argsort(scores, kind="stable")[-k:][::-1]
+        return [(int(rows[index]), int(cols[index])) for index in top_indices]
 
     def _build_interaction_matrix(self, X: np.ndarray) -> np.ndarray:
         """Append selected interaction columns to X."""

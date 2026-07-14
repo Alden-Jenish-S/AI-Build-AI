@@ -49,34 +49,13 @@ class InteractionMIPoly(BaseEstimator, ClassifierMixin):
         Pair score = mi_i + mi_j (simple additive heuristic).
         '''
         n_features = X.shape[1]
-        # Compute pairwise additive scores efficiently via broadcasting
-        # shape (n_features, n_features)
-        pair_scores = mi_scores[:, None] + mi_scores[None, :]
-        np.fill_diagonal(pair_scores, -np.inf)  # ignore self‑pairs
-        # Get indices of top_k pairs
-        flat_idx = np.argpartition(pair_scores.ravel(), -self.top_k)[-self.top_k:]
-        # Convert flat indices to (i, j)
-        rows, cols = np.unravel_index(flat_idx, pair_scores.shape)
-        # Ensure i < j to avoid duplicates
-        pairs = [(int(i), int(j)) for i, j in zip(rows, cols) if i < j]
-        # If we ended up with fewer than top_k because of duplicates, fill with next best
-        if len(pairs) < self.top_k:
-            # Sort all pairs by score descending and take top_k
-            sorted_idx = np.argsort(pair_scores.ravel())[::-1]
-            rows, cols = np.unravel_index(sorted_idx, pair_scores.shape)
-            pairs = []
-            seen = set()
-            for i, j in zip(rows, cols):
-                if i == j:
-                    continue
-                a, b = (i, j) if i < j else (j, i)
-                if (a, b) in seen:
-                    continue
-                seen.add((a, b))
-                pairs.append((a, b))
-                if len(pairs) >= self.top_k:
-                    break
-        return pairs
+        if n_features < 2 or self.top_k <= 0:
+            return []
+        rows, cols = np.triu_indices(n_features, k=1)
+        scores = mi_scores[rows] + mi_scores[cols]
+        k = min(self.top_k, len(scores))
+        top_indices = np.argsort(scores, kind="stable")[-k:][::-1]
+        return [(int(rows[index]), int(cols[index])) for index in top_indices]
 
     def _build_interaction_matrix(self, X: np.ndarray, pairs: List[Tuple[int, int]]) -> np.ndarray:
         '''Append product interaction columns to X.'''
@@ -107,10 +86,12 @@ class InteractionMIPoly(BaseEstimator, ClassifierMixin):
         -------
         self
         '''
+        input_feature_names = list(X.columns) if isinstance(X, pd.DataFrame) else None
         # Validate input
         X, y = check_X_y(X, y, accept_sparse=False, dtype=np.float64)
         check_classification_targets(y)
         self.classes_ = np.unique(y)
+        self._n_features_in = X.shape[1]
 
         # 1️⃣ Compute MI scores
         mi_scores = self._compute_mi_scores(X, y)
@@ -128,8 +109,8 @@ class InteractionMIPoly(BaseEstimator, ClassifierMixin):
         self.clf_.fit(X_aug, y)
 
         # Store feature names for convenience (if X is a DataFrame)
-        if isinstance(X, pd.DataFrame):
-            base_names = list(X.columns)
+        if input_feature_names is not None:
+            base_names = input_feature_names
             inter_names = [f'{base_names[i]}*{base_names[j]}' for i, j in self.top_pairs_]
             self.feature_names_in_ = base_names + inter_names
         else:
@@ -175,7 +156,7 @@ class InteractionMIPoly(BaseEstimator, ClassifierMixin):
     @property
     def n_features_in_(self):
         '''Number of original features.'''
-        return self._n_features_out if hasattr(self, '_n_features_out') else None
+        return getattr(self, '_n_features_in', None)
 
     def _more_tags(self):
         return {'binary_only': True, 'requires_y': True}

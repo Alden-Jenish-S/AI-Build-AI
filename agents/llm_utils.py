@@ -1,13 +1,9 @@
 import os
-import sys
 import time
 import logging
 from typing import Optional, Dict, Any
 
 logger = logging.getLogger(__name__)
-
-# Centralized Model Selection - Change this value to switch model across all agents
-DEFAULT_MODEL = "nvidia/nemotron-3-super-120b-a12b"
 
 # Global token usage tracker for metrics
 token_usage = {
@@ -31,18 +27,23 @@ def call_llm(system_prompt: str, user_prompt: str, model: Optional[str] = None, 
     global token_usage
     
     # 1. Resolve API Key & Base URL
-    api_key = os.getenv("NVIDIA_API_KEY") or os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        raise ValueError(
-            "API key is not configured! Please set either 'NVIDIA_API_KEY' or 'GEMINI_API_KEY' environment variable."
-        )
-        
-    if os.getenv("NVIDIA_API_KEY"):
+    provider = os.getenv("LLM_PROVIDER", "").strip().lower()
+    if provider not in {"", "nvidia", "gemini"}:
+        raise ValueError("LLM_PROVIDER must be either 'nvidia' or 'gemini'")
+
+    if provider == "nvidia" or (not provider and os.getenv("NVIDIA_API_KEY")):
+        api_key = os.getenv("NVIDIA_API_KEY")
         base_url = "https://integrate.api.nvidia.com/v1"
-        provider_default_model = "nvidia/nemotron-3-ultra-550b-a55b"
+        provider_default_model = "openai/gpt-oss-120b"
     else:
+        api_key = os.getenv("GEMINI_API_KEY")
         base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
         provider_default_model = "gemini-2.5-flash"
+
+    if not api_key:
+        raise ValueError(
+            "The selected LLM provider has no API key. Set NVIDIA_API_KEY or GEMINI_API_KEY."
+        )
         
     model_name = model or os.getenv("LLM_MODEL") or provider_default_model
     
@@ -67,6 +68,8 @@ def call_llm(system_prompt: str, user_prompt: str, model: Optional[str] = None, 
             if not response.choices:
                 raise ValueError(f"LLM API returned a response with an empty choices list. Response structure: {response}")
             content = response.choices[0].message.content
+            if not isinstance(content, str) or not content.strip():
+                raise ValueError("LLM API returned an empty message")
             usage = response.usage
             if usage:
                 token_usage["input_tokens"] += usage.prompt_tokens

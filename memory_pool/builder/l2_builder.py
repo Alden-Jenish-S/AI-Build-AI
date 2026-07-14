@@ -5,6 +5,7 @@ import subprocess
 from pathlib import Path
 from typing import Dict, Any
 from agents.llm_utils import call_llm
+from runtime_utils import sanitized_subprocess_env, validate_storage_identifier
 
 class L2Builder:
     def __init__(self, project_root: Path, model_name: str = None, venv_path: str = None):
@@ -15,7 +16,10 @@ class L2Builder:
         self.verifier_path = project_root / "memory_pool" / "builder" / "sandbox_verifier.py"
         
         import sys
-        resolved_path = str(Path(venv_path or "./.venv/bin/python").resolve())
+        candidate_path = Path(venv_path or "./.venv/bin/python")
+        if not candidate_path.is_absolute():
+            candidate_path = project_root / candidate_path
+        resolved_path = str(candidate_path.resolve())
         # Check if the resolved venv python is fully functional
         use_fallback = True
         if Path(resolved_path).exists():
@@ -62,7 +66,12 @@ class L2Builder:
             "     \"verified\": false,\n"
             "     \"verification_log\": \"\"\n"
             "   }\n"
-            "4. 'code': the self-contained importable python code containing the entrypoint function."
+            "4. 'code': the self-contained importable python code containing the entrypoint function.\n\n"
+            "CRITICAL CODE CONSTRAINTS:\n"
+            "- The entrypoint function and all helper functions MUST be fully compatible with standard tabular inputs (Pandas DataFrames for X_train/X_test, and NumPy arrays or Pandas Series for y_train).\n"
+            "- Do NOT assume inputs are PyTorch/TensorFlow tensors. If the technique requires neural networks, convert Pandas DataFrame/NumPy inputs to tensors inside the entrypoint function (e.g., using torch.tensor(X_train.values) or similar) and convert the outputs back to NumPy arrays or Pandas DataFrames/Series.\n"
+            "- Ensure that any optional parameter has a default value (e.g. y_train=None).\n"
+            "- The function must execute successfully and return predictions or transformed features without throwing type/attribute errors (such as calling tensor methods directly on DataFrame inputs)."
         )
         
         user_prompt = f"""
@@ -100,9 +109,16 @@ class L2Builder:
             print("L2Builder ERROR: Missing category, model_card or code in LLM response.")
             return False, None, None, None
             
-        artifact_id = model_card.get("artifact_id")
-        if not artifact_id:
-            print("L2Builder ERROR: Missing artifact_id inside model_card.")
+        try:
+            category = validate_storage_identifier(category, "category")
+            artifact_id = validate_storage_identifier(
+                model_card.get("artifact_id"), "artifact_id"
+            )
+        except ValueError as exc:
+            print(f"L2Builder ERROR: Unsafe generated identifier: {exc}")
+            return False, None, None, None
+        if not isinstance(code, str) or not code.strip():
+            print("L2Builder ERROR: Generated code must be a non-empty string.")
             return False, None, None, None
             
         # Handle new category creation
@@ -112,9 +128,6 @@ class L2Builder:
                 "description": data.get("category_description", "Custom category."),
                 "l2_pointers": []
             }
-            # Save updated L1 index
-            with open(self.l1_path, 'w', encoding='utf-8') as f:
-                json.dump(l1_index, f, indent=2)
                 
         # Prepare L2 store paths
         if commit:
@@ -128,6 +141,12 @@ class L2Builder:
         
         card_file = cat_dir / f"{artifact_id}.json"
         code_file = cat_dir / f"{artifact_id}.py"
+
+        if card_file.exists() or code_file.exists():
+            print(
+                f"L2Builder ERROR: Refusing to overwrite existing artifact files for {artifact_id}."
+            )
+            return False, None, None, None
         
         # Write files
         with open(code_file, 'w', encoding='utf-8') as f:
@@ -146,7 +165,14 @@ class L2Builder:
         cmd = [self.venv_python, str(self.verifier_path), str(card_file)]
         
         try:
-            res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            res = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=35,
+                env=sanitized_subprocess_env(),
+            )
             print(f"L2Builder: Sandbox verification passed for {artifact_id}!")
             try:
                 with open(card_file, 'r', encoding='utf-8') as f:
@@ -161,22 +187,61 @@ class L2Builder:
                     with open(self.l1_path, 'w', encoding='utf-8') as f:
                         json.dump(l1_index, f, indent=2)
             return True, category, artifact_id, model_card
-        except subprocess.CalledProcessError as e:
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
             print(f"L2Builder ERROR: Sandbox verification failed for {artifact_id}.")
             if e.stdout:
                 print(e.stdout)
-            print(e.stderr)
-            # Remove bad files to avoid corrupting pool
-            if code_file.exists():
-                code_file.unlink()
-            if card_file.exists():
-                card_file.unlink()
-            return False, None, None, None
+            if e.stderr:
+                print(e.stderr)
+            if commit:
+                # Never leave a failed artifact in the global reusable store.
+                if code_file.exists():
+                    code_file.unlink()
+                if card_file.exists():
+                    card_file.unlink()
+                return False, None, None, None
+
+            # Local failed candidates are valuable diagnostics for the node that
+            # proposed them. Keep both files, with verified=false, in its run dir.
+            try:
+                with open(card_file, 'r', encoding='utf-8') as f:
+                    model_card = json.load(f)
+            except Exception:
+                pass
+            return False, category, artifact_id, model_card
 
     def commit_artifact(self, category: str, artifact_id: str, local_code_file: Path, local_card_file: Path) -> bool:
         """
         Moves/copies verified local artifact files to the global l2_store and updates the L1 index.
         """
+        try:
+            category = validate_storage_identifier(category, "category")
+            artifact_id = validate_storage_identifier(artifact_id, "artifact_id")
+            local_code_file = Path(local_code_file)
+            local_card_file = Path(local_card_file)
+            if local_code_file.is_symlink() or local_card_file.is_symlink():
+                raise ValueError("Artifact source files may not be symlinks")
+            if not local_code_file.is_file() or not local_card_file.is_file():
+                raise ValueError("Artifact source files do not exist")
+            if local_code_file.name != f"{artifact_id}.py":
+                raise ValueError("Local code filename does not match artifact_id")
+            if local_card_file.name != f"{artifact_id}.json":
+                raise ValueError("Local card filename does not match artifact_id")
+            with open(local_card_file, 'r', encoding='utf-8') as f:
+                local_card_data = json.load(f)
+            if local_card_data.get("verified") is not True:
+                print(f"L2Builder ERROR: Refusing to commit unverified artifact {artifact_id}.")
+                return False
+            if local_card_data.get("artifact_id") != artifact_id:
+                raise ValueError("Model-card artifact_id does not match requested artifact")
+            if local_card_data.get("category") != category:
+                raise ValueError("Model-card category does not match requested category")
+            if local_card_data.get("code_path") != f"{artifact_id}.py":
+                raise ValueError("Model-card code_path does not match requested artifact")
+        except Exception as e:
+            print(f"L2Builder ERROR: Could not validate local model card for {artifact_id}: {e}")
+            return False
+
         # Load current L1 index
         with open(self.l1_path, 'r', encoding='utf-8') as f:
             l1_index = json.load(f)
@@ -194,6 +259,10 @@ class L2Builder:
         
         dest_card_file = cat_dir / f"{artifact_id}.json"
         dest_code_file = cat_dir / f"{artifact_id}.py"
+
+        if dest_card_file.exists() or dest_code_file.exists():
+            print(f"L2Builder ERROR: Refusing to overwrite existing artifact {artifact_id}.")
+            return False
         
         # Copy files
         import shutil
@@ -219,4 +288,41 @@ class L2Builder:
             return True
         except Exception as e:
             print(f"L2Builder ERROR: Failed to commit artifact {artifact_id} from local paths: {e}")
+            return False
+
+    def record_task_validation(
+        self,
+        category: str,
+        artifact_id: str,
+        validation: Dict[str, Any],
+    ) -> bool:
+        """Append or replace a task-level validation on a committed artifact."""
+        try:
+            category = validate_storage_identifier(category, "category")
+            artifact_id = validate_storage_identifier(artifact_id, "artifact_id")
+            card_file = self.l2_store / category / f"{artifact_id}.json"
+            with open(card_file, 'r', encoding='utf-8') as f:
+                card = json.load(f)
+            if card.get("verified") is not True:
+                raise ValueError("cannot validate an unverified global artifact")
+
+            validations = card.get("task_validations", [])
+            if not isinstance(validations, list):
+                validations = []
+            key = (validation.get("task_name"), validation.get("node_id"))
+            validations = [
+                item
+                for item in validations
+                if (item.get("task_name"), item.get("node_id")) != key
+            ]
+            validations.append(dict(validation))
+            card["task_validations"] = validations
+            with open(card_file, 'w', encoding='utf-8') as f:
+                json.dump(card, f, indent=2)
+            return True
+        except Exception as exc:
+            print(
+                f"L2Builder ERROR: Failed to record task validation for "
+                f"{category}/{artifact_id}: {exc}"
+            )
             return False

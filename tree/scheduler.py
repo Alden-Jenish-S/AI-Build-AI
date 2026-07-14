@@ -48,40 +48,38 @@ class UCB1Scheduler:
             curr_node.total_reward += reward
             curr_id = curr_node.parent_id
 
-    def select_next_node(self, root_id: str, all_nodes: Dict[str, NodeState]) -> str:
-        """Selects the next node to expand/evaluate by recursively walking down the tree 
-        following the maximum UCB1 paths (multi-armed bandit selection).
-        Skips nodes that have already been executed.
+    def select_next_node(self, root_id: str, all_nodes: Dict[str, NodeState]) -> Optional[str]:
+        """Select the shallowest pending frontier node, using UCB1 as a tie-breaker.
+
+        Covering the current breadth before deepening prevents a successful early
+        branch from starving unexecuted sibling implementations.
         """
-        curr_node = all_nodes[root_id]
-        t = self.current_step
-        
-        while curr_node.children_ids:
-            best_child = None
-            best_score = -float('inf')
-            
-            for cid in curr_node.children_ids:
-                child = all_nodes[cid]
-                # Skip nodes that have already been fully executed
-                # UNLESS they have unexecuted children (tree must be traversable)
-                if child.executed and not child.children_ids:
-                    continue
-                    
-                score = self.compute_ucb_score(child, curr_node.visits, t)
-                if score > best_score:
-                    best_score = score
-                    best_child = child
-                    
-            if best_child is None:
-                # All children are executed leaves — return current node
-                # (this branch is exhausted)
-                break
-                
-            curr_node = best_child
-            
-            # If this node is executed but has children, keep descending
-            # If it's unexecuted, stop — this is our selection
-            if not curr_node.executed:
-                break
-            
-        return curr_node.node_id
+        if root_id not in all_nodes:
+            return None
+
+        queue = [(root_id, 0)]
+        pending_by_depth: Dict[int, List[NodeState]] = {}
+        cursor = 0
+        while cursor < len(queue):
+            node_id, depth = queue[cursor]
+            cursor += 1
+            node = all_nodes[node_id]
+            if node_id != root_id and not node.executed:
+                pending_by_depth.setdefault(depth, []).append(node)
+                continue
+            for child_id in node.children_ids:
+                if child_id in all_nodes:
+                    queue.append((child_id, depth + 1))
+
+        if not pending_by_depth:
+            return None
+
+        candidates = pending_by_depth[min(pending_by_depth)]
+        return max(
+            candidates,
+            key=lambda candidate: self.compute_ucb_score(
+                candidate,
+                all_nodes[candidate.parent_id].visits if candidate.parent_id else 1,
+                self.current_step,
+            ),
+        ).node_id

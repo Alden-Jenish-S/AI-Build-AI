@@ -11,7 +11,8 @@
     "scikit-learn",
     "xgboost"
   ],
-  "verified": false,
-  "verification_log": "Verification failed at 2026-07-10 23:34:31.\nLog:\nTraceback (most recent call last):\n  File \"/var/folders/cs/nppg0gc93bg68g2g1tq9jsc40000gn/T/tmp39akgyem.py\", line 10, in <module>\n    from stacked_logistic_xgboost import fit_predict_stacked_entrypoint\n  File \"/Users/aldenjenish/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/memory_pool/l2_store/blending_stacking/stacked_logistic_xgboost.py\", line 1\n    ---------------------------------------------------- #\\n    # 5. Final predictions on test set\\n    # ------------------------------------------------------------------ #\\n    test_proba = meta_learner.predict_proba(meta_X_test)[:, 1]\\n    return test_proba\\n\\n\\n# ---------------------------------------------------------------------- #\\n# Interface entrypoint expected by the builder\\n# ---------------------------------------------------------------------- #\\ndef fit_predict_stacked_entrypoint(\\n    train_df: pd.DataFrame,\\n    test_df: pd.DataFrame,\\n    target_col: str = \\\"target\\\",\\n) -> np.ndarray:\\n    '''\\n    Builder\u2011friendly wrapper that matches the expected signature:\\n        (train_df, test_df, target_col) -> np.ndarray of predicted probabilities.\\n\\n    This function simply forwards to the core implementation.\\n    '''\\n    return fit_predict_stacked(train_df, test_df, target_col=target_col)\\n\n                                                                                                                                                                                                                                     ^\nSyntaxError: unexpected character after line continuation character",
-  "code_path": "stacked_logistic_xgboost.py"
+  "verified": true,
+  "verification_log": "Passed subprocess verification at 2026-07-14 13:24:13.\nOutput:\nFunction returned type: ndarray\nResult length: 30\nSUCCESS",
+  "code_path": "stacked_logistic_xgboost.py",
+  "verification_level": "shape-only-mock-data"
 }

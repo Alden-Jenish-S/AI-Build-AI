@@ -20,3 +20,5 @@ Thumbs.db
 
 # Run outputs/logs that might be large or temporary
 runs/
+tasks/
+eval/

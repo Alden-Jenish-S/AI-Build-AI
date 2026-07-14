@@ -1,3 +1,5 @@
+import json
+
 import pandas as pd
 import numpy as np
 from pathlib import Path
@@ -31,13 +33,38 @@ def run_dataset_analysis(task_dir: Path) -> str:
         df_train_sample = pd.read_csv(train_csv, nrows=5)
         df_test_sample = pd.read_csv(test_csv, nrows=5) if (test_csv and test_csv.exists()) else None
         
-        # Identify target column (difference between train and test headers)
+        if df_train_sample.empty:
+            raise ValueError("train.csv contains no data rows")
+
+        # Prefer an explicit task setting, then infer from train/test and the
+        # sample-submission schema. Never silently assume a fixed target name.
+        configured_target = None
+        config_file = task_dir / "task_config.json"
+        if config_file.exists():
+            with open(config_file, "r", encoding="utf-8") as f:
+                configured_target = json.load(f).get("target_column")
+
         if df_test_sample is not None:
             target_cols = [c for c in df_train_sample.columns if c not in df_test_sample.columns]
         else:
             target_cols = []
-            
-        if not target_cols:
+
+        sample_file = task_dir / "sample_submission.csv"
+        if not sample_file.exists() and (task_dir / "input" / "sample_submission.csv").exists():
+            sample_file = task_dir / "input" / "sample_submission.csv"
+        sample_prediction_cols = []
+        if sample_file.exists():
+            sample_cols = pd.read_csv(sample_file, nrows=0).columns.tolist()
+            sample_prediction_cols = sample_cols[1:]
+            analysis_report.append(f"Sample Submission Columns: {sample_cols}")
+
+        if configured_target in df_train_sample.columns:
+            target_col = configured_target
+        elif len(target_cols) == 1:
+            target_col = target_cols[0]
+        elif len(set(target_cols) & set(sample_prediction_cols)) == 1:
+            target_col = list(set(target_cols) & set(sample_prediction_cols))[0]
+        else:
             # Fallback if we cannot infer from test.csv
             # Search for common target names or pick the last column
             common_targets = ["target", "label", "cover_type", "class"]
@@ -46,8 +73,11 @@ def run_dataset_analysis(task_dir: Path) -> str:
                 target_col = found_common[0]
             else:
                 target_col = df_train_sample.columns[-1]
-        else:
-            target_col = target_cols[0]
+            if len(target_cols) > 1:
+                analysis_report.append(
+                    f"WARNING: Ambiguous train-only columns {target_cols}; inferred {target_col!r}. "
+                    "Set target_column in task_config.json to make this explicit."
+                )
             
         analysis_report.append(f"Inferred Target Column: '{target_col}'")
         
@@ -86,7 +116,10 @@ def run_dataset_analysis(task_dir: Path) -> str:
             if df_train[col].nunique() == 1:
                 drop_suggestions.append(f"  - '{col}' (constant column with single value)")
             # Sequential ID columns
-            elif col.lower() in ["id", "uuid", "index"] or (df_train[col].nunique() == num_rows and np.issubdtype(df_train[col].dtype, np.integer)):
+            elif col.lower() in ["id", "uuid", "index"] or (
+                df_train[col].nunique() == num_rows
+                and pd.api.types.is_integer_dtype(df_train[col].dtype)
+            ):
                 drop_suggestions.append(f"  - '{col}' (looks like an ID or sequential index column)")
             # Extreme missing values
             elif df_train[col].isnull().mean() > 0.90:
@@ -117,30 +150,61 @@ def run_dataset_analysis(task_dir: Path) -> str:
         else:
             target_series = df_train[target_col]
             
-        class_counts = target_series.value_counts().sort_index()
+        non_null_target = target_series.dropna()
+        target_nunique = non_null_target.nunique()
         analysis_report.append(f"  Total instances in target column: {len(target_series)}")
-        analysis_report.append("  Class Counts:")
-        for val, cnt in class_counts.items():
-            analysis_report.append(f"    - Class {val}: {cnt} instances ({cnt/len(target_series)*100:.4f}%)")
-            
-        # Check for rare classes (count < 10)
-        rare_classes = {val: cnt for val, cnt in class_counts.items() if cnt < 10}
-        if rare_classes:
-            analysis_report.append("\n!!! CRITICAL INCONSISTENCY DETECTED !!!")
-            analysis_report.append("  Rare target classes detected with very few instances:")
-            for val, cnt in rare_classes.items():
-                analysis_report.append(f"    - Class {val}: {cnt} instances")
-            
-            # Warn specifically about stratification crashes if count < 2
-            very_rare = [val for val, cnt in rare_classes.items() if cnt < 2]
-            if very_rare:
-                analysis_report.append("  WARNING: Classes with only 1 instance will crash standard stratified splits (e.g. train_test_split(..., stratify=y)).")
-                analysis_report.append("  RECOMMENDED ACTIONS IN DATALOADER:")
-                analysis_report.append("    - Filter out (drop) rows belonging to these rare classes from the training set BEFORE performing train_test_split, OR")
-                analysis_report.append("    - Do NOT use stratified split (disable `stratify=y` or set stratification to None), OR")
-                analysis_report.append("    - Use a custom validation splitting strategy that handles rare classes gracefully.")
-            else:
-                analysis_report.append("  RECOMMENDED ACTION: Ensure minimum class count is satisfied before stratified splits, or disable stratification.")
+        regression_threshold = max(20, int(np.sqrt(max(len(non_null_target), 1))))
+        is_regression = (
+            pd.api.types.is_numeric_dtype(non_null_target.dtype)
+            and target_nunique > regression_threshold
+        )
+        if is_regression:
+            analysis_report.append("  Inferred task type: regression (continuous numeric target)")
+            analysis_report.append(
+                "  Target summary: "
+                + non_null_target.describe(percentiles=[0.05, 0.25, 0.5, 0.75, 0.95]).to_string()
+            )
+        else:
+            class_counts = non_null_target.value_counts()
+            analysis_report.append("  Inferred task type: classification")
+            analysis_report.append("  Class Counts:")
+            for val, cnt in class_counts.head(50).items():
+                analysis_report.append(
+                    f"    - Class {val}: {cnt} instances "
+                    f"({cnt / max(len(non_null_target), 1) * 100:.4f}%)"
+                )
+            if len(class_counts) > 50:
+                analysis_report.append(
+                    f"    - ... {len(class_counts) - 50} additional classes omitted"
+                )
+
+            rare_classes = class_counts[class_counts < 10]
+            if not rare_classes.empty:
+                analysis_report.append("\n!!! CRITICAL INCONSISTENCY DETECTED !!!")
+                analysis_report.append(
+                    f"  {len(rare_classes)} target classes have fewer than 10 instances."
+                )
+                for val, cnt in rare_classes.head(20).items():
+                    analysis_report.append(f"    - Class {val}: {cnt} instances")
+
+                very_rare = rare_classes[rare_classes < 2]
+                if not very_rare.empty:
+                    analysis_report.append(
+                        "  WARNING: Classes with only 1 instance will crash standard "
+                        "stratified splits (e.g. train_test_split(..., stratify=y))."
+                    )
+                    analysis_report.append("  RECOMMENDED ACTIONS IN DATALOADER:")
+                    analysis_report.append(
+                        "    - Do NOT use stratification unless every class has enough samples, OR"
+                    )
+                    analysis_report.append(
+                        "    - Use a custom validation strategy that handles rare classes gracefully."
+                    )
+                else:
+                    analysis_report.append(
+                        "  RECOMMENDED ACTION: Ensure minimum class count is satisfied "
+                        "before stratified splits, or disable stratification."
+                    )
                 
     except Exception as e:
         analysis_report.append(f"Error during dataset analysis: {e}")

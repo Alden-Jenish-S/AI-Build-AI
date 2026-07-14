@@ -122,7 +122,10 @@ Please write the complete 'initial_dataloader.py' file.
             f"7. At the END of the script, write a JSON file 'result.json' in the current directory with EXACTLY this structure:\n"
             f'   {{"score": <float>, "metric": "{metric_name}", "direction": "{metric_direction}"}}\n'
             "   Example: import json; json.dump({{\"score\": 0.8521, \"metric\": \"roc_auc\", \"direction\": \"maximize\"}}, open('result.json', 'w'))\n"
-            "8. Save test predictions to './submission/submission.csv' with columns ['id', 'target'] or matching the submission schema.\n"
+            "8. Save test predictions to './submission/submission.csv'. If './input/sample_submission.csv' exists, "
+            "read it and preserve its exact column names, identifier values, row order, and prediction-column order. "
+            "Do not assume the columns are named 'id' or 'target'. If no sample exists, derive the schema from the "
+            "task description and test_ids.\n"
             "Return ONLY valid Python code wrapped in a ```python code block."
         )
         

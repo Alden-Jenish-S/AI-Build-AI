@@ -18,43 +18,74 @@ class TechniqueAgent:
         """
         print("TechniqueAgent: Generating 3 dynamic initial approaches based on task description...")
         system_prompt = (
-            "You are the Technique Agent. Given a machine learning task description, propose 3 distinct, "
-            "promising, and tailored modeling or preprocessing approaches (branches) that make sense for this specific task.\n"
+            "You are the Technique Agent. Given a machine learning task description, think from first principles "
+            "and propose 3 distinct, promising, and tailored modeling or preprocessing approaches (branches) "
+            "that make sense for this specific task.\n"
             "Respond ONLY with a valid JSON list of 3 dictionaries. Each dictionary must have two keys:\n"
             "1. 'name': A short camel_case or snake_case name for the branch (e.g., 'xgboost_with_target_encoding', 'feature_interactions_rf', 'mlp_tabular').\n"
             "2. 'plan': A detailed description of the approach, serving as a strategic direction for the technique selection.\n"
+            "Do not reuse stock branch labels like Branch_A_Ensembling, Branch_B_Features, or Branch_C_DeepLearning. "
+            "The branches must be task-specific, complementary, and directly implementable.\n"
             "Do not include any explanation or markdown formatting, just the raw JSON list."
         )
         user_prompt = f"Task Description:\n{task_description}\n\nPropose the 3 best approaches in JSON format."
         response = call_llm(system_prompt, user_prompt, model=self.model_name)
-        
-        # Parse JSON
+
         try:
-            if "```json" in response:
-                json_str = response.split("```json")[1].split("```")[0]
-            elif "```" in response:
-                json_str = response.split("```")[1].split("```")[0]
-            else:
-                json_str = response
-            approaches = json.loads(json_str.strip())
-            if isinstance(approaches, list) and len(approaches) >= 3:
-                valid_approaches = []
-                for app in approaches[:3]:
-                    name = app.get("name", "Branch_Plan")
-                    plan = app.get("plan", "")
-                    if plan:
-                        valid_approaches.append({"name": name, "plan": plan})
-                if len(valid_approaches) == 3:
-                    return valid_approaches
-        except Exception as e:
-            print(f"TechniqueAgent WARNING: Failed to parse initial approaches JSON: {e}. Falling back to default directions.")
-        
-        # Fallback
-        return [
-            {"name": "Branch_A_Ensembling", "plan": "Stronger GBDT ensembling: bias queries towards GBDT ensembling and stacking."},
-            {"name": "Branch_B_Features", "plan": "Richer feature engineering: bias queries towards feature engineering, category encoding, and imputation."},
-            {"name": "Branch_C_DeepLearning", "plan": "Alternative model family: bias queries towards tabular deep learning and neural models."}
-        ]
+            return self._parse_initial_approaches(response)
+        except Exception as parse_error:
+            print(f"TechniqueAgent WARNING: Failed to parse initial approaches JSON: {parse_error}. Asking LLM to repair the response.")
+
+        repair_system = (
+            "You repair malformed JSON for an ML technique planner. "
+            "Return ONLY a valid JSON list of exactly 3 dictionaries, each with non-empty 'name' and 'plan' strings. "
+            "Do not invent generic fallback branches; preserve and clean the task-specific ideas from the draft."
+        )
+        repair_user = f"""
+Task Description:
+{task_description}
+
+Malformed Draft:
+{response}
+
+Return repaired JSON only.
+"""
+        repaired_response = call_llm(repair_system, repair_user, model=self.model_name)
+        return self._parse_initial_approaches(repaired_response)
+
+    def _parse_initial_approaches(self, response: str) -> List[Dict[str, str]]:
+        """Parse and validate the LLM-authored initial branch ideas."""
+        if "```json" in response:
+            json_str = response.split("```json", 1)[1].split("```", 1)[0]
+        elif "```" in response:
+            json_str = response.split("```", 1)[1].split("```", 1)[0]
+        else:
+            json_str = response
+
+        approaches = json.loads(json_str.strip())
+        if not isinstance(approaches, list) or len(approaches) != 3:
+            raise ValueError("expected a JSON list with exactly 3 approaches")
+
+        valid_approaches = []
+        seen_names = set()
+        for idx, app in enumerate(approaches, start=1):
+            if not isinstance(app, dict):
+                raise ValueError(f"approach {idx} is not a dictionary")
+            name = str(app.get("name", "")).strip()
+            plan = str(app.get("plan", "")).strip()
+            if not name or not plan:
+                raise ValueError(f"approach {idx} must include non-empty name and plan")
+
+            normalized_name = re.sub(r"[^a-zA-Z0-9_]+", "_", name).strip("_").lower()
+            if not normalized_name:
+                normalized_name = f"llm_branch_{idx}"
+            if normalized_name in seen_names:
+                raise ValueError(f"duplicate branch name: {normalized_name}")
+            seen_names.add(normalized_name)
+
+            valid_approaches.append({"name": normalized_name, "plan": plan})
+
+        return valid_approaches
 
     def run(self, task_description: str, branch_plan: str, global_memory_context: dict, l1_index: dict) -> Dict[str, Any]:
         """
@@ -102,7 +133,8 @@ Which 1-2 categories best match the strategic direction? Output a comma-separate
         selected_categories = selected_categories[:2]
         
         if not selected_categories:
-            selected_categories = ["gbdt_ensembling", "feature_engineering_tabular"]
+            print("TechniqueAgent: No valid L1 category matched the branch plan. Initiating web search...")
+            return self._bootstrap_from_web(task_description, branch_plan)
             
         print(f"TechniqueAgent: Selected L1 categories: {selected_categories} (for branch: {branch_plan[:60]}...)")
         
@@ -110,7 +142,11 @@ Which 1-2 categories best match the strategic direction? Output a comma-separate
         l2_candidates = []
         for cat in selected_categories:
             res = query(cat)
-            l2_candidates.extend(res.get("artifacts", []))
+            verified_artifacts = [
+                artifact for artifact in res.get("artifacts", [])
+                if artifact.get("verified") is True
+            ]
+            l2_candidates.extend(verified_artifacts)
             
         system_prompt = (
             "You are the Technique Agent. Evaluate if any candidate artifact is a high-quality match for the task requirements. "
@@ -135,6 +171,9 @@ Which 1-2 categories best match the strategic direction? Output a comma-separate
             user_prompt = f"""
 Task Description:
 {task_description}
+
+Strategic Direction:
+{branch_plan}
 
 Candidate Artifacts in Memory Pool:
 {candidates_str}

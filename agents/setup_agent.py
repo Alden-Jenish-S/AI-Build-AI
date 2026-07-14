@@ -3,6 +3,22 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import List
+from runtime_utils import sanitized_subprocess_env
+
+
+def _validate_requirement(requirement: object) -> str:
+    """Accept registry package requirements, but reject URLs, paths, and pip flags."""
+    if not isinstance(requirement, str) or not requirement.strip():
+        raise ValueError(f"Invalid dependency requirement: {requirement!r}")
+    requirement = requirement.strip()
+    try:
+        from packaging.requirements import Requirement
+        parsed = Requirement(requirement)
+    except (ImportError, ValueError) as exc:
+        raise ValueError(f"Invalid dependency requirement: {requirement!r}") from exc
+    if parsed.url is not None:
+        raise ValueError(f"Direct URL/path dependencies are not allowed: {requirement!r}")
+    return requirement
 
 class SetupAgent:
     def __init__(self, venv_python_path: str = "./.venv/bin/python"):
@@ -47,9 +63,16 @@ class SetupAgent:
         """
         dependencies = set()
         for card in artifact_cards:
+            if card.get("verified") is not True:
+                raise ValueError(
+                    f"Refusing to install dependencies for unverified artifact "
+                    f"{card.get('artifact_id', '<unknown>')!r}"
+                )
             deps = card.get("dependencies", [])
+            if not isinstance(deps, list):
+                raise ValueError("Model-card dependencies must be a list")
             for dep in deps:
-                dependencies.add(dep)
+                dependencies.add(_validate_requirement(dep))
                 
         if not dependencies:
             self._log("SetupAgent: No dependencies to install.")
@@ -70,7 +93,12 @@ class SetupAgent:
             # Check if package is already installed
             cmd_check = [self.venv_python, "-m", "pip", "show", pkg_name]
             try:
-                res_check = subprocess.run(cmd_check, capture_output=True, text=True)
+                res_check = subprocess.run(
+                    cmd_check,
+                    capture_output=True,
+                    text=True,
+                    env=sanitized_subprocess_env(),
+                )
                 if res_check.returncode == 0:
                     self._log(f"SetupAgent: Package '{pkg_name}' is already installed. Skipping.")
                 else:
@@ -86,7 +114,13 @@ class SetupAgent:
         cmd = [self.venv_python, "-m", "pip", "install"] + to_install
         
         try:
-            res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            res = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=True,
+                env=sanitized_subprocess_env(),
+            )
             self._log("SetupAgent: Package installation successful!")
             self._log(res.stdout)
         except subprocess.CalledProcessError as e:

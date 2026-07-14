@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from runtime_utils import resolve_within, validate_storage_identifier
 
 # Base directory setup relative to this file
 BASE_DIR = Path(__file__).resolve().parent
@@ -24,6 +25,7 @@ def query_l1(category: str) -> dict:
     """Returns the L1 category description and summary of L2 pointer cards.
     Does NOT leak the code.
     """
+    category = validate_storage_identifier(category, "category")
     l1_path = BASE_DIR / "l1_index.json"
     if not l1_path.exists():
         raise FileNotFoundError(f"L1 index file not found at {l1_path}")
@@ -38,11 +40,22 @@ def query_l1(category: str) -> dict:
     l2_summaries = []
     
     for artifact_id in cat_info.get("l2_pointers", []):
-        card_path = BASE_DIR / "l2_store" / category / f"{artifact_id}.json"
+        try:
+            artifact_id = validate_storage_identifier(artifact_id, "artifact_id")
+            card_path = resolve_within(
+                BASE_DIR / "l2_store", category, f"{artifact_id}.json"
+            )
+        except ValueError as exc:
+            l2_summaries.append({"artifact_id": str(artifact_id), "error": str(exc)})
+            continue
         if card_path.exists():
             try:
                 with open(card_path, 'r', encoding='utf-8') as f:
                     card = json.load(f)
+                if card.get("verified") is not True:
+                    continue
+                if card.get("artifact_id") != artifact_id or card.get("category") != category:
+                    raise ValueError("Model-card identity does not match its L1 pointer")
                 # Keep only search/selection metadata, drop the source code or heavy details
                 summary = {
                     "artifact_id": card["artifact_id"],
@@ -65,14 +78,23 @@ def query_l1(category: str) -> dict:
 
 def query_l2(category: str, artifact_id: str) -> dict:
     """Returns the complete Model Card details including the actual code content."""
-    card_path = BASE_DIR / "l2_store" / category / f"{artifact_id}.json"
+    category = validate_storage_identifier(category, "category")
+    artifact_id = validate_storage_identifier(artifact_id, "artifact_id")
+    card_path = resolve_within(BASE_DIR / "l2_store", category, f"{artifact_id}.json")
     if not card_path.exists():
         raise FileNotFoundError(f"L2 model card not found at {card_path}")
         
     with open(card_path, 'r', encoding='utf-8') as f:
         card = json.load(f)
+    if card.get("verified") is not True:
+        raise ValueError(f"Artifact is not verified: {category}/{artifact_id}")
+    if card.get("artifact_id") != artifact_id or card.get("category") != category:
+        raise ValueError("Model-card identity does not match the requested artifact")
         
-    code_path = card_path.parent / card["code_path"]
+    expected_code_name = f"{artifact_id}.py"
+    if card.get("code_path") != expected_code_name:
+        raise ValueError("Model-card code_path does not match artifact_id")
+    code_path = resolve_within(card_path.parent, expected_code_name)
     if not code_path.exists():
         raise FileNotFoundError(f"Code file not found at {code_path}")
         

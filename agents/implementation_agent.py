@@ -2,10 +2,17 @@ import re
 import os
 import sys
 import json
+import math
+import signal
 import subprocess
 from pathlib import Path
 from typing import Dict, Any
 from .llm_utils import call_llm
+from runtime_utils import (
+    resolve_within,
+    sanitized_subprocess_env,
+    validate_storage_identifier,
+)
 
 class ImplementationAgent:
     def __init__(self, venv_python_path: str = "./.venv/bin/python", model_name: str = None):
@@ -45,6 +52,12 @@ class ImplementationAgent:
             timeout: Subprocess timeout in seconds (default 300)
             metric_direction: "maximize" or "minimize" — used in the prompt
         """
+        if not isinstance(timeout, (int, float)) or timeout <= 0:
+            raise ValueError(f"timeout must be a positive number, got {timeout!r}")
+        if metric_direction not in {"maximize", "minimize"}:
+            raise ValueError(
+                f"metric_direction must be 'maximize' or 'minimize', got {metric_direction!r}"
+            )
         node_dir.mkdir(parents=True, exist_ok=True)
         
         # Copy dataloader to node_dir so imports work locally
@@ -57,16 +70,25 @@ class ImplementationAgent:
         # Copy the memory pool technique python file to node_dir so it can be imported (Fixes ModuleNotFoundError)
         model_card = technique_record.get("model_card", {})
         if model_card and "category" in model_card and "code_path" in model_card:
-            category = model_card["category"]
-            code_name = model_card["code_path"]
-            src_tech = Path(self.project_root) / "memory_pool" / "l2_store" / category / code_name
-            dest_tech = node_dir / code_name
-            if src_tech.exists():
-                import shutil
-                shutil.copy(src_tech, dest_tech)
-                print(f"ImplementationAgent: Copied technique from {src_tech} to {dest_tech}")
-            else:
-                print(f"ImplementationAgent WARNING: Technique code file not found at {src_tech}")
+            try:
+                category = validate_storage_identifier(model_card["category"], "category")
+                artifact_id = validate_storage_identifier(
+                    model_card.get("artifact_id"), "artifact_id"
+                )
+                code_name = model_card["code_path"]
+                if code_name != f"{artifact_id}.py":
+                    raise ValueError("code_path must match '<artifact_id>.py'")
+                store = self.project_root / "memory_pool" / "l2_store"
+                src_tech = resolve_within(store, category, code_name)
+                dest_tech = resolve_within(node_dir, code_name)
+                if src_tech.is_file():
+                    import shutil
+                    shutil.copy(src_tech, dest_tech)
+                    print(f"ImplementationAgent: Copied technique from {src_tech} to {dest_tech}")
+                elif not dest_tech.is_file():
+                    print(f"ImplementationAgent WARNING: Technique code file not found at {src_tech}")
+            except ValueError as exc:
+                raise ValueError(f"Unsafe or invalid model card: {exc}") from exc
 
         # Symlink input directory so dataloader can find datasets (Fixes FileNotFoundError)
         src_input = task_dir / "input"
@@ -85,7 +107,11 @@ class ImplementationAgent:
                 dest_input.mkdir(parents=True, exist_ok=True)
                 import shutil
                 for f in task_dir.glob("*"):
-                    if f.is_file() and f.suffix in [".csv", ".tsv", ".txt", ".json"] and f.name != "task_config.json":
+                    if (
+                        f.is_file()
+                        and f.suffix in [".csv", ".tsv", ".txt", ".json"]
+                        and f.name not in {"task_config.json", "submission.csv"}
+                    ):
                         try:
                             os.symlink(f, dest_input / f.name)
                         except Exception:
@@ -106,9 +132,11 @@ class ImplementationAgent:
             metric_name = task_config.get("metric_name", "score")
             metric_direction = task_config.get("metric_direction", metric_direction)
             
-        # Check verified flag on model card
-        if model_card and model_card.get("verified") is False:
-            print(f"ImplementationAgent WARNING: Model card '{model_card.get('artifact_id', '?')}' is NOT verified. Proceeding with caution.")
+        # Never execute an artifact that failed verification.
+        if model_card and model_card.get("verified") is not True:
+            raise ValueError(
+                f"Model card {model_card.get('artifact_id', '<unknown>')!r} is not verified"
+            )
             
         # Get dataset analysis report to pass to LLM
         dataset_snapshot = ""
@@ -153,11 +181,27 @@ class ImplementationAgent:
         if technique_code:
             tech_code_str = f"Chosen Technique Source Code:\n```python\n{technique_code}\n```"
 
-        # Call LLM to generate glue code
+        # Call LLM to generate glue code. The artifact file is copied beside
+        # algorithm.py, so importing an invented memory_pool package is incorrect.
+        if model_card and technique_code:
+            module_name = Path(model_card["code_path"]).stem
+            entrypoint_signature = model_card.get("interface", {}).get("entrypoint", "")
+            entrypoint_name = entrypoint_signature.split("(", 1)[0].strip()
+            integration_instruction = (
+                f"Import the verified local artifact exactly from module {module_name!r}; for example, "
+                f"`from {module_name} import {entrypoint_name}`. Do not import from a `memory_pool` package "
+                "and do not reimplement the artifact's internal logic."
+            )
+        else:
+            integration_instruction = (
+                "No verified artifact is available for this node. Improve the original baseline directly "
+                "according to the technique plan, keep the script self-contained, and do not import any "
+                "`memory_pool` module or imaginary artifact."
+            )
+
         system_prompt = (
-            "You are the Implementation Agent. Modify the original algorithm code to integrate the selected "
-            "memory pool technique. You must directly import the technique from the memory pool rather than "
-            "regenerating its logic. Ensure the output is valid Python code wrapped in a ```python block.\n"
+            "You are the Implementation Agent. Produce a complete executable revision of the original algorithm. "
+            f"{integration_instruction} Ensure the output is valid Python code wrapped in a ```python block.\n"
             f"IMPORTANT: At the END of your script, write a JSON file 'result.json' in the current directory:\n"
             f'  import json; json.dump({{"score": <float>, "metric": "{metric_name}", "direction": "{metric_direction}"}}, open("result.json", "w"))\n'
             "The score should be the final validation metric value."
@@ -181,7 +225,8 @@ class ImplementationAgent:
 
             {dataset_snapshot}
 
-            Please modify the code to import and use the artifact. Return the complete updated file content.
+            {integration_instruction}
+            Return the complete updated file content.
             """
         response = call_llm(system_prompt, user_prompt, model=self.model_name)
         
@@ -219,6 +264,7 @@ class ImplementationAgent:
                     "You are a Coder/Debugging Agent. The previous implementation of the machine learning code failed with an error.\n"
                     "Review the original baseline code, your previous generated code, and the error traceback/stderr output.\n"
                     "Identify the issue, fix it, and write the corrected code.\n"
+                    f"{integration_instruction}\n"
                     "CRITICAL: Start your Python code response with a brief comment block explaining the cause of the error and how you are fixing it. "
                     "This helps trace execution logical errors correctly.\n"
                     "Ensure the output is valid Python code wrapped in a ```python block.\n"
@@ -255,7 +301,7 @@ class ImplementationAgent:
 
                 {dataset_snapshot}
 
-                Please debug and fix the code. Ensure the imported technique is used correctly and all variables/datasets are loaded properly. Return the complete corrected code file.
+                Please debug and fix the code. Follow the integration instruction exactly and ensure all variables/datasets are loaded properly. Return the complete corrected code file.
                 """
                 response = call_llm(debug_system_prompt, debug_user_prompt, model=self.model_name)
                 
@@ -278,13 +324,35 @@ class ImplementationAgent:
             import time
             import fcntl
             import os
+
+            # Do not accept stale outputs from an earlier run in the same node folder.
+            result_json_path = node_dir / "result.json"
+            submission_path = node_dir / "submission" / "submission.csv"
+            for stale_output in (result_json_path, submission_path):
+                if stale_output.exists() or stale_output.is_symlink():
+                    stale_output.unlink()
             
             proc = subprocess.Popen(
                 cmd,
                 cwd=node_dir,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
+                stderr=subprocess.PIPE,
+                env=sanitized_subprocess_env(),
+                start_new_session=True,
             )
+
+            def terminate_process_group() -> None:
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    return
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
             
             # Make stdout/stderr non-blocking
             for fd in (proc.stdout, proc.stderr):
@@ -293,8 +361,8 @@ class ImplementationAgent:
                 
             start_time = time.time()
             last_output_time = time.time()
-            inactivity_timeout = 120.0
-            hard_timeout = 1800.0  # 30-minute absolute ceiling
+            hard_timeout = float(timeout)
+            inactivity_timeout = min(1200.0, hard_timeout)
             
             while True:
                 ret = proc.poll()
@@ -348,30 +416,24 @@ class ImplementationAgent:
                 
                 if inactive_elapsed > inactivity_timeout:
                     print(f"\nImplementationAgent: INACTIVITY TIMEOUT after {inactivity_timeout}s with no output. Killing process.")
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
+                    terminate_process_group()
                     exit_code = -1
                     timeout_kill = True
                     break
                     
                 if elapsed > hard_timeout:
                     print(f"\nImplementationAgent: HARD TIMEOUT ceiling of {hard_timeout}s reached. Killing process.")
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
+                    terminate_process_group()
                     exit_code = -1
                     timeout_kill = True
                     break
                     
                 time.sleep(0.1)
-                
+
             stdout = "".join(stdout_lines)
             stderr = "".join(stderr_lines)
+            proc.stdout.close()
+            proc.stderr.close()
                 
             # Save stderr to error.log for debugging
             diagnostics = stdout + "\n" + stderr
@@ -390,22 +452,28 @@ class ImplementationAgent:
             status = "completed"
             
             # Strategy 1: Parse result.json (structured contract)
-            result_json_path = node_dir / "result.json"
-            if result_json_path.exists():
+            if exit_code == 0 and result_json_path.exists():
                 try:
                     with open(result_json_path, 'r', encoding='utf-8') as f:
                         result_data = json.load(f)
                     parsed_score = result_data.get("score")
                     if parsed_score is not None:
                         score = float(parsed_score)
+                        if not math.isfinite(score):
+                            raise ValueError("score must be finite")
+                        declared_direction = result_data.get("direction")
+                        if declared_direction and declared_direction != metric_direction:
+                            raise ValueError(
+                                f"result direction {declared_direction!r} does not match {metric_direction!r}"
+                            )
                         score_source = "result.json"
                         print(f"ImplementationAgent: Score from result.json: {score} "
                               f"(metric={result_data.get('metric', '?')}, direction={result_data.get('direction', '?')})")
-                except (json.JSONDecodeError, ValueError) as e:
+                except (json.JSONDecodeError, TypeError, ValueError, OverflowError) as e:
                     print(f"ImplementationAgent: WARNING: result.json exists but couldn't parse: {e}")
             
             # Strategy 2: Regex fallback on stdout (handles negatives and scientific notation)
-            if score is None and not timeout_kill:
+            if score is None and exit_code == 0 and not timeout_kill:
                 # Match patterns like: "Score: 0.93245", "AUC: -0.123", "accuracy = 9.5e-3"
                 score_matches = re.findall(
                     r'(?:score|auc|accuracy|metric|rmse|mae|loss|f1)[:\s=]+(-?[0-9]+\.?[0-9]*(?:e[+-]?[0-9]+)?)',
@@ -414,9 +482,12 @@ class ImplementationAgent:
                 if score_matches:
                     try:
                         score = float(score_matches[-1])
+                        if not math.isfinite(score):
+                            raise ValueError("score must be finite")
                         score_source = "stdout_regex"
                         print(f"ImplementationAgent: Score from stdout regex (fallback): {score}")
                     except ValueError:
+                        score = None
                         pass
             
             # If successful execution and a score was found, stop debugging
@@ -425,9 +496,11 @@ class ImplementationAgent:
                 
             attempt += 1
         
-        # Determine final status: if exit_code != 0 AND no score was produced, it's a failure
-        if exit_code != 0 and score is None:
+        # A crashing process is always a failed run, even if it wrote a partial score.
+        if exit_code != 0:
             status = "failed"
+            score = None
+            score_source = "none"
             if timeout_kill:
                 print(f"ImplementationAgent: FAILED — timeout after {timeout}s (exit_code={exit_code})")
             else:
