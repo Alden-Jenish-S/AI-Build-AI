@@ -1,0 +1,95 @@
+import json
+import subprocess
+import sys
+from pathlib import Path
+from typing import List
+
+class SetupAgent:
+    def __init__(self, venv_python_path: str = "./.venv/bin/python"):
+        import sys
+        resolved_path = str(Path(venv_python_path).resolve())
+        # Check if the resolved venv python is fully functional
+        use_fallback = True
+        if Path(resolved_path).exists():
+            try:
+                res = subprocess.run([resolved_path, "-c", "import sys; print('ok')"], capture_output=True, text=True, timeout=5)
+                if res.returncode == 0 and "ok" in res.stdout:
+                    use_fallback = False
+            except Exception:
+                pass
+                
+        if use_fallback:
+            print(f"SetupAgent WARNING: Specified python path '{resolved_path}' is invalid or non-functional. Falling back to active running interpreter: {sys.executable}")
+            self.venv_python = sys.executable
+        else:
+            self.venv_python = resolved_path
+            
+        self.pip_path = str(Path(self.venv_python).parent / "pip")
+        self.log_file = None
+
+    def set_task_run_dir(self, run_dir: Path):
+        """Set task run folder to write dependency logs."""
+        self.log_file = run_dir / "dependency_log.txt"
+
+    def _log(self, message: str):
+        print(message)
+        if self.log_file:
+            try:
+                with open(self.log_file, "a", encoding="utf-8") as f:
+                    f.write(message + "\n")
+            except Exception:
+                pass
+
+    def install_dependencies(self, artifact_cards: List[dict]):
+        """
+        Reads the union of the 'dependencies' fields from all imported Model Cards
+        for the run, checks if they are already installed, and installs missing ones.
+        """
+        dependencies = set()
+        for card in artifact_cards:
+            deps = card.get("dependencies", [])
+            for dep in deps:
+                dependencies.add(dep)
+                
+        if not dependencies:
+            self._log("SetupAgent: No dependencies to install.")
+            return
+            
+        self._log(f"SetupAgent: Checking/Installing dependencies: {list(dependencies)}")
+        
+        to_install = []
+        for dep in dependencies:
+            # Basic parsing of requirement specifier to get package name
+            # e.g., 'catboost==1.2.3' -> 'catboost'
+            pkg_name = dep
+            for op in ['==', '>=', '<=', '>', '<', '~=']:
+                if op in dep:
+                    pkg_name = dep.split(op)[0].strip()
+                    break
+            
+            # Check if package is already installed
+            cmd_check = [self.venv_python, "-m", "pip", "show", pkg_name]
+            try:
+                res_check = subprocess.run(cmd_check, capture_output=True, text=True)
+                if res_check.returncode == 0:
+                    self._log(f"SetupAgent: Package '{pkg_name}' is already installed. Skipping.")
+                else:
+                    to_install.append(dep)
+            except Exception:
+                to_install.append(dep)
+
+        if not to_install:
+            self._log("SetupAgent: All dependencies are already satisfied.")
+            return
+
+        self._log(f"SetupAgent: Executing pip install for missing dependencies: {to_install}")
+        cmd = [self.venv_python, "-m", "pip", "install"] + to_install
+        
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            self._log("SetupAgent: Package installation successful!")
+            self._log(res.stdout)
+        except subprocess.CalledProcessError as e:
+            self._log("SetupAgent ERROR: Failed to install dependencies.")
+            self._log(e.stderr)
+            raise e

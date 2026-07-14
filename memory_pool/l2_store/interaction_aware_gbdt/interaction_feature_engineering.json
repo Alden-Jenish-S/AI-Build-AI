@@ -1,0 +1,16 @@
+{
+  "artifact_id": "interaction_feature_engineering",
+  "category": "interaction_aware_gbdt",
+  "description": "Creates pairwise interaction features, selects top-k via mutual information, and fits a HistGradientBoostingClassifier.",
+  "interface": {
+    "entrypoint": "fit_predict_interaction_gbm(X_train, y_train, X_test, k_interactions=50, gbm_random_state=42)"
+  },
+  "dependencies": [
+    "numpy",
+    "scikit-learn"
+  ],
+  "verified": true,
+  "verification_log": "Passed sandbox verification at 2026-07-10 22:55:31.\nOutput:\nFunction returned type: tuple\nResult length: 2\nTuple of 2 elements\nSUCCESS",
+  "code_path": "interaction_feature_engineering.py",
+  "verification_level": "shape-only-mock-data"
+}

@@ -1,0 +1,26 @@
+{
+  "artifact_id": "polynomial_features",
+  "category": "feature_engineering_tabular",
+  "description": "Generates polynomial and/or interaction features for selected continuous variables.",
+  "interface": {
+    "entrypoint": "transform(X_train, X_test, columns, degree=2, interaction_only=True) -> (X_tr, X_te)",
+    "input_shapes": "X_train: pd.DataFrame, X_test: pd.DataFrame, columns: list",
+    "output_shapes": "X_tr: pd.DataFrame, X_te: pd.DataFrame"
+  },
+  "code_path": "polynomial_features.py",
+  "dependencies": [
+    "scikit-learn",
+    "pandas",
+    "numpy"
+  ],
+  "usage_example": "X_tr_poly, X_te_poly = transform(X_train, X_test, columns=['f_0', 'f_1'])",
+  "known_pitfalls": [
+    "Using degree > 2 on many columns can result in a combinatorially large feature space and OOM."
+  ],
+  "provenance": {
+    "source_type": "prior_run_takeaway",
+    "source_url_or_run_id": "manual"
+  },
+  "verified": true,
+  "verification_log": "Passed sandbox verification at 2026-07-09 20:53:12.\nOutput:\nSUCCESS"
+}

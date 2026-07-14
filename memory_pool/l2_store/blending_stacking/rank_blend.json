@@ -1,0 +1,26 @@
+{
+  "artifact_id": "rank_blend",
+  "category": "blending_stacking",
+  "description": "Blends predictions from multiple models by taking a weighted average of their rank percentiles.",
+  "interface": {
+    "entrypoint": "blend(preds_list, weights=None) -> blended_preds",
+    "input_shapes": "preds_list: list of np.ndarray",
+    "output_shapes": "blended_preds: np.ndarray"
+  },
+  "code_path": "rank_blend.py",
+  "dependencies": [
+    "scipy",
+    "numpy"
+  ],
+  "usage_example": "blended = blend([oof_cat, oof_lgb], weights=[0.6, 0.4])",
+  "known_pitfalls": [
+    "All arrays in preds_list must be of identical length.",
+    "Only suitable for regression/classification probabilities where ranking order is preserved."
+  ],
+  "provenance": {
+    "source_type": "prior_run_takeaway",
+    "source_url_or_run_id": "manual"
+  },
+  "verified": true,
+  "verification_log": "Passed sandbox verification at 2026-07-09 20:53:11.\nOutput:\nSUCCESS"
+}

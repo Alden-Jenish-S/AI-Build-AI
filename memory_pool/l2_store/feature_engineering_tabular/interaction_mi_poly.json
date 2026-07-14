@@ -1,0 +1,16 @@
+{
+  "artifact_id": "interaction_mi_poly",
+  "category": "feature_engineering_tabular",
+  "description": "Automatically discovers informative pairwise feature interactions via mutual information and augments the feature matrix with product terms, then fits a HistGradientBoostingClassifier.",
+  "interface": {
+    "entrypoint": "train_interaction_mi_poly(X_train, y_train, top_k=30, random_state=None, **hgb_kwargs)"
+  },
+  "dependencies": [
+    "numpy",
+    "pandas",
+    "scikit-learn"
+  ],
+  "verified": false,
+  "verification_log": "Verification failed at 2026-07-10 22:10:32.\nLog:\nFAILURE:\n\nTraceback (most recent call last):\n  File \"/var/folders/cs/nppg0gc93bg68g2g1tq9jsc40000gn/T/tmpeixd7m35.py\", line 110, in <module>\n    result = train_interaction_mi_poly(**kwargs)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/aldenjenish/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/memory_pool/l2_store/feature_engineering_tabular/interaction_mi_poly.py\", line 216, in train_interaction_mi_poly\n    model.fit(X_train, y_train)\n  File \"/Users/aldenjenish/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/memory_pool/l2_store/feature_engineering_tabular/interaction_mi_poly.py\", line 119, in fit\n    self.top_pairs_ = self._select_top_pairs(X, mi_scores)\n                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/aldenjenish/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/memory_pool/l2_store/feature_engineering_tabular/interaction_mi_poly.py\", line 57, in _select_top_pairs\n    flat_idx = np.argpartition(pair_scores.ravel(), -self.top_k)[-self.top_k:]\n               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/aldenjenish/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/.venv/lib/python3.11/site-packages/numpy/_core/fromnumeric.py\", line 932, in argpartition\n    return _wrapfunc(a, 'argpartition', kth, axis=axis, kind=kind, order=order)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/aldenjenish/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/.venv/lib/python3.11/site-packages/numpy/_core/fromnumeric.py\", line 54, in _wrapfunc\n    return bound(*args, **kwds)\n           ^^^^^^^^^^^^^^^^^^^^\nValueError: kth(=-21) out of bounds (9)",
+  "code_path": "interaction_mi_poly.py"
+}

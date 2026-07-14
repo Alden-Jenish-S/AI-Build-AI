@@ -1,0 +1,27 @@
+{
+  "artifact_id": "stratified_kfold_split",
+  "category": "cv_strategies",
+  "description": "Generates Stratified K-Fold cross validation splits for a classification target.",
+  "interface": {
+    "entrypoint": "get_splits(X, y, n_splits=5, shuffle=True, random_state=42) -> splits",
+    "input_shapes": "X: pd.DataFrame, y: np.ndarray",
+    "output_shapes": "splits: list of tuples (train_idx, val_idx)"
+  },
+  "code_path": "stratified_kfold_split.py",
+  "dependencies": [
+    "scikit-learn",
+    "numpy",
+    "pandas"
+  ],
+  "usage_example": "splits = get_splits(X_train, y_train, n_splits=5)",
+  "known_pitfalls": [
+    "Only suitable for classification targets where stratification is possible.",
+    "Regression targets must be binned first if stratification is desired."
+  ],
+  "provenance": {
+    "source_type": "prior_run_takeaway",
+    "source_url_or_run_id": "manual"
+  },
+  "verified": true,
+  "verification_log": "Passed sandbox verification at 2026-07-09 20:53:11.\nOutput:\nSUCCESS"
+}

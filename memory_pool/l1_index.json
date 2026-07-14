@@ -1,0 +1,74 @@
+{
+  "gbdt_ensembling": {
+    "description": "Strategies for training and ensembling GBDT models (XGBoost, LightGBM, CatBoost) via averaging or folding.",
+    "l2_pointers": [
+      "catboost_10fold_ensemble",
+      "lightgbm_5fold_ensemble",
+      "xgboost_5fold_ensemble"
+    ]
+  },
+  "feature_engineering_tabular": {
+    "description": "Mathematical transformations, scaling, interactions, and column transformations for tabular datasets.",
+    "l2_pointers": [
+      "polynomial_features",
+      "robust_scaler",
+      "interaction_mi_poly"
+    ]
+  },
+  "categorical_encoding": {
+    "description": "Encoders for mapping categorical variables into numeric values (Target encoding, Frequency encoding, etc.).",
+    "l2_pointers": [
+      "target_encoding",
+      "frequency_encoding"
+    ]
+  },
+  "cv_strategies": {
+    "description": "Cross-validation partitioning strategies for tabular datasets.",
+    "l2_pointers": [
+      "stratified_kfold_split"
+    ]
+  },
+  "imbalance_handling": {
+    "description": "Techniques for managing class imbalance in tabular classification (SMOTE, class weighting).",
+    "l2_pointers": []
+  },
+  "hyperparam_search": {
+    "description": "Hyperparameter optimization strategies like Optuna and Random Search.",
+    "l2_pointers": []
+  },
+  "tabular_deep_learning": {
+    "description": "Neural networks designed specifically for tabular data (MLPs, Attention architectures).",
+    "l2_pointers": []
+  },
+  "blending_stacking": {
+    "description": "Meta-ensembling techniques including rank blending and stacking algorithms.",
+    "l2_pointers": [
+      "rank_blend",
+      "stacking_ensemble_blend",
+      "stacked_logistic_xgboost"
+    ]
+  },
+  "missing_value_imputation": {
+    "description": "Methods to fill in missing continuous or categorical values.",
+    "l2_pointers": [
+      "missing_imputer"
+    ]
+  },
+  "outlier_handling": {
+    "description": "Techniques to detect, clip, or filter outlying observations.",
+    "l2_pointers": []
+  },
+  "factorization_machines": {
+    "description": "Factorization Machines models for capturing pairwise feature interactions in tabular data.",
+    "l2_pointers": [
+      "factorization_machine_binary"
+    ]
+  },
+  "interaction_aware_gbdt": {
+    "description": "Techniques that automatically construct feature interactions and train gradient boosting models on the augmented feature set.",
+    "l2_pointers": [
+      "interaction_enhanced_gb",
+      "interaction_feature_engineering"
+    ]
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "artifact_id": "interaction_enhanced_gb",
+  "category": "interaction_aware_gbdt",
+  "description": "Automatically selects top-K feature pairs by mutual information, creates product interaction features, and fits a HistGradientBoostingClassifier on the augmented feature set.",
+  "interface": {
+    "entrypoint": "build_model(X_train, X_test, y_train=None, **kwargs)"
+  },
+  "dependencies": [
+    "numpy",
+    "scikit-learn"
+  ],
+  "verified": false,
+  "verification_log": "Verification failed at 2026-07-10 22:44:09.\nLog:\nFAILURE:\n\nTraceback (most recent call last):\n  File \"/var/folders/cs/nppg0gc93bg68g2g1tq9jsc40000gn/T/tmpd52z8z56.py\", line 110, in <module>\n    result = build_model(**kwargs)\n             ^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/aldenjenish/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/memory_pool/l2_store/interaction_aware_gbdt/interaction_enhanced_gb.py\", line 188, in build_model\n    model.fit(X_train, y_train)\n  File \"/Users/aldenjenish/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/memory_pool/l2_store/interaction_aware_gbdt/interaction_enhanced_gb.py\", line 103, in fit\n    self._interaction_pairs = self._select_top_pairs(mi_scores)\n                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/aldenjenish/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/memory_pool/l2_store/interaction_aware_gbdt/interaction_enhanced_gb.py\", line 54, in _select_top_pairs\n    flat_idx = np.argpartition(pair_scores.ravel(), -self.top_k_interactions)[-self.top_k_interactions:]\n               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/aldenjenish/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/.venv/lib/python3.11/site-packages/numpy/_core/fromnumeric.py\", line 932, in argpartition\n    return _wrapfunc(a, 'argpartition', kth, axis=axis, kind=kind, order=order)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/aldenjenish/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/.venv/lib/python3.11/site-packages/numpy/_core/fromnumeric.py\", line 54, in _wrapfunc\n    return bound(*args, **kwds)\n           ^^^^^^^^^^^^^^^^^^^^\nValueError: kth(=-11) out of bounds (9)",
+  "code_path": "interaction_enhanced_gb.py"
+}

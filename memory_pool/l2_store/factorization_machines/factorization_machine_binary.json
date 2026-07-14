@@ -1,0 +1,17 @@
+{
+  "artifact_id": "factorization_machine_binary",
+  "category": "factorization_machines",
+  "description": "A second\u2011order Factorization Machine for binary classification that learns latent vectors for each feature and models interactions via dot product, combined with a linear term. Includes preprocessing (standard scaling for numeric, ordinal encoding for categoricals), training loop with BCEWithLogitsLoss, and prediction returning probabilities.",
+  "interface": {
+    "entrypoint": "train_and_predict(X_train, X_test, y_train=None, target_col='target', k=10, lr=0.01, weight_decay=1e-5, epochs=30, batch_size=1024, device='cpu')"
+  },
+  "dependencies": [
+    "numpy",
+    "pandas",
+    "torch",
+    "scikit-learn"
+  ],
+  "verified": false,
+  "verification_log": "Verification failed at 2026-07-10 22:19:57.\nLog:\nTraceback (most recent call last):\n  File \"/var/folders/cs/nppg0gc93bg68g2g1tq9jsc40000gn/T/tmpi7p96d15.py\", line 10, in <module>\n    from factorization_machine_binary import train_and_predict\n  File \"/Users/aldenjenish/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/memory_pool/l2_store/factorization_machines/factorization_machine_binary.py\", line 3, in <module>\n    import torch\nModuleNotFoundError: No module named 'torch'",
+  "code_path": "factorization_machine_binary.py"
+}

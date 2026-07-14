@@ -1,0 +1,25 @@
+{
+  "artifact_id": "missing_imputer",
+  "category": "missing_value_imputation",
+  "description": "Impute continuous features using training median and categorical features using training mode.",
+  "interface": {
+    "entrypoint": "transform(X_train, X_test, cont_cols, cat_cols) -> (X_tr, X_te)",
+    "input_shapes": "X_train: pd.DataFrame, X_test: pd.DataFrame, cont_cols: list, cat_cols: list",
+    "output_shapes": "X_tr: pd.DataFrame, X_te: pd.DataFrame"
+  },
+  "code_path": "missing_imputer.py",
+  "dependencies": [
+    "pandas",
+    "numpy"
+  ],
+  "usage_example": "X_tr_imp, X_te_imp = transform(X_train, X_test, cont_cols=['age'], cat_cols=['city'])",
+  "known_pitfalls": [
+    "Does not create indicator flags for missing values. Mode value falls back to 'missing' string if column is entirely empty."
+  ],
+  "provenance": {
+    "source_type": "prior_run_takeaway",
+    "source_url_or_run_id": "manual"
+  },
+  "verified": true,
+  "verification_log": "Passed sandbox verification at 2026-07-09 20:53:04.\nOutput:\nSUCCESS"
+}

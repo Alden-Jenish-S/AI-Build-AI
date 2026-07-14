@@ -1,0 +1,26 @@
+{
+  "artifact_id": "robust_scaler",
+  "category": "feature_engineering_tabular",
+  "description": "Standardize features robust to outliers by removing the median and scaling by the IQR.",
+  "interface": {
+    "entrypoint": "transform(X_train, X_test, columns) -> (X_tr, X_te)",
+    "input_shapes": "X_train: pd.DataFrame, X_test: pd.DataFrame, columns: list",
+    "output_shapes": "X_tr: pd.DataFrame, X_te: pd.DataFrame"
+  },
+  "code_path": "robust_scaler.py",
+  "dependencies": [
+    "scikit-learn",
+    "pandas",
+    "numpy"
+  ],
+  "usage_example": "X_tr_scale, X_te_scale = transform(X_train, X_test, columns=['f_0', 'f_1'])",
+  "known_pitfalls": [
+    "Columns with zero variance or all identical values will output NaN values during scale division."
+  ],
+  "provenance": {
+    "source_type": "prior_run_takeaway",
+    "source_url_or_run_id": "manual"
+  },
+  "verified": true,
+  "verification_log": "Passed sandbox verification at 2026-07-09 20:53:13.\nOutput:\nSUCCESS"
+}

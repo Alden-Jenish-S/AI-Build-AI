@@ -1,0 +1,25 @@
+{
+  "artifact_id": "frequency_encoding",
+  "category": "categorical_encoding",
+  "description": "Replaces categorical values with their frequency proportion in train data.",
+  "interface": {
+    "entrypoint": "transform(X_train, X_test, cat_features) -> (X_tr, X_te)",
+    "input_shapes": "X_train: pd.DataFrame, X_test: pd.DataFrame, cat_features: list",
+    "output_shapes": "X_tr: pd.DataFrame, X_te: pd.DataFrame"
+  },
+  "code_path": "frequency_encoding.py",
+  "dependencies": [
+    "pandas",
+    "numpy"
+  ],
+  "usage_example": "X_tr_enc, X_te_enc = transform(X_train, X_test, cat_features=['city'])",
+  "known_pitfalls": [
+    "Unseen categories in the test set will receive a frequency value of 0."
+  ],
+  "provenance": {
+    "source_type": "prior_run_takeaway",
+    "source_url_or_run_id": "manual"
+  },
+  "verified": true,
+  "verification_log": "Passed sandbox verification at 2026-07-09 20:53:05.\nOutput:\nSUCCESS"
+}

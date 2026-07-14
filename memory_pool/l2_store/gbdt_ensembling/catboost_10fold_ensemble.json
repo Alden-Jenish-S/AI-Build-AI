@@ -1,0 +1,28 @@
+{
+  "artifact_id": "catboost_10fold_ensemble",
+  "category": "gbdt_ensembling",
+  "description": "10-fold CatBoost trained on tabular features, returns OOF and test predictions.",
+  "interface": {
+    "entrypoint": "fit_predict(X_train, y_train, X_test, cat_features=None, n_folds=10, is_classification=True) -> (oof_preds, test_preds, model_list)",
+    "input_shapes": "X_train: pd.DataFrame, y_train: np.ndarray, X_test: pd.DataFrame",
+    "output_shapes": "oof_preds: np.ndarray, test_preds: np.ndarray, model_list: list"
+  },
+  "code_path": "catboost_10fold_ensemble.py",
+  "dependencies": [
+    "catboost>=1.2",
+    "numpy",
+    "pandas",
+    "scikit-learn"
+  ],
+  "usage_example": "oof, test_preds, models = fit_predict(X_train, y_train, X_test, cat_features=['sex','cp'])",
+  "known_pitfalls": [
+    "Categorical columns must be passed as cat_features by name or index, not one-hot encoded.",
+    "Requires y_train to be numeric-encoded for classification."
+  ],
+  "provenance": {
+    "source_type": "prior_run_takeaway",
+    "source_url_or_run_id": "manual"
+  },
+  "verified": true,
+  "verification_log": "Passed sandbox verification at 2026-07-09 20:53:10.\nOutput:\nSUCCESS"
+}
