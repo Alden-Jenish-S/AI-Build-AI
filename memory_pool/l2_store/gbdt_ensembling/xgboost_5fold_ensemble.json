@@ -1,15 +1,46 @@
 {
   "artifact_id": "xgboost_5fold_ensemble",
   "category": "gbdt_ensembling",
+  "scope": "model_family",
+  "resource_profile": {
+    "accelerator": "any",
+    "min_ram_gb": 4,
+    "estimated_runtime_seconds": 180
+  },
   "description": "5-fold XGBoost trained on tabular features, returns OOF and test predictions.",
   "interface": {
-    "entrypoint": "fit_predict(X_train, y_train, X_test, cat_features=None, n_folds=5, is_classification=True) -> (oof_preds, test_preds, model_list)",
+    "entrypoint": "fit_predict(X_train, y_train, X_test, cat_features=None, n_folds=5, is_classification=True, device=None, xgboost_params=None) -> (oof_preds, test_preds, model_list)",
     "input_shapes": "X_train: pd.DataFrame, y_train: np.ndarray, X_test: pd.DataFrame",
-    "output_shapes": "oof_preds: np.ndarray, test_preds: np.ndarray, model_list: list"
+    "output_shapes": "oof_preds: np.ndarray, test_preds: np.ndarray, model_list: list",
+    "output_contract": {
+      "kind": "predictions",
+      "aligned_to": "X_test"
+    }
+  },
+  "capabilities": {
+    "supported_operators": [
+      "initial",
+      "refine",
+      "tune",
+      "diversify",
+      "promote"
+    ],
+    "tunable_parameters": [
+      "n_estimators",
+      "learning_rate",
+      "max_depth",
+      "subsample",
+      "colsample_bytree"
+    ],
+    "gpu_accelerated": true,
+    "supported_accelerators": [
+      "cpu",
+      "cuda"
+    ]
   },
   "code_path": "xgboost_5fold_ensemble.py",
   "dependencies": [
-    "xgboost>=2.0",
+    "xgboost>=1.7",
     "numpy",
     "pandas",
     "scikit-learn"
@@ -17,12 +48,14 @@
   "usage_example": "oof, test_preds, models = fit_predict(X_train, y_train, X_test, cat_features=['sex','cp'])",
   "known_pitfalls": [
     "Categorical columns must be passed in cat_features and are converted to category dtype inside the method.",
-    "Requires enable_categorical=True which is enabled by default inside the method."
+    "Requires enable_categorical=True which is enabled by default inside the method.",
+    "XGBoost GPU uses CUDA; unavailable CUDA builds retry safely on CPU."
   ],
   "provenance": {
     "source_type": "prior_run_takeaway",
     "source_url_or_run_id": "manual"
   },
   "verified": true,
-  "verification_log": "Passed sandbox verification at 2026-07-09 20:53:08.\nOutput:\nSUCCESS"
+  "verification_log": "Passed subprocess verification at 2026-07-16 12:28:40.\nOutput:\nFunction returned type: tuple\nReturned tabular lengths: [100, 30]\nSUCCESS",
+  "verification_level": "contract-mock-data"
 }

@@ -1,6 +1,6 @@
 # AIBuildAI - Architecture & Workflow Reference
 
-> **Project goal:** An autonomous multi-agent system that, given a tabular ML competition task, discovers, bootstraps, implements, evaluates, and reuses machine learning techniques through a memory-pool-augmented UCB1 tree search.
+> **Project goal:** An autonomous tabular-ML system that evolves measured parent solutions through targeted refinement, tuning, and diversification; allocates an implementation-experiment budget with lineage-level UCB; learns empirical technique priors; and produces a validation-aware ensemble.
 
 ---
 
@@ -14,14 +14,15 @@ agent_system/
 │   ├── technique_agent.py         # Selects memory-pool artifacts or searches for new techniques
 │   ├── implementation_agent.py    # Wires techniques into runnable code and executes them
 │   ├── setup_agent.py             # Installs artifact dependencies into the selected Python env
-│   ├── aggregator_agent.py        # Prediction averaging utility for best leaf nodes
+│   ├── aggregator_agent.py        # Diverse candidate selection, OOF weighting, rank averaging
+│   ├── validation_guard.py        # Static pre-execution train/test leakage checks
 │   ├── data_analyzer.py           # Dataset profiling and schema/target analysis
 │   ├── llm_utils.py               # NVIDIA/Gemini LLM client, model override, retries, token metrics
 │   └── web_search.py              # Serper and DuckDuckGo fallback search
 │
 ├── tree/
 │   ├── node.py                    # NodeState dataclass
-│   ├── scheduler.py               # UCB1 scheduler with piecewise exploration decay
+│   ├── scheduler.py               # Lineage-level UCB frontier scheduler
 │   └── global_memory.py           # Cross-node technique/result context store
 │
 ├── memory_pool/
@@ -35,7 +36,7 @@ agent_system/
 │
 ├── tasks/<task_name>/
 │   ├── task_description.md        # Competition/task description
-│   ├── task_config.json           # Optional metric_name, metric_direction, subprocess_timeout
+│   ├── task_config.json           # Metrics, timeout, fidelity, and ensemble settings
 │   ├── train.csv / test.csv       # Flat-file fallback layout
 │   ├── input/                     # Optional dataset folder layout
 │   ├── sample_submission.csv
@@ -45,18 +46,21 @@ agent_system/
 │
 ├── runs/<task_name>/
 │   ├── baseline/                  # Generated baseline code, result, and input link/copy
-│   └── complete_system/           # Pool-enabled tree-search run
+│   ├── complete_system/           # Pool-enabled tree-search run
 │       ├── node_<n>/              # Per-node algorithm.py, artifacts, input link/copy, result.json
 │       │   ├── node_state.json    # Durable state, including pending/unexecuted nodes
 │       │   └── technique_plan.md  # Technique-node plan when applicable
 │       ├── tree_state.json        # Canonical state used by the tree renderer
 │       ├── method_tree.png        # Exploration tree rendering for this condition
+│       ├── ensemble_manifest.json # Final ensemble members and strategy
 │       └── submission.csv         # Final submission predictions for this condition
+│   └── token_usage.json           # Baseline, complete-system, and overall LLM token totals
 │
 ├── requirements.txt               # Unified dependencies file
 └── eval/
     ├── run_ablation.py            # Baseline-versus-complete-system harness
-    ├── metrics.py                 # Medal, overcome, and pool-hit metrics
+    ├── metrics.py                 # Normalized improvement, overcome, and pool metrics
+    ├── evolve_harness.py          # Offline review-gated prompt/control-flow proposals
     └── results.md                 # Ablation output table
 ```
 
@@ -65,24 +69,23 @@ agent_system/
 ## 2. Component Map
 
 ```text
-                            ManagerAgent
-       (task config, tree state, node execution, final submission)
-                   /                |                 \
-                  v                 v                  v
-           InitialAgent       TechniqueAgent      ImplementationAgent
-           + DataAnalyzer     + Memory Pool       + watchdog timer
-                               + Web Search       + self-documenting debug
-                  |                 |                  |
-                  v                 v                  v
-         initial_dataloader    query_tool.py      node_<n>/algorithm.py
-         initial_algorithm     l1_index.json      node_<n>/result.json
-                               l2_store/
- 
-              UCB1Scheduler  <---------------->  NodeState tree
-              GlobalMemory   <---------------->  sibling/parent context
+                         ManagerAgent
+            (experiment budget, lineage, final ensemble)
+               /             |               \
+              v              v                v
+       InitialAgent    TechniqueAgent    ImplementationAgent
+       + DataAnalyzer  + empirical pool  + parent workspace
+                      + web bootstrap    + leakage guard
+                              |          + watchdog/debug
+                              v                |
+                     query_tool.py             v
+                     task validations    result + OOF + submission
 
-              L2Builder + SandboxVerifier
-              (local artifact build -> verify -> optional global commit)
+       Lineage UCB Scheduler <------> NodeState experiment tree
+       GlobalMemory          <------> measured parent/sibling traces
+       AggregatorAgent       <------> same-fidelity diverse candidates
+
+       L2Builder + SandboxVerifier -> reusable artifact pool
 ```
 
 ---
@@ -97,17 +100,50 @@ Each task can include `task_config.json`:
 {
   "metric_name": "score",
   "metric_direction": "maximize",
-  "subprocess_timeout": 300
+  "subprocess_timeout": 300,
+  "enable_multi_fidelity": true,
+  "ensemble_top_k": 3,
+  "ensemble_strategy": "rank_average",
+  "uncertainty_weight": 1.0,
+  "max_l1_categories": 8,
+  "max_artifact_candidates": 5,
+  "resource_limits": {
+    "preferred_accelerator": "auto",
+    "max_ram_gb": 32
+  }
 }
 ```
+
+The manager probes PyTorch CUDA/MPS support and NVIDIA hardware once at startup.
+`preferred_accelerator: "auto"` (or `"gpu"`) resolves in CUDA, MPS, CPU order. An optional
+`accelerators` list is an allowlist over detected devices, while `max_ram_gb` caps
+detected RAM. The selected device is persisted in `tree_state.json`, passed to
+planning and artifact ranking, and exported to implementation/verifier subprocesses
+as `AIBUILDAI_ACCELERATOR`.
 
 `ManagerAgent` loads `metric_direction` and `subprocess_timeout` at startup. `ImplementationAgent` reads `metric_name` and requires generated code to write:
 
 ```json
-{"score": 0.8123, "metric": "score", "direction": "maximize"}
+{
+  "score": 0.8123,
+  "metric": "score",
+  "direction": "maximize",
+  "cv_mean": 0.8123,
+  "cv_std": 0.0041,
+  "folds": 3,
+  "fidelity": "medium",
+  "accelerator": "cuda"
+}
 ```
 
-Defaults are `metric_direction="maximize"` and `subprocess_timeout=300`.
+Defaults are `metric_direction="maximize"`, `subprocess_timeout=300`, multi-fidelity enabled, top-3 aggregation, and rank averaging. Generated pipelines should also write `oof_predictions.csv` with `row_id,target,prediction` when practical.
+
+At the start of a new tree search, an existing condition directory is moved under
+`runs/<task>/archive/`. This preserves diagnostics while preventing stale results and
+generated-artifact filename collisions. Before sandbox import verification, a
+web-derived artifact may bootstrap only dependencies already controlled by the
+repository's `requirements.txt`; arbitrary packages, URLs, paths, and pip flags remain
+rejected.
 
 ### LLM Config
 
@@ -156,8 +192,10 @@ The memory pool is a two-level library of reusable tabular ML techniques.
 
 Each artifact in `memory_pool/l2_store/<category>/` has:
 
-- `<artifact_id>.json`: model card with `artifact_id`, `category`, `description`, `interface.entrypoint`, `dependencies`, `verified`, `verification_level`, `verification_log`, and `code_path`.
+- `<artifact_id>.json`: model card with identity/interface metadata, output contract, supported operators/tunable parameters, `scope` (`component`, `model_family`, or `full_pipeline`), a resource profile, verification state, pitfalls, and append-only task validations.
 - `<artifact_id>.py`: self-contained implementation imported by generated node code.
+
+`query(category)` exposes compact empirical summaries (`runs`, `failures`, `improvement_rate`, and `mean_reward`) plus scope/resource metadata and the three most recent validations. Before prompting, category browsing is lexically prefiltered to `max_l1_categories`; artifact candidates are scope-filtered, assigned a numeric lexical/empirical/UCB prior, and capped at `max_artifact_candidates`. Legacy cards without explicit scope are conservatively classified by category.
 
 ### Query API
 
@@ -198,16 +236,22 @@ ManagerAgent.initialize_task()
        -> DataAnalyzer profiles train/test data
        -> LLM generates initial_dataloader.py
        -> LLM generates initial_algorithm.py
+  -> execute baseline and validate finite score + submission
+       -> on failure, record baseline_debug.log
+       -> repair initial_algorithm.py and retry up to two times
 ```
 
-The generated baseline is based on `task_description.md` and dataset profiles, not hardcoded model logic.
+The loader is required to initialize lazily so both `MyDataLoader()()` and immediate
+`get_data()` are valid. It exposes `X_full`, `y_full`, and stable full/split row IDs in
+addition to the legacy train/validation fields. The algorithm uses the callable form. The generated baseline
+is based on `task_description.md` and dataset profiles, not hardcoded model logic.
 
 ### Phase 2 - Technique Selection
 
 ```text
 TechniqueAgent.run(task_description, branch_plan, global_memory_context, l1_index)
-  -> uses branch_plan to select at most 2 L1 categories
-  -> queries L2 summaries for selected categories
+  -> uses branch_plan plus measured parent/sibling context to select at most 2 L1 categories
+  -> queries L2 summaries including empirical validation aggregates
   -> pool hit: returns full model card and code metadata
   -> pool miss: generates a clean methodology-focused web query
                 searches web
@@ -225,45 +269,79 @@ L2Builder.build_from_source(..., commit=False, target_dir=node_dir)
   -> extracts model card and code from the raw outline
   -> writes local artifact files into node_dir
   -> SandboxVerifier runs the entrypoint in a credential-scrubbed subprocess with mock data
-       -> success: sets verified=True, verification_level="shape-only-mock-data",
+       -> success: requires an X_test-aligned, finite tabular output; sets
+                   verified=True, verification_level="contract-mock-data",
                    and updates verification_log inside the JSON card file.
                    and commits the reusable artifact to the memory pool.
-       -> failure: preserves the candidate and verifier diagnostics in the node directory,
+       -> first failure: sends the bounded traceback and current module through one repair
+       -> final failure: preserves the candidate and verifier diagnostics in the node directory,
                    then uses a self-contained implementation fallback.
 ```
 
-Verification and task performance are tracked separately: a shape-verified web artifact is immediately reusable by later nodes and future runs, while implementation results are appended to its model card as task-validation records.
+Verification and task performance are tracked separately: a contract-verified web artifact is immediately reusable by later nodes and future runs, while implementation results are appended to its model card as task-validation records.
 
-### Phase 4 - Implementation & Robust Execution
+### Phase 4 - Lineage-Preserving Implementation & Validation
 
 ```text
-ImplementationAgent.run(node_dir, tech_record, task_dir)
+ImplementationAgent.run(node_dir, tech_record, task_dir,
+                        base_algorithm_path, parent_node_dir,
+                        fidelity, operator)
+  -> starts from the measured parent algorithm for descendants
+  -> copies reusable parent support files into an isolated child workspace, excluding stale outputs
   -> copies initial_dataloader.py into node_dir
+  -> copies evaluation_contract.py and requires its deterministic rows/fold IDs
   -> copies selected artifact code into node_dir when available
   -> links or copies task data into node_dir/input/
   -> reads or creates dataset_analysis_report.txt
-  -> asks LLM to modify initial_algorithm.py to import and use the technique
-  -> executes algorithm.py with an activity watchdog timer
+  -> asks the LLM for a focused refine/tune/diversify change
+  -> runs a static guard for test-fitted preprocessing and test statistics
+  -> requests a repair before execution when the guard finds a defect
+  -> executes algorithm.py with an experiment-wide activity/deadline watchdog
+  -> validates OOF coverage and recomputes fold score mean/std outside generated code
+  -> rejects exact parent-output duplicates as no_effect and deduplicates their files
+  -> records score, reward, fidelity, runtime, CV metadata, and OOF path
 ```
 
 #### Activity Watchdog Timer
 Subprocesses are executed non-blockingly (`subprocess.Popen` with `fcntl` non-blocking descriptor reads).
 * **Inactivity limit**: If no output is written before `min(subprocess_timeout, 1200s)`, the process group is killed.
-* **Absolute ceiling**: The task's configured `subprocess_timeout` is enforced regardless of output.
-* **Diagnostics**: Full stdout and stderr are printed to the console and written to `node_dir/error.log` upon failure.
+* **Absolute ceiling**: One task `subprocess_timeout` deadline covers all run/debug attempts.
+* **Diagnostics**: Failed attempts use `attempt_<n>.log`; `error.log` exists only when the node ultimately fails.
 
 #### Self-Documenting Debugging
-On execution failure, a coder debugging loop retries up to 5 times. The debugging agent is explicitly instructed to prepend a comment block explaining the cause of the previous error and how it is resolved to the top of the revised script.
+On execution failure, a coder debugging loop permits at most two repair attempts within the shared deadline. Debug prompts contain the current code, traceback, compact interface, and evaluation profile instead of repeatedly embedding the parent and complete artifact source. The debugging agent prepends a comment block explaining the fix.
 
-### Phase 5 - Tree Search
+#### Fidelity profiles
 
-Tree mode starts with a virtual root and three dynamic initial technique branches generated from the task description. The scheduler first covers the shallowest pending frontier, then uses UCB1 to break ties at that depth:
+| Fidelity | Data guidance | CV guidance | Max tuning trials | Role |
+|----------|--------------:|------------:|------------------:|------|
+| `screen` | 25% | 2 | 8 | Cheap initial comparison |
+| `medium` | 60% | 3 | 20 | Candidate promotion |
+| `full` | 100% | 5 | 40 | Final-quality evaluation |
+
+These profiles are enforced by `evaluation_contract.py`, not left to prompt compliance. It restores complete loader data, selects deterministic rows, writes a shared fold assignment, and requires one aligned OOF prediction per scheduled row. `ImplementationAgent` rejects a mismatched row count, fold count, fraction, fidelity, metric, or fold assignment. The harness recomputes fold scores, `cv_mean`, and `cv_std` from OOF predictions.
+
+### Phase 5 - Experiment-Budgeted Evolutionary Tree Search
+
+Tree mode starts with a virtual root and `min(3, max(1, budget // 3))` task-specific architecture approaches. Forced root coverage is excluded from UCB decay and visit accounting, so the first real scheduling choice starts in the high-exploration phase. Planning nodes do not consume the budget; an attempted implementation does.
+
+After every successful experiment, the manager creates three metadata-only virtual slots without an LLM call:
+
+- `refine`: preserve the pipeline and modify its highest-impact component.
+- `tune`: preserve the model family and run a compact pruned Optuna search.
+- `diversify`: seek a sound but less-correlated ensemble candidate.
+
+The scheduler ranks these slots from parent reward, lineage visits, operator, fidelity, and depth. Only the selected slot is materialized into task-specific proposal text. Refine and tune advance from `screen` to `medium` to `full`; all slots carry the measured parent code path.
+
+The scheduler scores every pending frontier action using:
 
 ```text
-UCB1 = average_reward + c_t * sqrt(log(parent_visits) / node_visits)
+frontier_score = nearest_measured_reward
+               + c_t * sqrt(log(root_visits + 2) / (lineage_visits + 1))
+               + operator_priority + type/fidelity_bonus - depth_penalty
 ```
 
-Unvisited nodes score as infinity so sibling branches are covered before the search deepens. The exploration constant decays by budget region:
+UCB statistics live on the top-level lineage, so the scheduler can compare virtual slots that have not themselves run. Under-tested lineages receive a larger exploration term, while strong parents can be deepened before every shallow action is exhausted. The exploration constant decays over UCB-eligible experiments only—the total budget minus forced root coverage:
 
 ```text
 0%  -> 30% budget: c_t = 1.414
@@ -271,19 +349,33 @@ Unvisited nodes score as infinity so sibling branches are covered before the sea
 70% -> 100% budget: c_t = 0.5
 ```
 
-Technique nodes receive a small reward (`0.01`) after resolving. Implementation nodes backpropagate `score` for maximize metrics and `-score` for minimize metrics. After each successful implementation, the manager asks the LLM for a short follow-up improvement plan and spawns a child technique node.
+Only measured implementation outcomes backpropagate. Failures receive `-1`. Before normalization, maximize metrics use `score - uncertainty_weight * cv_std` (minimize metrics use `score + ...`). Thus a noisy two-fold screen cannot outrank a statistically indistinguishable candidate solely on its point estimate.
 
-### Phase 6 - Best Node and Submission
+Before an implementation is scheduled, the declared resource profile and operator capabilities are checked against detected/configured CUDA/MPS/CPU availability, RAM, task timeout, and the selected operator. Infeasible or incompatible artifacts are persisted without consuming experiment budget. Verification and feasibility statuses remain distinct. If artifact verification fails for a feasible idea, the builder receives one traceback-focused repair attempt before the fallback preserves the branch intent.
 
-After the budget is exhausted, `ManagerAgent` scans successful implementation nodes:
+GPU support is an execution contract rather than a prompt-only hint. The Technique
+Agent gives a bounded prior bonus to empirically suitable artifacts that declare a
+working backend for the selected accelerator. `ImplementationAgent` writes
+`execution_resource.json`, exposes the selection to the child process, and asks
+generated code to use framework-native device settings. Verified CatBoost, XGBoost,
+LightGBM, PyTorch, and mixed stacking artifacts read the same contract. CUDA-only
+libraries use CPU on MPS, and a missing GPU-enabled package build triggers a local
+CPU retry rather than consuming another search experiment.
+
+An implementation is not automatically evidence merely because it exits successfully. Exact parent/child OOF and submission matches are classified as `no_effect`, receive a negative reward, do not branch, and are hard-linked to the parent files to avoid duplicate storage. The configured timeout is a single wall-clock deadline shared by all execution/debug attempts.
+
+### Phase 6 - Best Fidelity and Diversity-Aware Submission
+
+After the experiment budget is exhausted, `ManagerAgent` finds the highest fidelity with a successful implementation and compares only candidates at that fidelity:
 
 - `maximize`: choose the highest score.
 - `minimize`: choose the lowest score.
 
-`generate_final_submission()` copies the best node's `submission/submission.csv`, aligns it to `sample_submission.csv` when possible, and writes both:
+`AggregatorAgent` sorts these candidates by validation score, rejects near-duplicate prediction vectors above the configured correlation threshold, and combines up to `ensemble_top_k` members. When every member provides aligned OOF predictions, deterministic coordinate hill climbing fits non-negative weights; otherwise the configured equal-weight average or rank average is used. `generate_final_submission()` then aligns the ensemble to `sample_submission.csv` and writes:
 
 - `tasks/<task_name>/submission.csv`
 - `runs/<task_name>/complete_system/submission.csv`
+- `runs/<task_name>/complete_system/ensemble_manifest.json`
 
 The manager also writes `runs/<task_name>/complete_system/tree_state.json` and renders `method_tree.png` from that state. Pending nodes are represented explicitly rather than shown as failures.
 
@@ -297,11 +389,17 @@ The manager also writes `runs/<task_name>/complete_system/tree_state.json` and r
 |--------|---------|
 | Pool Hit Rate | Technique nodes that reused a memory-pool artifact |
 | Overcome Rate | Implementation nodes that beat the baseline |
-| Medal Rate | Implementation nodes passing bronze/silver/gold thresholds |
-| Gold Rate | Implementation nodes passing the gold threshold |
-| Avg tokens/node | Total tracked LLM input/output tokens for the condition |
+| Proxy Medal/Gold Rate | Legacy baseline-relative thresholds; not official Kaggle medals |
+| Normalized Improvement | Best relative error reduction or baseline-relative change |
+| Avg tokens/experiment | Tracked LLM tokens divided by attempted implementations |
+| Experiments | Number of implementation attempts charged to the budget |
+| Best fidelity | Highest completed fidelity used for final selection |
 
-`eval/run_ablation.py` writes the final comparison table to `eval/results.md`.
+`eval/run_ablation.py` writes the final comparison table to `eval/results.md`. Skipped
+implementation placeholders are excluded from experiment and overcome denominators;
+the charged count comes from `ManagerAgent.experiments_executed`. Metric identity is
+carried forward from the validated baseline. `token_usage.json` contains aggregate and
+per-call token counts, prompt sizes, caller labels, models, providers, and latency.
 
 ---
 
@@ -319,19 +417,39 @@ Search is used only when the selected memory-pool candidates are absent or not a
 
 ---
 
-## 8. Design Invariants
+## 8. Offline Harness Evolution
+
+`eval/evolve_harness.py` collects compact implementation traces from multiple completed run directories and asks the LLM for up to five prompt/control-flow amendments. It writes review candidates only; it never edits the live harness. Candidates must be evaluated on held-out tasks and multiple seeds before manual acceptance.
+
+```bash
+python eval/evolve_harness.py runs/task_a/complete_system runs/task_b/complete_system
+```
+
+---
+
+## 9. Design Invariants
 
 | Invariant | Implementation |
 |-----------|----------------|
 | No hardcoded task algorithm | Baseline dataloader and algorithm are generated from task description plus dataset profile. |
 | Fair comparison starter state | The complete system starts from the exact dataloader and algorithm used by the baseline. |
-| Bounded retrieval | TechniqueAgent selects at most 2 L1 categories per branch. |
-| Pool-first, novelty-aware selection | Strong pool matches are reused; weak/empty matches trigger web/LLM bootstrapping. |
-| Verified bootstrapping | New technique code must pass local subprocess verification (creating `verification_level="shape-only-mock-data"`) before execution. This validates compatibility, not trustworthiness. |
-| Reusable global memory pool | Shape-verified dynamic artifacts are committed immediately; task scores and failures are recorded separately. |
-| Robust node execution | Node-level failures are isolated; failed implementation nodes receive zero reward and stop branching. |
-| Activity watchdog | Non-blocking execution watchdog enforces the configured task timeout and terminates the whole process group. |
+| True iterative lineage | Descendants read the measured parent `algorithm.py` and inherit reusable parent files. |
+| Experiment-based budget | Only attempted implementation runs consume budget; technique planning is tracked separately. |
+| Operator diversity | Every successful candidate creates three virtual operator slots; only a selected slot incurs proposal-generation tokens. |
+| Budget-aware warm-up | Root fan-out scales with budget, and forced coverage is excluded from UCB decay/visits. |
+| Bounded retrieval | L1 input, selected categories, and L2 candidate counts are independently capped. |
+| Scope-compatible retrieval | Root alternatives use full-pipeline/model-family artifacts; components attach only below a measured pipeline. |
+| Evidence-aware retrieval | Pool matches are numerically ranked from lexical fit, empirical reward, improvement rate, and exploration bonus. |
+| Feasibility before budget | Declared accelerator, RAM, and runtime constraints can skip an implementation without consuming an experiment. |
+| Verified bootstrapping | New technique code must pass output-length/finiteness contract verification (creating `verification_level="contract-mock-data"`); one bounded repair is allowed before rejection. |
+| Reusable empirical memory | Shape-verified artifacts are committed separately from task validations; pool hits and new artifacts both accumulate outcomes. |
+| Leakage-aware execution | High-confidence test-fitted preprocessing patterns trigger a pre-execution repair request. |
+| Robust node execution | Node failures are isolated; failed implementations receive reward `-1` and stop branching. |
+| Harness-owned evaluation | Full rows, fidelity fractions, deterministic folds, OOF coverage, metric identity, and uncertainty are validated outside generated code. |
+| Effectful lineage | Byte-identical parent predictions are `no_effect`, negatively rewarded, deduplicated, and cannot branch. |
+| Activity watchdog | One wall-clock experiment deadline covers every execution/debug attempt and terminates the whole process group. |
 | Self-documenting debug | LLM prepends debug explanations directly inside script files during coder error recovery. |
-| Metric-aware search | Minimize metrics are converted to negative reward for scheduling while best-node selection honors the original direction. |
-| Central LLM config | Provider selection, retries, model override, and token tracking live in `llm_utils.py`. |
-| Submission compatibility | Best-node submissions are aligned to the sample submission schema when available. |
+| Metric-aware search | Rewards are uncertainty-discounted around the baseline; best-node selection honors metric direction and fidelity. |
+| Central LLM config | Provider selection, retries, model override, aggregate/per-call token tracking, prompt sizes, and latency live in `llm_utils.py`. |
+| Ensemble compatibility | Only same-fidelity candidates are combined, then aligned to the sample submission schema. |
+| Review-gated self-improvement | Harness evolution produces proposals but cannot rewrite production prompts automatically. |

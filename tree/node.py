@@ -11,9 +11,10 @@ class NodeState:
     config: Optional[dict] = None       # Config details
     result: Optional[dict] = None       # {"score": float, "diagnostics": str}
     executed: bool = False               # True after node has been fully processed
+    operator: Optional[str] = None       # refine, tune, diversify, promote, etc.
+    fidelity: str = "full"              # screen, medium, or full evaluation
     
     # Scheduling fields
     visits: int = 0
     total_reward: float = 0.0
     children_ids: List[str] = field(default_factory=list)
-

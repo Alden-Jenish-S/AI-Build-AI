@@ -2,14 +2,53 @@
 
 from __future__ import annotations
 
+import os
+import warnings
 from typing import Tuple
 
 import numpy as np
 import pandas as pd
+import xgboost as xgb
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import StandardScaler
 from xgboost import XGBClassifier
+
+
+def _xgboost_device() -> str:
+    requested = os.environ.get("AIBUILDAI_ACCELERATOR", "cpu").lower()
+    try:
+        cuda_built = bool(xgb.build_info().get("USE_CUDA", False))
+    except Exception:
+        cuda_built = True
+    selected = "cuda" if requested in {"cuda", "gpu"} and cuda_built else "cpu"
+    os.environ["AIBUILDAI_ACTUAL_ACCELERATOR"] = selected
+    return selected
+
+
+def _fit_xgboost_with_fallback(params, X_train, y_train):
+    model = XGBClassifier(**params)
+    try:
+        model.fit(X_train, y_train)
+        return model
+    except Exception as exc:
+        if params.get("device") != "cuda" and params.get("tree_method") != "gpu_hist":
+            raise
+        warnings.warn(
+            f"XGBoost CUDA backend failed ({exc}); retrying this fold on CPU.",
+            RuntimeWarning,
+        )
+        cpu_params = dict(params)
+        os.environ["AIBUILDAI_ACTUAL_ACCELERATOR"] = "cpu"
+        if int(xgb.__version__.split(".", 1)[0]) >= 2:
+            cpu_params["device"] = "cpu"
+        else:
+            cpu_params.pop("device", None)
+        cpu_params["tree_method"] = "hist"
+        cpu_params.pop("predictor", None)
+        model = XGBClassifier(**cpu_params)
+        model.fit(X_train, y_train)
+        return model
 
 
 def _prepare_xy(
@@ -67,19 +106,27 @@ def fit_predict_stacked(
             logistic.predict_proba(X_test_scaled)[:, 1] / effective_splits
         )
 
-        xgboost = XGBClassifier(
-            n_estimators=300,
-            learning_rate=0.05,
-            max_depth=4,
-            subsample=0.9,
-            colsample_bytree=0.9,
-            objective="binary:logistic",
-            eval_metric="logloss",
-            n_jobs=-1,
-            random_state=random_state,
-            tree_method="hist",
+        xgboost_params = {
+            "n_estimators": 300,
+            "learning_rate": 0.05,
+            "max_depth": 4,
+            "subsample": 0.9,
+            "colsample_bytree": 0.9,
+            "objective": "binary:logistic",
+            "eval_metric": "logloss",
+            "n_jobs": -1,
+            "random_state": random_state,
+            "tree_method": "hist",
+        }
+        xgboost_device = _xgboost_device()
+        if int(xgb.__version__.split(".", 1)[0]) >= 2:
+            xgboost_params["device"] = xgboost_device
+        elif xgboost_device == "cuda":
+            xgboost_params["tree_method"] = "gpu_hist"
+            xgboost_params["predictor"] = "gpu_predictor"
+        xgboost = _fit_xgboost_with_fallback(
+            xgboost_params, X_train, y_train
         )
-        xgboost.fit(X_train, y_train)
         oof_predictions[valid_indices, 1] = xgboost.predict_proba(X_valid)[:, 1]
         test_predictions[:, 1] += (
             xgboost.predict_proba(X_test)[:, 1] / effective_splits

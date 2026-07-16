@@ -22,3 +22,6 @@ Thumbs.db
 runs/
 tasks/
 eval/
+!eval/
+eval/*
+!eval/evolve_harness.py

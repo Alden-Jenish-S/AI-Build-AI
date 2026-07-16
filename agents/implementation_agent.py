@@ -5,12 +5,16 @@ import json
 import math
 import signal
 import subprocess
+import shutil
+import time
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from .llm_utils import call_llm
+from .validation_guard import inspect_generated_code
+from evaluation_contract import FIDELITY_PROFILES, validate_evaluation_outputs
 from runtime_utils import (
+    accelerator_subprocess_env,
     resolve_within,
-    sanitized_subprocess_env,
     validate_storage_identifier,
 )
 
@@ -37,8 +41,55 @@ class ImplementationAgent:
         self.model_name = model_name
         self.project_root = Path(__file__).resolve().parent.parent
 
-    def run(self, node_dir: Path, technique_record: dict, task_dir: Path,
-            timeout: int = 300, metric_direction: str = "maximize") -> Dict[str, Any]:
+    def _inherit_parent_workspace(self, parent_node_dir: Path, node_dir: Path) -> list[str]:
+        """Seed a child with reusable parent artifacts without copying stale outputs/data."""
+        inherited = []
+        if not parent_node_dir or not parent_node_dir.is_dir():
+            return inherited
+        excluded = {
+            "algorithm.py",
+            "result.json",
+            "node_state.json",
+            "technique_record.json",
+            "error.log",
+            "oof_predictions.csv",
+            "evaluation_manifest.json",
+            "fold_assignments.csv",
+        }
+        allowed_suffixes = {
+            ".py", ".json", ".yaml", ".yml", ".txt", ".pkl", ".joblib",
+            ".cbm", ".bin", ".pt", ".pth",
+        }
+        for source in parent_node_dir.iterdir():
+            if (
+                not source.is_file()
+                or source.is_symlink()
+                or source.name in excluded
+                or source.suffix.lower() not in allowed_suffixes
+            ):
+                continue
+            destination = node_dir / source.name
+            if destination.exists():
+                continue
+            shutil.copy2(source, destination)
+            inherited.append(source.name)
+        return inherited
+
+    def run(
+        self,
+        node_dir: Path,
+        technique_record: dict,
+        task_dir: Path,
+        timeout: int = 300,
+        metric_direction: str = "maximize",
+        base_algorithm_path: Optional[Path] = None,
+        parent_node_dir: Optional[Path] = None,
+        fidelity: str = "full",
+        operator: Optional[str] = None,
+        enforce_evaluation_contract: bool = False,
+        accelerator: str = "cpu",
+        available_accelerators: Optional[set[str]] = None,
+    ) -> Dict[str, Any]:
         """
         1. Reads task skeletons from task_dir.
         2. Calls LLM to generate updated code wiring the artifact in.
@@ -58,14 +109,40 @@ class ImplementationAgent:
             raise ValueError(
                 f"metric_direction must be 'maximize' or 'minimize', got {metric_direction!r}"
             )
+        accelerator = str(accelerator).lower()
+        if accelerator not in {"cpu", "cuda", "mps"}:
+            raise ValueError(f"Unsupported accelerator: {accelerator!r}")
+        exposed_accelerators = {
+            str(item).lower() for item in (available_accelerators or {"cpu"})
+        }
+        exposed_accelerators.add("cpu")
+        if accelerator not in exposed_accelerators:
+            raise ValueError(
+                f"Selected accelerator {accelerator!r} is not exposed by this run"
+            )
         node_dir.mkdir(parents=True, exist_ok=True)
+        run_started = time.monotonic()
+        execution_resource = {
+            "selected_accelerator": accelerator,
+            "available_accelerators": sorted(exposed_accelerators),
+            "environment_variable": "AIBUILDAI_ACCELERATOR",
+            "fallback": "cpu",
+        }
+        with open(node_dir / "execution_resource.json", "w", encoding="utf-8") as f:
+            json.dump(execution_resource, f, indent=2)
+            f.write("\n")
+        inherited_files = self._inherit_parent_workspace(
+            Path(parent_node_dir) if parent_node_dir else None, node_dir
+        )
         
         # Copy dataloader to node_dir so imports work locally
         src_loader = task_dir / "initial_dataloader.py"
         dest_loader = node_dir / "initial_dataloader.py"
         if src_loader.exists():
-            import shutil
             shutil.copy(src_loader, dest_loader)
+        contract_source = self.project_root / "evaluation_contract.py"
+        if contract_source.is_file():
+            shutil.copy2(contract_source, node_dir / "evaluation_contract.py")
             
         # Copy the memory pool technique python file to node_dir so it can be imported (Fixes ModuleNotFoundError)
         model_card = technique_record.get("model_card", {})
@@ -82,7 +159,6 @@ class ImplementationAgent:
                 src_tech = resolve_within(store, category, code_name)
                 dest_tech = resolve_within(node_dir, code_name)
                 if src_tech.is_file():
-                    import shutil
                     shutil.copy(src_tech, dest_tech)
                     print(f"ImplementationAgent: Copied technique from {src_tech} to {dest_tech}")
                 elif not dest_tech.is_file():
@@ -98,14 +174,12 @@ class ImplementationAgent:
                 try:
                     os.symlink(src_input, dest_input)
                 except Exception:
-                    import shutil
                     if src_input.is_dir():
                         shutil.copytree(src_input, dest_input)
         else:
             # Fallback: if data files are directly in task_dir, copy/symlink them under 'input'
             if not dest_input.exists():
                 dest_input.mkdir(parents=True, exist_ok=True)
-                import shutil
                 for f in task_dir.glob("*"):
                     if (
                         f.is_file()
@@ -118,8 +192,13 @@ class ImplementationAgent:
                             shutil.copy(f, dest_input / f.name)
                 print(f"ImplementationAgent: Prepared 'input' folder fallback at {dest_input}")
 
-        # Read the initial algorithm skeleton
-        src_algo = task_dir / "initial_algorithm.py"
+        # Descendants evolve the measured parent implementation. Only root-level
+        # candidates start from the generated baseline.
+        src_algo = Path(base_algorithm_path) if base_algorithm_path else (
+            task_dir / "initial_algorithm.py"
+        )
+        if not src_algo.is_file():
+            raise FileNotFoundError(f"Base algorithm does not exist: {src_algo}")
         with open(src_algo, 'r', encoding='utf-8') as f:
             original_code = f.read()
             
@@ -192,25 +271,63 @@ class ImplementationAgent:
                 f"`from {module_name} import {entrypoint_name}`. Do not import from a `memory_pool` package "
                 "and do not reimplement the artifact's internal logic."
             )
+
         else:
             integration_instruction = (
-                "No verified artifact is available for this node. Improve the original baseline directly "
+                "No verified artifact is available for this node. Improve the supplied parent baseline directly "
                 "according to the technique plan, keep the script self-contained, and do not import any "
                 "`memory_pool` module or imaginary artifact."
             )
 
+        if fidelity not in FIDELITY_PROFILES:
+            raise ValueError("fidelity must be 'screen', 'medium', or 'full'")
+        fidelity_profile = FIDELITY_PROFILES[fidelity]
+        operator_instruction = {
+            "refine": "Modify only the highest-impact relevant component; preserve working parent behavior elsewhere.",
+            "tune": "Preserve the model family and run a compact Optuna search with pruning and a fixed seed.",
+            "diversify": "Favor a sound model or representation whose errors are likely less correlated with the parent.",
+            "promote": "Preserve the parent method and evaluate it more rigorously at the requested fidelity.",
+        }.get(operator or "", "Apply the requested technique as a focused change to the parent pipeline.")
+
         system_prompt = (
-            "You are the Implementation Agent. Produce a complete executable revision of the original algorithm. "
+            "You are the Implementation Agent. Produce a complete executable revision of the supplied parent algorithm. "
             f"{integration_instruction} Ensure the output is valid Python code wrapped in a ```python block.\n"
+            f"Search operator: {operator or 'initial'}. {operator_instruction}\n"
+            f"Evaluation fidelity: {fidelity} ({json.dumps(fidelity_profile)}). These limits are mandatory.\n"
+            f"Execution accelerator: {accelerator}; available={sorted(exposed_accelerators)}. "
+            "The subprocess also exposes this value as AIBUILDAI_ACCELERATOR. When the selected accelerator is "
+            "CUDA or MPS, use the framework-native GPU/device option for every compatible training component "
+            "and move neural-network models and tensors to that device. Check that the framework backend is "
+            "usable and fall back to CPU only when that model/library has no working backend for the selected "
+            "accelerator. When the technique permits equivalent model families, prefer a GPU-capable learner "
+            "over a CPU-only one. Do not send small preprocessing or unsupported scikit-learn estimators to a GPU. "
+            "After training, report os.environ.get('AIBUILDAI_ACTUAL_ACCELERATOR', selected_device) in "
+            "result.json; GPU-aware pool artifacts update this variable when they fall back.\n"
+            "Import `prepare_evaluation_data` from the local `evaluation_contract` module and call "
+            f"`X_eval, y_eval, row_ids, fold_ids, evaluation_meta = prepare_evaluation_data(train_data, '{fidelity}')`. "
+            "Use X_eval/y_eval for every training and validation operation, use the supplied fold_ids exactly, "
+            "and train final test-prediction models on all X_eval rows. Save one OOF prediction per scheduled "
+            "row to oof_predictions.csv with columns row_id,target,prediction. Do not create a separate split.\n"
+            "Fit every imputer, encoder, scaler, feature selector, and target-dependent transform on training folds only. "
+            "Never use test-set statistics or target values in feature generation. Use stratification for classification.\n"
+            "When practical, save validation predictions to 'oof_predictions.csv' with columns row_id,target,prediction.\n"
             f"IMPORTANT: At the END of your script, write a JSON file 'result.json' in the current directory:\n"
-            f'  import json; json.dump({{"score": <float>, "metric": "{metric_name}", "direction": "{metric_direction}"}}, open("result.json", "w"))\n'
-            "The score should be the final validation metric value."
+            f'  import json; json.dump({{"score": <float>, "metric": "{metric_name}", "direction": "{metric_direction}", '
+            f'"cv_mean": <float>, "cv_std": <float>, "folds": <int>, "fidelity": "{fidelity}", '
+            f'"accelerator": <actual "cpu"|"cuda"|"mps">}}, open("result.json", "w"))\n'
+            "The score must be the cross-validation mean when CV is used, otherwise the held-out validation score."
         )
         
         technique_plan = technique_record.get("plan", "")
         
+        prompt_model_card = dict(model_card or {})
+        prompt_model_card.pop("code_content", None)
+        if prompt_model_card.get("verification_log"):
+            prompt_model_card["verification_log"] = str(
+                prompt_model_card["verification_log"]
+            )[-1200:]
         user_prompt = f"""
-            Original Code:
+            Parent Code ({'measured ancestor' if base_algorithm_path else 'generated baseline'}):
             ```python
             {original_code}
             ```
@@ -219,13 +336,14 @@ class ImplementationAgent:
             {technique_plan}
 
             Model Card details:
-            {json.dumps(model_card, indent=2) if model_card else "None"}
+            {json.dumps(prompt_model_card, indent=2) if prompt_model_card else "None"}
 
             {tech_code_str}
 
             {dataset_snapshot}
 
             {integration_instruction}
+            Inherited reusable files: {inherited_files}
             Return the complete updated file content.
             """
         response = call_llm(system_prompt, user_prompt, model=self.model_name)
@@ -236,6 +354,40 @@ class ImplementationAgent:
             clean_code = response.split("```python")[1].split("```")[0]
         elif "```" in response:
             clean_code = response.split("```")[1].split("```")[0]
+
+        guard_issues = inspect_generated_code(clean_code)
+        if guard_issues:
+            print(
+                "ImplementationAgent: Validation guard found leakage risks; "
+                "requesting a pre-execution repair."
+            )
+            repair_response = call_llm(
+                "You are an ML validation-safety reviewer. Repair every listed leakage defect while "
+                "preserving the intended model and focused change. Fit preprocessing only on training "
+                "folds. Return the complete corrected Python file in a ```python block.",
+                f"""
+Leakage defects:
+{json.dumps(guard_issues, indent=2)}
+
+Code:
+```python
+{clean_code}
+```
+""",
+                model=self.model_name,
+            )
+            if "```python" in repair_response:
+                clean_code = repair_response.split("```python", 1)[1].split("```", 1)[0]
+            elif "```" in repair_response:
+                clean_code = repair_response.split("```", 1)[1].split("```", 1)[0]
+            else:
+                clean_code = repair_response
+            remaining_issues = inspect_generated_code(clean_code)
+            if remaining_issues:
+                raise ValueError(
+                    "Generated implementation failed leakage guard after repair: "
+                    + "; ".join(remaining_issues)
+                )
             
         dest_code_file = node_dir / "algorithm.py"
         with open(dest_code_file, 'w', encoding='utf-8') as f:
@@ -246,7 +398,7 @@ class ImplementationAgent:
         cmd = [self.venv_python, "algorithm.py"]
         
         # Debug/Coder retry loop
-        max_attempts = 5
+        max_attempts = 3
         attempt = 0
         score = None
         score_source = "none"
@@ -256,6 +408,7 @@ class ImplementationAgent:
         exit_code = 0
         timeout_kill = False
         diagnostics = ""
+        result_data: Dict[str, Any] = {}
         
         while attempt < max_attempts:
             if attempt > 0:
@@ -268,17 +421,20 @@ class ImplementationAgent:
                     "CRITICAL: Start your Python code response with a brief comment block explaining the cause of the error and how you are fixing it. "
                     "This helps trace execution logical errors correctly.\n"
                     "Ensure the output is valid Python code wrapped in a ```python block.\n"
+                    "Fit preprocessing on training folds only; never derive preprocessing statistics from test data.\n"
+                    "Keep using evaluation_contract.prepare_evaluation_data and its supplied fold_ids exactly; "
+                    "write complete OOF predictions for the scheduled rows.\n"
+                    f"The selected accelerator is {accelerator}, exposed as AIBUILDAI_ACCELERATOR. Preserve "
+                    "framework-native GPU configuration when supported and retain a safe CPU fallback. Report "
+                    "AIBUILDAI_ACTUAL_ACCELERATOR after training.\n"
                     f"IMPORTANT: At the END of your script, write a JSON file 'result.json' in the current directory:\n"
-                    f'  import json; json.dump({{"score": <float>, "metric": "{metric_name}", "direction": "{metric_direction}"}}, open("result.json", "w"))\n'
+                    f'  import json; json.dump({{"score": <float>, "metric": "{metric_name}", "direction": "{metric_direction}", '
+                    f'"cv_mean": <float>, "cv_std": <float>, "folds": <int>, "fidelity": "{fidelity}", '
+                    f'"accelerator": <actual "cpu"|"cuda"|"mps">}}, open("result.json", "w"))\n'
                     "The score should be the final validation metric value."
                 )
                 
                 debug_user_prompt = f"""
-                Original Baseline Code:
-                ```python
-                {original_code}
-                ```
-
                 Your Previous Generated Code (which failed):
                 ```python
                 {clean_code}
@@ -297,9 +453,11 @@ class ImplementationAgent:
                 {stdout}
                 ```
 
-                {tech_code_str}
+                Artifact interface metadata:
+                {json.dumps(prompt_model_card.get('interface', {}), indent=2)}
 
-                {dataset_snapshot}
+                Required evaluation profile:
+                {json.dumps(fidelity_profile)}
 
                 Please debug and fix the code. Follow the integration instruction exactly and ensure all variables/datasets are loaded properly. Return the complete corrected code file.
                 """
@@ -311,7 +469,19 @@ class ImplementationAgent:
                     clean_code = response.split("```python")[1].split("```")[0]
                 elif "```" in response:
                     clean_code = response.split("```")[1].split("```")[0]
-                    
+
+                debug_guard_issues = inspect_generated_code(clean_code)
+                if debug_guard_issues:
+                    stderr = (
+                        "Static leakage guard rejected the debug revision:\n"
+                        + "\n".join(debug_guard_issues)
+                    )
+                    stdout = ""
+                    exit_code = -2
+                    timeout_kill = False
+                    attempt += 1
+                    continue
+
                 with open(dest_code_file, 'w', encoding='utf-8') as f:
                     f.write(clean_code.strip())
                 print(f"ImplementationAgent: Wrote revised glue code to {dest_code_file}")
@@ -321,23 +491,34 @@ class ImplementationAgent:
             stdout_lines = []
             stderr_lines = []
             
-            import time
             import fcntl
-            import os
 
             # Do not accept stale outputs from an earlier run in the same node folder.
             result_json_path = node_dir / "result.json"
             submission_path = node_dir / "submission" / "submission.csv"
-            for stale_output in (result_json_path, submission_path):
+            for stale_output in (
+                result_json_path,
+                submission_path,
+                node_dir / "oof_predictions.csv",
+                node_dir / "evaluation_manifest.json",
+                node_dir / "fold_assignments.csv",
+            ):
                 if stale_output.exists() or stale_output.is_symlink():
                     stale_output.unlink()
             
+            remaining_deadline = float(timeout) - (time.monotonic() - run_started)
+            if remaining_deadline <= 0:
+                exit_code = -1
+                timeout_kill = True
+                stderr = "overall experiment deadline exhausted before this attempt"
+                break
+
             proc = subprocess.Popen(
                 cmd,
                 cwd=node_dir,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                env=sanitized_subprocess_env(),
+                env=accelerator_subprocess_env(accelerator),
                 start_new_session=True,
             )
 
@@ -361,7 +542,7 @@ class ImplementationAgent:
                 
             start_time = time.time()
             last_output_time = time.time()
-            hard_timeout = float(timeout)
+            hard_timeout = remaining_deadline
             inactivity_timeout = min(1200.0, hard_timeout)
             
             while True:
@@ -435,11 +616,12 @@ class ImplementationAgent:
             proc.stdout.close()
             proc.stderr.close()
                 
-            # Save stderr to error.log for debugging
+            # Preserve individual failed-attempt diagnostics. error.log is reserved
+            # for the final failed state so recovered nodes are not mislabeled.
             diagnostics = stdout + "\n" + stderr
             if stderr.strip():
-                error_log_path = node_dir / "error.log"
-                with open(error_log_path, 'w', encoding='utf-8') as f:
+                attempt_log_path = node_dir / f"attempt_{attempt + 1}.log"
+                with open(attempt_log_path, 'w', encoding='utf-8') as f:
                     f.write(f"Attempt={attempt + 1}\nexit_code={exit_code}\ntimeout_kill={timeout_kill}\n\n")
                     f.write("=== STDERR ===\n")
                     f.write(stderr)
@@ -452,6 +634,7 @@ class ImplementationAgent:
             status = "completed"
             
             # Strategy 1: Parse result.json (structured contract)
+            result_data = {}
             if exit_code == 0 and result_json_path.exists():
                 try:
                     with open(result_json_path, 'r', encoding='utf-8') as f:
@@ -466,14 +649,75 @@ class ImplementationAgent:
                             raise ValueError(
                                 f"result direction {declared_direction!r} does not match {metric_direction!r}"
                             )
+                        declared_metric = result_data.get("metric")
+                        if declared_metric and declared_metric != metric_name:
+                            raise ValueError(
+                                f"result metric {declared_metric!r} does not match {metric_name!r}"
+                            )
+                        declared_fidelity = result_data.get("fidelity")
+                        if declared_fidelity and declared_fidelity != fidelity:
+                            raise ValueError(
+                                f"result fidelity {declared_fidelity!r} does not match {fidelity!r}"
+                            )
+                        declared_accelerator = result_data.get("accelerator")
+                        if enforce_evaluation_contract and declared_accelerator is None:
+                            raise ValueError(
+                                "result must declare the accelerator actually used"
+                            )
+                        if declared_accelerator is not None:
+                            declared_accelerator = str(declared_accelerator).lower()
+                            if declared_accelerator not in {"cpu", "cuda", "mps"}:
+                                raise ValueError(
+                                    "result accelerator must be cpu, cuda, or mps"
+                                )
+                            if declared_accelerator not in {"cpu", accelerator}:
+                                raise ValueError(
+                                    f"result claims {declared_accelerator!r}, but this node "
+                                    f"selected {accelerator!r}"
+                                )
+                            result_data["accelerator"] = declared_accelerator
+                        if result_data.get("cv_std") is not None:
+                            cv_std = float(result_data["cv_std"])
+                            if not math.isfinite(cv_std) or cv_std < 0:
+                                raise ValueError("cv_std must be finite and non-negative")
+                        if result_data.get("folds") is not None:
+                            folds = int(result_data["folds"])
+                            if folds < 1:
+                                raise ValueError("folds must be positive")
+                        if enforce_evaluation_contract:
+                            contract_validation = validate_evaluation_outputs(
+                                node_dir, fidelity, metric_name
+                            )
+                            result_data.update(contract_validation)
+                            score = float(contract_validation["cv_mean"])
+                            result_data["score"] = score
+                            result_data["metric"] = metric_name
+                            result_data["direction"] = metric_direction
+                            with open(result_json_path, "w", encoding="utf-8") as f:
+                                json.dump(result_data, f, indent=2)
                         score_source = "result.json"
                         print(f"ImplementationAgent: Score from result.json: {score} "
                               f"(metric={result_data.get('metric', '?')}, direction={result_data.get('direction', '?')})")
-                except (json.JSONDecodeError, TypeError, ValueError, OverflowError) as e:
+                except (
+                    json.JSONDecodeError,
+                    TypeError,
+                    ValueError,
+                    OverflowError,
+                    OSError,
+                ) as e:
+                    score = None
+                    score_source = "none"
+                    stderr = (stderr + "\nResult contract error: " + str(e)).strip()
+                    diagnostics = stdout + "\n" + stderr
                     print(f"ImplementationAgent: WARNING: result.json exists but couldn't parse: {e}")
             
             # Strategy 2: Regex fallback on stdout (handles negatives and scientific notation)
-            if score is None and exit_code == 0 and not timeout_kill:
+            if (
+                score is None
+                and exit_code == 0
+                and not timeout_kill
+                and not enforce_evaluation_contract
+            ):
                 # Match patterns like: "Score: 0.93245", "AUC: -0.123", "accuracy = 9.5e-3"
                 score_matches = re.findall(
                     r'(?:score|auc|accuracy|metric|rmse|mae|loss|f1)[:\s=]+(-?[0-9]+\.?[0-9]*(?:e[+-]?[0-9]+)?)',
@@ -511,8 +755,23 @@ class ImplementationAgent:
             status = "failed"
             print(f"ImplementationAgent: FAILED — subprocess exited cleanly but produced no score.")
         else:
+            (node_dir / "error.log").unlink(missing_ok=True)
             print(f"ImplementationAgent: Execution completed — exit_code={exit_code}, score={score}, "
                   f"source={score_source}, timeout_kill={timeout_kill}")
+
+        if status == "failed":
+            with open(node_dir / "error.log", "w", encoding="utf-8") as f:
+                f.write(stderr or diagnostics or "experiment failed without diagnostics")
+
+        actual_accelerator = (
+            result_data.get("accelerator", accelerator)
+            if status == "completed"
+            else None
+        )
+        execution_resource["reported_accelerator"] = actual_accelerator
+        with open(node_dir / "execution_resource.json", "w", encoding="utf-8") as f:
+            json.dump(execution_resource, f, indent=2)
+            f.write("\n")
         
         return {
             "status": status,
@@ -523,5 +782,27 @@ class ImplementationAgent:
             "stdout": stdout,
             "stderr": stderr,
             "diagnostics": diagnostics,
-            "code_path": str(dest_code_file)
+            "code_path": str(dest_code_file),
+            "base_code_path": str(src_algo),
+            "parent_node_dir": str(parent_node_dir) if parent_node_dir else None,
+            "inherited_files": inherited_files,
+            "operator": operator,
+            "fidelity": fidelity,
+            "accelerator": actual_accelerator,
+            "selected_accelerator": accelerator,
+            "elapsed_seconds": time.monotonic() - run_started,
+            "validation": {
+                key: result_data.get(key)
+                for key in (
+                    "cv_mean", "cv_std", "folds", "fold_scores", "seed",
+                    "fidelity", "row_count", "source_row_count",
+                    "fold_assignment_sha256",
+                )
+                if result_data.get(key) is not None
+            },
+            "oof_path": (
+                str(node_dir / "oof_predictions.csv")
+                if (node_dir / "oof_predictions.csv").is_file()
+                else None
+            ),
         }

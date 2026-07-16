@@ -15,17 +15,27 @@ from agents.data_analyzer import run_dataset_analysis
 from agents.implementation_agent import ImplementationAgent
 from agents.llm_utils import call_llm
 from agents.manager_agent import ManagerAgent
-from agents.setup_agent import _validate_requirement
-from eval.run_ablation import _prepare_run_input
-from memory_pool.query_tool import query_l2
+from agents.setup_agent import SetupAgent, _validate_requirement
+from agents.technique_agent import TechniqueAgent
+from agents.validation_guard import inspect_generated_code
+from eval.run_ablation import (
+    _prepare_run_input,
+    _run_baseline,
+    _write_token_usage_report,
+)
+from memory_pool.query_tool import infer_artifact_scope, query_l1, query_l2
 from memory_pool.builder.l2_builder import L2Builder
 from runtime_utils import (
+    accelerator_subprocess_env,
     sanitized_subprocess_env,
+    select_preferred_accelerator,
     validate_path_component,
     validate_storage_identifier,
 )
 from tree.node import NodeState
 from tree.scheduler import UCB1Scheduler
+from evaluation_contract import prepare_evaluation_data, validate_evaluation_outputs
+from eval.metrics import calculate_ablation_metrics
 
 
 class RuntimeSafetyTests(unittest.TestCase):
@@ -39,6 +49,25 @@ class RuntimeSafetyTests(unittest.TestCase):
             }
         )
         self.assertEqual(clean, {"PATH": "/bin"})
+
+    def test_accelerator_selection_prefers_gpu_and_falls_back_safely(self):
+        self.assertEqual(
+            select_preferred_accelerator({"cpu", "cuda", "mps"}, "auto"),
+            "cuda",
+        )
+        self.assertEqual(
+            select_preferred_accelerator({"cpu", "mps"}, "cuda"), "mps"
+        )
+        self.assertEqual(select_preferred_accelerator({"cpu"}, "auto"), "cpu")
+
+    def test_accelerator_contract_is_passed_to_sanitized_child(self):
+        env = accelerator_subprocess_env(
+            "cuda", {"PATH": "/bin", "API_KEY": "secret"}
+        )
+        self.assertNotIn("API_KEY", env)
+        self.assertEqual(env["AIBUILDAI_ACCELERATOR"], "cuda")
+        self.assertEqual(env["AIBUILDAI_PREFER_GPU"], "1")
+        self.assertEqual(env["AIBUILDAI_CUDA_DEVICES"], "0")
 
     def test_unknown_llm_provider_is_rejected(self):
         with patch.dict(os.environ, {"LLM_PROVIDER": "unknown"}, clear=True):
@@ -59,6 +88,26 @@ class RuntimeSafetyTests(unittest.TestCase):
         for value in ("https://example.com/pkg.whl", "pkg @ https://example.com/pkg.whl", "--index-url"):
             with self.assertRaises(ValueError):
                 _validate_requirement(value)
+
+    def test_generated_dependencies_use_exact_project_allowlist_entry(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            requirements = Path(temp_dir) / "requirements.txt"
+            requirements.write_text("pytorch-tabnet==4.1.0\nnumpy==2.0.0\n")
+            agent = SetupAgent(venv_python_path=sys.executable)
+            card = {
+                "artifact_id": "generated_tabnet",
+                "verified": False,
+                "dependencies": ["pytorch-tabnet>=4"],
+            }
+            with patch.object(agent, "install_dependencies") as install:
+                agent.install_allowlisted_dependencies([card], requirements)
+            install.assert_called_once_with(
+                [{"verified": True, "dependencies": ["pytorch-tabnet==4.1.0"]}]
+            )
+
+            card["dependencies"] = ["not-in-project>=1"]
+            with self.assertRaises(ValueError):
+                agent.install_allowlisted_dependencies([card], requirements)
 
     def test_builder_rejects_generated_path_traversal(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -108,6 +157,12 @@ class RuntimeSafetyTests(unittest.TestCase):
                         "category": "custom_models",
                         "description": "candidate",
                         "interface": {"entrypoint": "run(X_train, X_test)"},
+                        "scope": "model_family",
+                        "resource_profile": {
+                            "accelerator": "cpu",
+                            "min_ram_gb": 0,
+                            "estimated_runtime_seconds": 1,
+                        },
                         "dependencies": [],
                     },
                     "code": "def run(X_train, X_test): return X_test",
@@ -160,6 +215,79 @@ class RuntimeSafetyTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_verifier_rejects_predictions_with_wrong_test_length(self):
+        verifier = (
+            Path(__file__).resolve().parents[1]
+            / "memory_pool"
+            / "builder"
+            / "sandbox_verifier.py"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            artifact_dir = Path(temp_dir)
+            (artifact_dir / "short_model.py").write_text(
+                "def run(X_train, X_test):\n    return [0.5] * (len(X_test) // 2)\n"
+            )
+            card_file = artifact_dir / "short_model.json"
+            card_file.write_text(
+                json.dumps(
+                    {
+                        "artifact_id": "short_model",
+                        "category": "custom_models",
+                        "interface": {"entrypoint": "run(X_train, X_test)"},
+                        "code_path": "short_model.py",
+                    }
+                )
+            )
+            result = subprocess.run(
+                [sys.executable, str(verifier), str(card_file)],
+                cwd=artifact_dir,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("aligns with X_test length", result.stdout + result.stderr)
+
+    def test_evaluation_contract_restores_full_rows_and_recomputes_uncertainty(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            X = pd.DataFrame({"feature": range(80)})
+            X_val = pd.DataFrame({"feature": range(80, 100)})
+            train_data = {
+                "X": X,
+                "y": [0, 1] * 40,
+                "X_val": X_val,
+                "y_val": [0, 1] * 10,
+            }
+            X_eval, y_eval, row_ids, fold_ids, metadata = prepare_evaluation_data(
+                train_data, "full", output_dir=temp_dir
+            )
+            self.assertEqual(len(X_eval), 100)
+            self.assertEqual(metadata["source_row_count"], 100)
+            predictions = [0.1 if target == 0 else 0.9 for target in y_eval]
+            pd.DataFrame(
+                {
+                    "row_id": row_ids,
+                    "target": y_eval,
+                    "prediction": predictions,
+                    "fold_id": fold_ids,
+                }
+            ).to_csv(Path(temp_dir) / "oof_predictions.csv", index=False)
+            validation = validate_evaluation_outputs(temp_dir, "full", "roc_auc")
+            self.assertEqual(validation["folds"], 5)
+            self.assertEqual(validation["row_count"], 100)
+            self.assertEqual(len(validation["fold_scores"]), 5)
+
+    def test_skipped_implementations_do_not_distort_ablation_denominators(self):
+        metrics = calculate_ablation_metrics(
+            [
+                {"type": "implementation", "status": "completed", "score": 0.8},
+                {"type": "implementation", "status": "failed", "score": None},
+                {"type": "implementation", "status": "skipped_infeasible", "score": None},
+            ],
+            baseline_score=0.7,
+        )
+        self.assertEqual(metrics["overcome_rate"], 0.5)
+
     def test_run_input_excludes_previous_submission(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -171,6 +299,79 @@ class RuntimeSafetyTests(unittest.TestCase):
             _prepare_run_input(task_dir, run_dir)
             self.assertTrue((run_dir / "input" / "train.csv").exists())
             self.assertFalse((run_dir / "input" / "submission.csv").exists())
+
+    def test_token_usage_report_includes_end_to_end_input_and_output_totals(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            report_file = _write_token_usage_report(
+                "example_task",
+                {"input_tokens": 120, "output_tokens": 30},
+                {"input_tokens": 450, "output_tokens": 90},
+                runs_root=Path(temp_dir),
+            )
+            report = json.loads(report_file.read_text())
+            self.assertEqual(
+                report["baseline"],
+                {"input_tokens": 120, "output_tokens": 30, "total_tokens": 150},
+            )
+            self.assertEqual(
+                report["complete_system"],
+                {"input_tokens": 450, "output_tokens": 90, "total_tokens": 540},
+            )
+            self.assertEqual(
+                report["overall"],
+                {"input_tokens": 570, "output_tokens": 120, "total_tokens": 690},
+            )
+
+    def test_failed_baseline_invokes_bounded_debugging_then_retries(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            task_dir = root / "task"
+            baseline_dir = root / "baseline"
+            task_dir.mkdir()
+            (task_dir / "initial_dataloader.py").write_text(
+                "class MyDataLoader:\n    pass\n"
+            )
+            (task_dir / "initial_algorithm.py").write_text("raise RuntimeError('bad')\n")
+
+            class ManagerStub:
+                venv_path = sys.executable
+                subprocess_timeout = 3
+                metric_direction = "maximize"
+                metric_name = "roc_auc"
+                model_name = None
+
+            manager = ManagerStub()
+            manager.task_dir = task_dir
+            executions = 0
+
+            def fake_run(*args, **kwargs):
+                nonlocal executions
+                executions += 1
+                if executions == 1:
+                    return subprocess.CompletedProcess(
+                        args[0], 1, stdout="", stderr="loader lifecycle error"
+                    )
+                (baseline_dir / "result.json").write_text(
+                    '{"score": 0.75, "direction": "maximize"}'
+                )
+                (baseline_dir / "submission").mkdir(exist_ok=True)
+                (baseline_dir / "submission" / "submission.csv").write_text(
+                    "id,prediction\n1,0.5\n"
+                )
+                return subprocess.CompletedProcess(args[0], 0, stdout="", stderr="")
+
+            with (
+                patch("eval.run_ablation.subprocess.run", side_effect=fake_run),
+                patch(
+                    "eval.run_ablation.InitialAgent.repair_initial_algorithm"
+                ) as repair,
+            ):
+                score = _run_baseline(manager, baseline_dir, max_debug_attempts=1)
+
+            self.assertEqual(score, 0.75)
+            self.assertEqual(executions, 2)
+            repair.assert_called_once()
+            self.assertTrue((baseline_dir / "baseline_debug.log").is_file())
 
     def test_continuous_target_is_not_reported_as_rare_classes(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -223,6 +424,22 @@ class RuntimeSafetyTests(unittest.TestCase):
             self.assertEqual(node_state["status"], "pending")
             self.assertEqual(tree_state["nodes"]["node_8"]["status"], "pending")
 
+    def test_existing_run_is_archived_before_a_fresh_search(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = ManagerAgent.__new__(ManagerAgent)
+            manager.run_root = Path(temp_dir) / "complete_system"
+            manager.run_root.mkdir()
+            (manager.run_root / "tree_state.json").write_text("stale")
+
+            manager._prepare_run_root()
+
+            self.assertEqual(list(manager.run_root.iterdir()), [])
+            archives = list((Path(temp_dir) / "archive").iterdir())
+            self.assertEqual(len(archives), 1)
+            self.assertEqual(
+                (archives[0] / "tree_state.json").read_text(), "stale"
+            )
+
     def test_task_validation_is_written_to_committed_model_card(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             project_root = Path(temp_dir)
@@ -257,8 +474,233 @@ class RuntimeSafetyTests(unittest.TestCase):
             saved_card = json.loads(card_file.read_text())
             self.assertEqual(saved_card["task_validations"], [validation])
 
+    def test_pool_summary_exposes_empirical_validation_history(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pool = Path(temp_dir)
+            category_dir = pool / "l2_store" / "models"
+            category_dir.mkdir(parents=True)
+            (pool / "l1_index.json").write_text(
+                json.dumps(
+                    {"models": {"description": "models", "l2_pointers": ["model_a"]}}
+                )
+            )
+            (category_dir / "model_a.json").write_text(
+                json.dumps(
+                    {
+                        "artifact_id": "model_a",
+                        "category": "models",
+                        "description": "test model",
+                        "interface": {"entrypoint": "run(X)"},
+                        "verified": True,
+                        "task_validations": [
+                            {
+                                "status": "completed",
+                                "score": 0.8,
+                                "reward": 0.2,
+                                "improved_over_baseline": True,
+                            },
+                            {"status": "failed", "score": None},
+                        ],
+                    }
+                )
+            )
+            with patch("memory_pool.query_tool.BASE_DIR", pool):
+                summary = query_l1("models")["artifacts"][0]["validation_summary"]
+            self.assertEqual(summary["runs"], 2)
+            self.assertEqual(summary["failures"], 1)
+            self.assertEqual(summary["improvement_rate"], 1.0)
+
+    def test_validation_guard_detects_test_fitted_preprocessing(self):
+        code = """
+import pandas as pd
+combined = pd.concat([X_train, X_test])
+encoder.fit(combined)
+X_test = X_test.fillna(X_test.mean())
+"""
+        issues = inspect_generated_code(code)
+        self.assertEqual(len(issues), 2)
+        self.assertTrue(any("fit" in issue for issue in issues))
+        self.assertTrue(any("test-set mean" in issue for issue in issues))
+
 
 class SchedulerTests(unittest.TestCase):
+    def test_ucb_decay_starts_after_forced_warmup(self):
+        scheduler = UCB1Scheduler(total_budget=6)
+        scheduler.set_warmup_budget(2)
+        self.assertEqual(scheduler.get_exploration_constant(0), scheduler.c_0)
+        self.assertEqual(scheduler.get_exploration_constant(2), scheduler.c_0)
+        self.assertEqual(scheduler.get_exploration_constant(6), scheduler.c_min)
+
+    def test_initial_fanout_scales_with_budget(self):
+        self.assertEqual(ManagerAgent._initial_fanout_for_budget(1), 1)
+        self.assertEqual(ManagerAgent._initial_fanout_for_budget(6), 2)
+        self.assertEqual(ManagerAgent._initial_fanout_for_budget(60), 3)
+
+    def test_cv_uncertainty_reduces_scheduling_reward(self):
+        manager = ManagerAgent.__new__(ManagerAgent)
+        manager.baseline_score = 0.95
+        manager.metric_direction = "maximize"
+        manager.uncertainty_weight = 1.0
+        certain = manager._score_to_reward(0.954, cv_std=0.0)
+        noisy = manager._score_to_reward(0.954, cv_std=0.003)
+        self.assertLess(noisy, certain)
+
+    def test_gpu_only_artifact_is_skipped_on_cpu_capacity(self):
+        manager = ManagerAgent.__new__(ManagerAgent)
+        manager.available_accelerators = {"cpu"}
+        manager.available_ram_gb = 16.0
+        manager.subprocess_timeout = 300
+        reason = manager._feasibility_reason(
+            {
+                "resource_profile": {
+                    "accelerator": "gpu",
+                    "min_ram_gb": 8,
+                    "estimated_runtime_seconds": 60,
+                }
+            }
+        )
+        self.assertIn("requires a GPU", reason)
+
+    def test_l1_prefilter_caps_categories_before_prompting(self):
+        agent = TechniqueAgent(max_l1_categories=3)
+        l1_index = {
+            f"category_{index}": {"description": f"method {index}"}
+            for index in range(10)
+        }
+        visible = agent._prefilter_l1(l1_index, "method 7")
+        self.assertEqual(len(visible), 3)
+        self.assertIn("category_7", visible)
+
+    def test_legacy_pool_scope_is_inferred_conservatively(self):
+        self.assertEqual(
+            infer_artifact_scope({}, "feature_engineering_tabular"), "component"
+        )
+        self.assertEqual(
+            infer_artifact_scope({}, "gbdt_ensembling"), "model_family"
+        )
+        self.assertEqual(
+            infer_artifact_scope({}, "blending_stacking"), "full_pipeline"
+        )
+
+    def test_artifact_prior_uses_empirical_reward_not_only_llm_text(self):
+        agent = TechniqueAgent()
+        proven = {
+            "artifact_id": "catboost_model",
+            "category": "gbdt_ensembling",
+            "description": "catboost model",
+            "interface": {},
+            "validation_summary": {
+                "runs": 5,
+                "mean_reward": 0.5,
+                "improvement_rate": 1.0,
+            },
+        }
+        untested = {
+            **proven,
+            "artifact_id": "untested_catboost_model",
+            "validation_summary": {
+                "runs": 0,
+                "mean_reward": None,
+                "improvement_rate": None,
+            },
+        }
+        self.assertGreater(
+            agent._artifact_prior(proven, "catboost model", total_runs=5),
+            agent._artifact_prior(untested, "catboost model", total_runs=5),
+        )
+
+    def test_artifact_prior_rewards_compatible_gpu_artifact(self):
+        agent = TechniqueAgent()
+        candidate = {
+            "artifact_id": "gpu_model",
+            "category": "models",
+            "description": "model",
+            "interface": {},
+            "validation_summary": {"runs": 0},
+            "capabilities": {
+                "gpu_accelerated": True,
+                "supported_accelerators": ["cpu", "cuda"],
+            },
+        }
+        cpu_only = {
+            **candidate,
+            "artifact_id": "cpu_model",
+            "capabilities": {"gpu_accelerated": False},
+        }
+        self.assertGreater(
+            agent._artifact_prior(
+                candidate, "model", total_runs=0, preferred_accelerator="cuda"
+            ),
+            agent._artifact_prior(
+                cpu_only, "model", total_runs=0, preferred_accelerator="cuda"
+            ),
+        )
+
+    def test_follow_up_slots_are_created_without_eager_llm_generation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = ManagerAgent.__new__(ManagerAgent)
+            manager.run_root = Path(temp_dir)
+            manager.task_name = "example"
+            manager.metric_direction = "maximize"
+            manager.baseline_score = 0.5
+            manager.total_budget = 6
+            manager.experiments_executed = 1
+            manager.initial_fanout = 2
+            manager.available_accelerators = {"cpu"}
+            manager.available_ram_gb = 8.0
+            manager.enable_multi_fidelity = True
+            manager.node_counter = 1
+            manager.technique_agent = TechniqueAgent()
+            parent_code = Path(temp_dir) / "algorithm.py"
+            parent_code.write_text("print('parent')\n")
+            root = NodeState("root", None, "technique", executed=True)
+            parent = NodeState(
+                "node_1",
+                "root",
+                "implementation",
+                code=str(parent_code),
+                result={"score": 0.7, "reward": 0.2},
+                executed=True,
+                fidelity="screen",
+            )
+            root.children_ids = ["node_1"]
+            manager.all_nodes = {"root": root, "node_1": parent}
+
+            with patch.object(
+                manager.technique_agent, "generate_follow_up_approaches"
+            ) as eager_generation:
+                manager._spawn_follow_up_nodes(parent, "node_1")
+
+            eager_generation.assert_not_called()
+            children = [manager.all_nodes[node_id] for node_id in parent.children_ids]
+            self.assertEqual(len(children), 3)
+            self.assertTrue(all(child.config["lazy_proposal"] for child in children))
+            self.assertTrue(all(not child.config["materialized"] for child in children))
+
+    def test_identical_parent_and_child_outputs_are_marked_no_effect(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = ManagerAgent.__new__(ManagerAgent)
+            manager.run_root = Path(temp_dir)
+            parent_dir = manager.run_root / "parent"
+            child_dir = manager.run_root / "child"
+            for directory in (parent_dir, child_dir):
+                (directory / "submission").mkdir(parents=True)
+                (directory / "oof_predictions.csv").write_text(
+                    "row_id,target,prediction\n1,0,0.2\n"
+                )
+                (directory / "submission" / "submission.csv").write_text(
+                    "id,target\n1,0.2\n"
+                )
+            node = NodeState(
+                "child",
+                "technique",
+                "implementation",
+                config={"base_node_id": "parent"},
+            )
+            self.assertIn(
+                "byte-identical", manager._no_effect_reason(node, child_dir)
+            )
+
     def test_exhausted_tree_returns_none_instead_of_reexecuting_root(self):
         root = NodeState("root", None, "technique", executed=True)
         child = NodeState("child", "root", "implementation", executed=True)
@@ -337,8 +779,89 @@ class AggregatorTests(unittest.TestCase):
                 )
             )
 
+    def test_oof_history_can_weight_ranked_candidates(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            for node_id, test_predictions, oof_predictions in (
+                ("good", [0.1, 0.9], [0.1, 0.9]),
+                ("bad", [0.9, 0.1], [0.9, 0.1]),
+            ):
+                submission_dir = root / node_id / "submission"
+                submission_dir.mkdir(parents=True)
+                pd.DataFrame(
+                    {"id": [1, 2], "prediction": test_predictions}
+                ).to_csv(submission_dir / "submission.csv", index=False)
+                pd.DataFrame(
+                    {
+                        "row_id": [10, 11],
+                        "target": [0, 1],
+                        "prediction": oof_predictions,
+                    }
+                ).to_csv(root / node_id / "oof_predictions.csv", index=False)
+            output = root / "ensemble.csv"
+            selected = AggregatorAgent().aggregate_ranked_candidates(
+                root,
+                [
+                    {"node_id": "good", "score": 0.9},
+                    {"node_id": "bad", "score": 0.6},
+                ],
+                output,
+                top_k=2,
+                strategy="average",
+                metric_name="roc_auc",
+                correlation_limit=1.1,
+            )
+            self.assertEqual(selected, ["good", "bad"])
+            result = pd.read_csv(output)
+            self.assertLess(result.loc[0, "prediction"], 0.5)
+            self.assertGreater(result.loc[1, "prediction"], 0.5)
+
 
 class ImplementationExecutionTests(unittest.TestCase):
+    def test_descendant_uses_parent_code_and_inherits_support_files(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            task_dir = root / "task"
+            parent_dir = root / "parent"
+            node_dir = root / "child"
+            task_dir.mkdir()
+            parent_dir.mkdir()
+            (task_dir / "initial_algorithm.py").write_text("BASELINE_MARKER = True\n")
+            (task_dir / "initial_dataloader.py").write_text("LOADER_MARKER = True\n")
+            parent_code = parent_dir / "algorithm.py"
+            parent_code.write_text("PARENT_MARKER = True\n")
+            (parent_dir / "support.json").write_text('{"value": 1}')
+            generated = """
+import json
+from pathlib import Path
+Path('submission').mkdir(exist_ok=True)
+Path('submission/submission.csv').write_text('id,prediction\\n1,0.5\\n')
+json.dump({'score': 0.7, 'direction': 'maximize', 'fidelity': 'medium'}, open('result.json', 'w'))
+"""
+            prompts = []
+
+            def fake_llm(system, user, **kwargs):
+                prompts.append(user)
+                return generated
+
+            agent = ImplementationAgent(venv_python_path=sys.executable)
+            with patch("agents.implementation_agent.call_llm", side_effect=fake_llm):
+                result = agent.run(
+                    node_dir,
+                    {},
+                    task_dir,
+                    timeout=3,
+                    base_algorithm_path=parent_code,
+                    parent_node_dir=parent_dir,
+                    fidelity="medium",
+                    operator="refine",
+                )
+            self.assertEqual(result["status"], "completed")
+            self.assertIn("PARENT_MARKER", prompts[0])
+            self.assertNotIn("BASELINE_MARKER", prompts[0])
+            self.assertTrue((node_dir / "support.json").is_file())
+            self.assertTrue((node_dir / "initial_dataloader.py").is_file())
+
     def test_stale_result_is_not_accepted_after_process_failure(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

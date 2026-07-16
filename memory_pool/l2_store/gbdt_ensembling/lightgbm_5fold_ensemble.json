@@ -1,11 +1,42 @@
 {
   "artifact_id": "lightgbm_5fold_ensemble",
   "category": "gbdt_ensembling",
+  "scope": "model_family",
+  "resource_profile": {
+    "accelerator": "any",
+    "min_ram_gb": 4,
+    "estimated_runtime_seconds": 180
+  },
   "description": "5-fold LightGBM trained on tabular features, returns OOF and test predictions.",
   "interface": {
-    "entrypoint": "fit_predict(X_train, y_train, X_test, cat_features=None, n_folds=5, is_classification=True) -> (oof_preds, test_preds, model_list)",
+    "entrypoint": "fit_predict(X_train, y_train, X_test, cat_features=None, n_folds=5, is_classification=True, device=None, lightgbm_params=None) -> (oof_preds, test_preds, model_list)",
     "input_shapes": "X_train: pd.DataFrame, y_train: np.ndarray, X_test: pd.DataFrame",
-    "output_shapes": "oof_preds: np.ndarray, test_preds: np.ndarray, model_list: list"
+    "output_shapes": "oof_preds: np.ndarray, test_preds: np.ndarray, model_list: list",
+    "output_contract": {
+      "kind": "predictions",
+      "aligned_to": "X_test"
+    }
+  },
+  "capabilities": {
+    "supported_operators": [
+      "initial",
+      "refine",
+      "tune",
+      "diversify",
+      "promote"
+    ],
+    "tunable_parameters": [
+      "n_estimators",
+      "learning_rate",
+      "max_depth",
+      "num_leaves",
+      "subsample"
+    ],
+    "gpu_accelerated": true,
+    "supported_accelerators": [
+      "cpu",
+      "cuda"
+    ]
   },
   "code_path": "lightgbm_5fold_ensemble.py",
   "dependencies": [
@@ -17,12 +48,14 @@
   "usage_example": "oof, test_preds, models = fit_predict(X_train, y_train, X_test, cat_features=['sex','cp'])",
   "known_pitfalls": [
     "Categorical columns must be passed as cat_features by name or index.",
-    "LGBM handles categorical values best if they are int-encoded."
+    "LGBM handles categorical values best if they are int-encoded.",
+    "The installed LightGBM package must include GPU support; otherwise each fold retries on CPU."
   ],
   "provenance": {
     "source_type": "prior_run_takeaway",
     "source_url_or_run_id": "manual"
   },
   "verified": true,
-  "verification_log": "Passed sandbox verification at 2026-07-09 20:53:09.\nOutput:\nSUCCESS"
+  "verification_log": "Passed subprocess verification at 2026-07-16 12:28:41.\nOutput:\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\n[LightGBM] [Warning] Met negative value in categorical features, will convert it to NaN\nFunction returned type: tuple\nReturned tabular lengths: [100, 30]\nSUCCESS\n\n<HOME>/.matplotlib is not a writable directory\nMatplotlib created a temporary cache directory at <TEMP_PATH> because there was an issue with the default path ({configdir}); it is highly recommended to set the MPLCONFIGDIR environment variable to a writable directory, in particular to speed up the import of Matplotlib and to better support multiprocessing.\n<HOME>/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/.venv/lib/python3.11/site-packages/joblib/externals/loky/backend/context.py:131: UserWarning: Could not find the number of physical cores for the following reason:\ninvalid literal for int() with base 10: ''\nReturning the number of logical cores instead. You can silence this warning by setting LOKY_MAX_CPU_COUNT to the number of cores you want to use.\n  warnings.warn(\n  File \"<HOME>/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/.venv/lib/python3.11/site-packages/joblib/externals/loky/backend/context.py\", line 249, in _count_physical_cores\n    cpu_count_physical = _count_physical_cores_darwin()\n                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"<HOME>/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/.venv/lib/python3.11/site-packages/joblib/externals/loky/backend/context.py\", line 318, in _count_physical_cores_darwin\n    return int(cpu_info)\n           ^^^^^^^^^^^^^",
+  "verification_level": "contract-mock-data"
 }

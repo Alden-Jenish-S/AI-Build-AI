@@ -1,9 +1,29 @@
 {
   "artifact_id": "stacked_logistic_xgboost",
   "category": "blending_stacking",
+  "scope": "full_pipeline",
+  "resource_profile": {
+    "accelerator": "any",
+    "min_ram_gb": 4,
+    "estimated_runtime_seconds": 240
+  },
   "description": "Two-level stacking ensemble combining Logistic Regression and XGBoost with out-of-fold predictions to generate test probabilities.",
   "interface": {
     "entrypoint": "fit_predict_stacked_entrypoint(train_df, test_df, target_col='target')"
+  },
+  "capabilities": {
+    "supported_operators": [
+      "initial",
+      "refine",
+      "diversify",
+      "promote"
+    ],
+    "tunable_parameters": [],
+    "gpu_accelerated": true,
+    "supported_accelerators": [
+      "cpu",
+      "cuda"
+    ]
   },
   "dependencies": [
     "numpy",
@@ -12,7 +32,10 @@
     "xgboost"
   ],
   "verified": true,
-  "verification_log": "Passed subprocess verification at 2026-07-14 13:24:13.\nOutput:\nFunction returned type: ndarray\nResult length: 30\nSUCCESS",
+  "verification_log": "Passed subprocess verification at 2026-07-16 12:28:44.\nOutput:\nFunction returned type: ndarray\nReturned tabular lengths: [30]\nSUCCESS",
   "code_path": "stacked_logistic_xgboost.py",
-  "verification_level": "shape-only-mock-data"
+  "verification_level": "contract-mock-data",
+  "known_pitfalls": [
+    "Only the XGBoost base learner uses CUDA; logistic regression remains on CPU and unavailable CUDA builds retry safely on CPU."
+  ]
 }

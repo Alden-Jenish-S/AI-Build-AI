@@ -1,9 +1,29 @@
 {
   "artifact_id": "stacking_ensemble_blend",
   "category": "blending_stacking",
+  "scope": "full_pipeline",
+  "resource_profile": {
+    "accelerator": "any",
+    "min_ram_gb": 8,
+    "estimated_runtime_seconds": 300
+  },
   "description": "Stacking ensemble that generates out-of-fold predictions for base learners, trains a meta\u2011learner on those predictions, and blends meta and base probabilities.",
   "interface": {
-    "entrypoint": "train_and_predict(X_train, y_train, X_test)"
+    "entrypoint": "train_and_predict(X_train, y_train, X_test, device=None)"
+  },
+  "capabilities": {
+    "supported_operators": [
+      "initial",
+      "refine",
+      "diversify",
+      "promote"
+    ],
+    "tunable_parameters": [],
+    "gpu_accelerated": true,
+    "supported_accelerators": [
+      "cpu",
+      "cuda"
+    ]
   },
   "dependencies": [
     "numpy",
@@ -11,8 +31,25 @@
     "catboost",
     "lightgbm"
   ],
+  "known_pitfalls": [
+    "CatBoost and LightGBM require GPU-enabled builds; either learner retries on CPU if its CUDA backend is unavailable.",
+    "The logistic-regression base and meta learners always run on CPU."
+  ],
   "verified": true,
-  "verification_log": "Passed subprocess verification at 2026-07-14 13:24:14.\nOutput:\nFunction returned type: ndarray\nResult length: 30\nSUCCESS\n\n<HOME>/.matplotlib is not a writable directory\nMatplotlib created a temporary cache directory at <TEMP_PATH> because there was an issue with the default path ({configdir}); it is highly recommended to set the MPLCONFIGDIR environment variable to a writable directory, in particular to speed up the import of Matplotlib and to better support multiprocessing.\n<HOME>/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/.venv/lib/python3.11/site-packages/joblib/externals/loky/backend/context.py:131: UserWarning: Could not find the number of physical cores for the following reason:\ninvalid literal for int() with base 10: ''\nReturning the number of logical cores instead. You can silence this warning by setting LOKY_MAX_CPU_COUNT to the number of cores you want to use.\n  warnings.warn(\n  File \"<HOME>/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/.venv/lib/python3.11/site-packages/joblib/externals/loky/backend/context.py\", line 249, in _count_physical_cores\n    cpu_count_physical = _count_physical_cores_darwin()\n                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"<HOME>/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/.venv/lib/python3.11/site-packages/joblib/externals/loky/backend/context.py\", line 318, in _count_physical_cores_darwin\n    return int(cpu_info)\n           ^^^^^^^^^^^^^\n<HOME>/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/.venv/lib/python3.11/site-packages/sklearn/utils/validation.py:2827: UserWarning: X does not have valid feature names, but LGBMClassifier was fitted with feature names\n  warnings.warn(\n<HOME>/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/.venv/lib/python3.11/site-packages/sklearn/utils/validation.py:2827: UserWarning: X does not have valid feature names, but LGBMClassifier was fitted with feature names\n  warnings.warn(\n<HOME>/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/.venv/lib/python3.11/site-packages/sklearn/utils/validation.py:2827: UserWarning: X does not have valid feature names, but LGBMClassifier was fitted with feature names\n  warnings.warn(\n<HOME>/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/.venv/lib/python3.11/site-packages/sklearn/utils/validation.py:2827: UserWarning: X does not have valid feature names, but LGBMClassifier was fitted with feature names\n  warnings.warn(\n<HOME>/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/.venv/lib/python3.11/site-packages/sklearn/utils/validation.py:2827: UserWarning: X does not have valid feature names, but LGBMClassifier was fitted with feature names\n  warnings.warn(\n<HOME>/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/.venv/lib/python3.11/site-packages/sklearn/utils/validation.py:2827: UserWarning: X does not have valid feature names, but LGBMClassifier was fitted with feature names\n  warnings.warn(",
+  "verification_log": "Passed subprocess verification at 2026-07-16 12:28:47.\nOutput:\nFunction returned type: ndarray\nReturned tabular lengths: [30]\nSUCCESS\n\n<HOME>/.matplotlib is not a writable directory\nMatplotlib created a temporary cache directory at <TEMP_PATH> because there was an issue with the default path ({configdir}); it is highly recommended to set the MPLCONFIGDIR environment variable to a writable directory, in particular to speed up the import of Matplotlib and to better support multiprocessing.\n<HOME>/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/.venv/lib/python3.11/site-packages/joblib/externals/loky/backend/context.py:131: UserWarning: Could not find the number of physical cores for the following reason:\ninvalid literal for int() with base 10: ''\nReturning the number of logical cores instead. You can silence this warning by setting LOKY_MAX_CPU_COUNT to the number of cores you want to use.\n  warnings.warn(\n  File \"<HOME>/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/.venv/lib/python3.11/site-packages/joblib/externals/loky/backend/context.py\", line 249, in _count_physical_cores\n    cpu_count_physical = _count_physical_cores_darwin()\n                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"<HOME>/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/.venv/lib/python3.11/site-packages/joblib/externals/loky/backend/context.py\", line 318, in _count_physical_cores_darwin\n    return int(cpu_info)\n           ^^^^^^^^^^^^^\n<HOME>/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/.venv/lib/python3.11/site-packages/sklearn/utils/validation.py:2827: UserWarning: X does not have valid feature names, but LGBMClassifier was fitted with feature names\n  warnings.warn(\n<HOME>/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/.venv/lib/python3.11/site-packages/sklearn/utils/validation.py:2827: UserWarning: X does not have valid feature names, but LGBMClassifier was fitted with feature names\n  warnings.warn(\n<HOME>/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/.venv/lib/python3.11/site-packages/sklearn/utils/validation.py:2827: UserWarning: X does not have valid feature names, but LGBMClassifier was fitted with feature names\n  warnings.warn(\n<HOME>/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/.venv/lib/python3.11/site-packages/sklearn/utils/validation.py:2827: UserWarning: X does not have valid feature names, but LGBMClassifier was fitted with feature names\n  warnings.warn(\n<HOME>/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/.venv/lib/python3.11/site-packages/sklearn/utils/validation.py:2827: UserWarning: X does not have valid feature names, but LGBMClassifier was fitted with feature names\n  warnings.warn(\n<HOME>/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/.venv/lib/python3.11/site-packages/sklearn/utils/validation.py:2827: UserWarning: X does not have valid feature names, but LGBMClassifier was fitted with feature names\n  warnings.warn(",
   "code_path": "stacking_ensemble_blend.py",
-  "verification_level": "shape-only-mock-data"
+  "verification_level": "contract-mock-data",
+  "task_validations": [
+    {
+      "task_name": "playground-series-s6e2",
+      "node_id": "node_6",
+      "score": 0.9505704058184936,
+      "metric_direction": "maximize",
+      "status": "completed",
+      "reward": 0.00822883551315419,
+      "fidelity": "screen",
+      "elapsed_seconds": 158.37797129199953,
+      "improved_over_baseline": true
+    }
+  ]
 }

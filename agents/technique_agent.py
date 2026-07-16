@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import re
 from pathlib import Path
@@ -8,37 +9,54 @@ from .web_search import search_web
 from memory_pool.query_tool import query
 
 class TechniqueAgent:
-    def __init__(self, model_name: str = None):
+    def __init__(
+        self,
+        model_name: str = None,
+        max_l1_categories: int = 8,
+        max_artifact_candidates: int = 5,
+    ):
         self.model_name = model_name
+        self.max_l1_categories = max(1, int(max_l1_categories))
+        self.max_artifact_candidates = max(1, int(max_artifact_candidates))
 
-    def generate_initial_approaches(self, task_description: str) -> List[Dict[str, str]]:
+    def generate_initial_approaches(
+        self, task_description: str, count: int = 3
+    ) -> List[Dict[str, str]]:
         """
-        Suggests 3 distinct machine learning approaches tailored to the task description.
+        Suggests a budget-aware number of distinct full modeling approaches.
         Returns a list of dicts: [{'name': '...', 'plan': '...'}]
         """
-        print("TechniqueAgent: Generating 3 dynamic initial approaches based on task description...")
+        count = max(1, min(3, int(count)))
+        print(
+            f"TechniqueAgent: Generating {count} dynamic initial approaches "
+            "based on task description..."
+        )
         system_prompt = (
             "You are the Technique Agent. Given a machine learning task description, think from first principles "
-            "and propose 3 distinct, promising, and tailored modeling or preprocessing approaches (branches) "
+            f"and propose {count} distinct, promising, and tailored full modeling approaches (branches) "
             "that make sense for this specific task.\n"
-            "Respond ONLY with a valid JSON list of 3 dictionaries. Each dictionary must have two keys:\n"
+            f"Respond ONLY with a valid JSON list of {count} dictionaries. Each dictionary must have two keys:\n"
             "1. 'name': A short camel_case or snake_case name for the branch (e.g., 'xgboost_with_target_encoding', 'feature_interactions_rf', 'mlp_tabular').\n"
             "2. 'plan': A detailed description of the approach, serving as a strategic direction for the technique selection.\n"
             "Do not reuse stock branch labels like Branch_A_Ensembling, Branch_B_Features, or Branch_C_DeepLearning. "
+            "Each root branch must specify a complete pipeline or model family, not a standalone scaler, encoder, imputer, or CV utility. "
             "The branches must be task-specific, complementary, and directly implementable.\n"
             "Do not include any explanation or markdown formatting, just the raw JSON list."
         )
-        user_prompt = f"Task Description:\n{task_description}\n\nPropose the 3 best approaches in JSON format."
+        user_prompt = (
+            f"Task Description:\n{task_description}\n\n"
+            f"Propose the {count} best approaches in JSON format."
+        )
         response = call_llm(system_prompt, user_prompt, model=self.model_name)
 
         try:
-            return self._parse_initial_approaches(response)
+            return self._parse_initial_approaches(response, count)
         except Exception as parse_error:
             print(f"TechniqueAgent WARNING: Failed to parse initial approaches JSON: {parse_error}. Asking LLM to repair the response.")
 
         repair_system = (
             "You repair malformed JSON for an ML technique planner. "
-            "Return ONLY a valid JSON list of exactly 3 dictionaries, each with non-empty 'name' and 'plan' strings. "
+            f"Return ONLY a valid JSON list of exactly {count} dictionaries, each with non-empty 'name' and 'plan' strings. "
             "Do not invent generic fallback branches; preserve and clean the task-specific ideas from the draft."
         )
         repair_user = f"""
@@ -51,9 +69,11 @@ Malformed Draft:
 Return repaired JSON only.
 """
         repaired_response = call_llm(repair_system, repair_user, model=self.model_name)
-        return self._parse_initial_approaches(repaired_response)
+        return self._parse_initial_approaches(repaired_response, count)
 
-    def _parse_initial_approaches(self, response: str) -> List[Dict[str, str]]:
+    def _parse_initial_approaches(
+        self, response: str, expected_count: int = 3
+    ) -> List[Dict[str, str]]:
         """Parse and validate the LLM-authored initial branch ideas."""
         if "```json" in response:
             json_str = response.split("```json", 1)[1].split("```", 1)[0]
@@ -63,8 +83,10 @@ Return repaired JSON only.
             json_str = response
 
         approaches = json.loads(json_str.strip())
-        if not isinstance(approaches, list) or len(approaches) != 3:
-            raise ValueError("expected a JSON list with exactly 3 approaches")
+        if not isinstance(approaches, list) or len(approaches) != expected_count:
+            raise ValueError(
+                f"expected a JSON list with exactly {expected_count} approaches"
+            )
 
         valid_approaches = []
         seen_names = set()
@@ -87,7 +109,225 @@ Return repaired JSON only.
 
         return valid_approaches
 
-    def run(self, task_description: str, branch_plan: str, global_memory_context: dict, l1_index: dict) -> Dict[str, Any]:
+    def generate_follow_up_approach(
+        self,
+        operator: str,
+        task_description: str,
+        parent_code: str,
+        parent_result: dict,
+        global_memory_context: dict,
+    ) -> Dict[str, Any]:
+        """Materialize one previously scheduled operator slot on demand."""
+        if operator not in {"refine", "tune", "diversify"}:
+            raise ValueError(f"unsupported lazy operator: {operator!r}")
+        instructions = {
+            "refine": "Change only the highest-impact code block and preserve the rest.",
+            "tune": "Keep the architecture and define a compact, pruned tuning experiment.",
+            "diversify": "Create a sound candidate whose prediction errors should be less correlated with the parent.",
+        }
+        user_prompt = (
+            f"Task:\n{task_description}\n\n"
+            f"Selected operator: {operator}\n"
+            f"Operator contract: {instructions[operator]}\n\n"
+            f"Parent result:\n{json.dumps(parent_result or {}, indent=2, default=str)}\n\n"
+            f"Relevant prior experiments:\n"
+            f"{json.dumps(global_memory_context or {}, indent=2, default=str)}\n\n"
+            f"Parent code:\n```python\n{parent_code}\n```\n"
+        )
+        response = call_llm(
+            "You are an ML search-policy agent. Materialize exactly one already-selected "
+            "operator into a concrete task-specific experiment. Return ONLY one JSON object "
+            "with fields name, plan, operator, priority. Priority must be numeric in [-0.1, 0.1].",
+            user_prompt,
+            model=self.model_name,
+        )
+        if "```json" in response:
+            response = response.split("```json", 1)[1].split("```", 1)[0]
+        elif "```" in response:
+            response = response.split("```", 1)[1].split("```", 1)[0]
+        item = json.loads(response.strip())
+        if not isinstance(item, dict) or item.get("operator") != operator:
+            raise ValueError("lazy proposal did not preserve the selected operator")
+        name = re.sub(
+            r"[^a-zA-Z0-9_]+", "_", str(item.get("name", "")).strip()
+        ).strip("_").lower()
+        plan = str(item.get("plan", "")).strip()
+        if not name or not plan:
+            raise ValueError("lazy proposal is incomplete")
+        try:
+            priority = max(-0.1, min(0.1, float(item.get("priority", 0.0))))
+        except (TypeError, ValueError):
+            priority = 0.0
+        return {"name": name, "plan": plan, "operator": operator, "priority": priority}
+
+    @staticmethod
+    def _terms(text: str) -> set[str]:
+        return {
+            token
+            for token in re.findall(r"[a-z0-9]+", str(text).lower())
+            if len(token) > 2 or token.isdigit()
+        }
+
+    def _prefilter_l1(self, l1_index: dict, query_text: str) -> dict:
+        """Bound L1 prompt growth using deterministic lexical relevance."""
+        query_terms = self._terms(query_text)
+        ranked = []
+        for position, (category, details) in enumerate(l1_index.items()):
+            category_terms = self._terms(
+                category.replace("_", " ") + " " + details.get("description", "")
+            )
+            overlap = len(query_terms & category_terms)
+            ranked.append((overlap, -position, category, details))
+        ranked.sort(reverse=True)
+        return {
+            category: details
+            for _, _, category, details in ranked[: self.max_l1_categories]
+        }
+
+    def _artifact_prior(
+        self,
+        candidate: dict,
+        branch_plan: str,
+        total_runs: int,
+        preferred_accelerator: str = "cpu",
+    ) -> float:
+        """Combine lexical fit, empirical reward, and an exploration bonus."""
+        branch_terms = self._terms(branch_plan)
+        artifact_terms = self._terms(
+            " ".join(
+                [
+                    candidate.get("artifact_id", ""),
+                    candidate.get("category", ""),
+                    candidate.get("description", ""),
+                    json.dumps(candidate.get("interface", {})),
+                ]
+            ).replace("_", " ")
+        )
+        lexical = len(branch_terms & artifact_terms) / max(len(branch_terms), 1)
+        stats = candidate.get("validation_summary", {})
+        runs = max(0, int(stats.get("runs", 0) or 0))
+        mean_reward = float(stats.get("mean_reward", 0.0) or 0.0)
+        improvement_rate = float(stats.get("improvement_rate", 0.0) or 0.0)
+        exploration = math.sqrt(math.log(max(total_runs, 0) + 2.0) / (runs + 1.0))
+        capabilities = candidate.get("capabilities") or {}
+        raw_supported_accelerators = capabilities.get("supported_accelerators") or []
+        if not isinstance(raw_supported_accelerators, (list, tuple, set)):
+            raw_supported_accelerators = []
+        supported_accelerators = {
+            str(item).lower()
+            for item in raw_supported_accelerators
+        }
+        gpu_bonus = 0.0
+        if (
+            preferred_accelerator in {"cuda", "mps"}
+            and capabilities.get("gpu_accelerated") is True
+            and (
+                not supported_accelerators
+                or preferred_accelerator in supported_accelerators
+            )
+        ):
+            gpu_bonus = 0.12
+        return (
+            lexical
+            + 0.35 * mean_reward
+            + 0.15 * improvement_rate
+            + 0.08 * exploration
+            + gpu_bonus
+        )
+
+    def generate_follow_up_approaches(
+        self,
+        task_description: str,
+        parent_code: str,
+        parent_result: dict,
+        global_memory_context: dict,
+    ) -> List[Dict[str, Any]]:
+        """Generate a small operator portfolio for measured candidate evolution."""
+        system_prompt = (
+            "You are an ML search-policy agent. Given a working parent pipeline and its measured result, "
+            "propose exactly three complementary child experiments. Return ONLY a JSON list. The three "
+            "operators must be exactly: 'refine', 'tune', and 'diversify'.\n"
+            "- refine: change only the highest-impact code block, preserving the rest.\n"
+            "- tune: keep the architecture and use Optuna-style pruning or a compact search space.\n"
+            "- diversify: produce predictions likely to be less correlated with the parent for ensembling.\n"
+            "Each item must have non-empty 'name', 'plan', 'operator', and numeric 'priority' in [-0.1, 0.1]. "
+            "Plans must be concrete, task-specific, leakage-safe, and directly executable."
+        )
+        user_prompt = f"""
+Task:
+{task_description}
+
+Parent result:
+{json.dumps(parent_result or {}, indent=2, default=str)}
+
+Relevant prior experiments:
+{json.dumps(global_memory_context or {}, indent=2, default=str)}
+
+Parent code:
+```python
+{parent_code}
+```
+
+Return the three child experiments as JSON only.
+"""
+        response = call_llm(system_prompt, user_prompt, model=self.model_name)
+        try:
+            return self._parse_follow_up_approaches(response)
+        except Exception as parse_error:
+            print(
+                "TechniqueAgent WARNING: Failed to parse follow-up portfolio: "
+                f"{parse_error}. Asking LLM to repair it."
+            )
+        repair = call_llm(
+            "Repair the draft into ONLY a JSON list of exactly three dictionaries with unique "
+            "operators refine, tune, diversify and fields name, plan, operator, priority.",
+            response,
+            model=self.model_name,
+        )
+        return self._parse_follow_up_approaches(repair)
+
+    def _parse_follow_up_approaches(self, response: str) -> List[Dict[str, Any]]:
+        if "```json" in response:
+            payload = response.split("```json", 1)[1].split("```", 1)[0]
+        elif "```" in response:
+            payload = response.split("```", 1)[1].split("```", 1)[0]
+        else:
+            payload = response
+        approaches = json.loads(payload.strip())
+        if not isinstance(approaches, list) or len(approaches) != 3:
+            raise ValueError("expected exactly three follow-up approaches")
+        required_operators = {"refine", "tune", "diversify"}
+        actual_operators = {str(item.get("operator", "")).strip() for item in approaches}
+        if actual_operators != required_operators:
+            raise ValueError("follow-up operators must be refine, tune, and diversify")
+        result = []
+        for index, item in enumerate(approaches, start=1):
+            name = re.sub(
+                r"[^a-zA-Z0-9_]+", "_", str(item.get("name", "")).strip()
+            ).strip("_").lower()
+            plan = str(item.get("plan", "")).strip()
+            operator = str(item["operator"]).strip()
+            if not name or not plan:
+                raise ValueError(f"follow-up approach {index} is incomplete")
+            try:
+                priority = max(-0.1, min(0.1, float(item.get("priority", 0.0))))
+            except (TypeError, ValueError):
+                priority = 0.0
+            result.append(
+                {"name": name, "plan": plan, "operator": operator, "priority": priority}
+            )
+        return result
+
+    def run(
+        self,
+        task_description: str,
+        branch_plan: str,
+        global_memory_context: dict,
+        l1_index: dict,
+        allowed_scopes: set[str] | None = None,
+        available_accelerators: set[str] | None = None,
+        preferred_accelerator: str = "cpu",
+    ) -> Dict[str, Any]:
         """
         1. Decides if relevant techniques are in the Memory Pool.
         2. If not, searches the web, pulls new technique info, and flags for L2 build.
@@ -103,7 +343,8 @@ Return repaired JSON only.
             print("TechniqueAgent: Memory pool disabled or empty. Generating a new technique outline.")
             return self._bootstrap_from_web(task_description, branch_plan)
 
-        # Bug 4 fix: Use branch_plan for category selection with tighter constraints
+        # Use both the branch direction and measured lineage context. The latter
+        # prevents repeating failed sibling experiments and enables evidence-based reuse.
         system_prompt = (
             "You are the Technique Agent. Given the strategic direction below, select the 1-2 MOST RELEVANT "
             "categories from the list that align with this direction.\n"
@@ -113,13 +354,23 @@ Return repaired JSON only.
             "- Output ONLY a comma-separated list of category names from the available list. No explanation."
         )
         
+        visible_l1 = self._prefilter_l1(
+            l1_index, task_description + "\n" + branch_plan
+        )
         l1_summary = ""
-        for cat, details in l1_index.items():
+        for cat, details in visible_l1.items():
             l1_summary += f"- {cat}: {details['description']}\n"
             
         user_prompt = f"""
 Strategic Direction:
 {branch_plan}
+
+Measured Parent/Sibling Context:
+{json.dumps(global_memory_context or {}, indent=2, default=str)}
+
+Execution Resources:
+Available accelerators: {sorted(available_accelerators or {'cpu'})}
+Preferred accelerator: {preferred_accelerator}
 
 Available Categories:
 {l1_summary}
@@ -127,7 +378,9 @@ Available Categories:
 Which 1-2 categories best match the strategic direction? Output a comma-separated list.
 """
         response = call_llm(system_prompt, user_prompt, model=self.model_name).strip()
-        selected_categories = [c.strip() for c in response.split(",") if c.strip() in l1_index]
+        selected_categories = [
+            c.strip() for c in response.split(",") if c.strip() in visible_l1
+        ]
         
         # Bug 4: Limit to max 2 categories even if LLM returns more
         selected_categories = selected_categories[:2]
@@ -145,8 +398,28 @@ Which 1-2 categories best match the strategic direction? Output a comma-separate
             verified_artifacts = [
                 artifact for artifact in res.get("artifacts", [])
                 if artifact.get("verified") is True
+                and (
+                    not allowed_scopes
+                    or artifact.get("scope") in allowed_scopes
+                )
             ]
             l2_candidates.extend(verified_artifacts)
+
+        total_runs = sum(
+            int(item.get("validation_summary", {}).get("runs", 0) or 0)
+            for item in l2_candidates
+        )
+        for candidate in l2_candidates:
+            candidate["retrieval_prior"] = self._artifact_prior(
+                candidate,
+                branch_plan,
+                total_runs,
+                preferred_accelerator=preferred_accelerator,
+            )
+        l2_candidates.sort(
+            key=lambda item: item.get("retrieval_prior", 0.0), reverse=True
+        )
+        l2_candidates = l2_candidates[: self.max_artifact_candidates]
             
         system_prompt = (
             "You are the Technique Agent. Evaluate if any candidate artifact is a high-quality match for the task requirements. "
@@ -162,7 +435,16 @@ Which 1-2 categories best match the strategic direction? Output a comma-separate
         candidates_str = ""
         for cand in l2_candidates:
             if "error" not in cand:
-                candidates_str += f"- ID: {cand['artifact_id']} (Category: {cand['category']}): {cand['description']}\n"
+                empirical = cand.get("validation_summary", {})
+                candidates_str += (
+                    f"- ID: {cand['artifact_id']} (Category: {cand['category']}): "
+                    f"{cand['description']} | scope={cand.get('scope')} | "
+                    f"retrieval_prior={cand.get('retrieval_prior', 0.0):.4f} | "
+                    f"resources={json.dumps(cand.get('resource_profile', {}))} | "
+                    f"capabilities={json.dumps(cand.get('capabilities', {}))} | "
+                    f"empirical_validation={json.dumps(empirical)} | "
+                    f"pitfalls={cand.get('known_pitfalls', [])}\n"
+                )
         
         # If no candidates exist at all, skip LLM call and go straight to web search
         if not candidates_str.strip():
@@ -174,6 +456,9 @@ Task Description:
 
 Strategic Direction:
 {branch_plan}
+
+Measured Parent/Sibling Context:
+{json.dumps(global_memory_context or {}, indent=2, default=str)}
 
 Candidate Artifacts in Memory Pool:
 {candidates_str}
@@ -187,14 +472,17 @@ Decide: Output either one artifact_id from the list, or 'web_search'.
         
         if matching_cand:
             # Memory Pool Hit
-            artifact_id = matching_cand[0]["artifact_id"]
-            cat = matching_cand[0]["category"]
+            selected_candidate = matching_cand[0]
+            artifact_id = selected_candidate["artifact_id"]
+            cat = selected_candidate["category"]
             card = query(cat, artifact_id)
             print(f"TechniqueAgent: Memory Pool Hit: {artifact_id}")
             return {
                 "status": "pool_hit",
                 "artifact_id": artifact_id,
                 "category": cat,
+                "scope": selected_candidate.get("scope"),
+                "retrieval_prior": selected_candidate.get("retrieval_prior"),
                 "plan": f"Use memory pool artifact {artifact_id} from category {cat}.",
                 "model_card": card
             }

@@ -1,7 +1,9 @@
 import os
 import time
 import logging
+import inspect
 from typing import Optional, Dict, Any
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -9,7 +11,8 @@ logger = logging.getLogger(__name__)
 token_usage = {
     "input_tokens": 0,
     "output_tokens": 0,
-    "cost": 0.0
+    "cost": 0.0,
+    "calls": [],
 }
 
 def get_token_usage() -> Dict[str, Any]:
@@ -17,7 +20,7 @@ def get_token_usage() -> Dict[str, Any]:
 
 def reset_token_usage():
     global token_usage
-    token_usage = {"input_tokens": 0, "output_tokens": 0, "cost": 0.0}
+    token_usage = {"input_tokens": 0, "output_tokens": 0, "cost": 0.0, "calls": []}
 
 def call_llm(system_prompt: str, user_prompt: str, model: Optional[str] = None, temperature: float = 0.2) -> str:
     """
@@ -46,12 +49,15 @@ def call_llm(system_prompt: str, user_prompt: str, model: Optional[str] = None, 
         )
         
     model_name = model or os.getenv("LLM_MODEL") or provider_default_model
+    caller = inspect.stack()[1]
+    trace_label = f"{Path(caller.filename).stem}.{caller.function}"
     
     # 2. Query LLM with Retry Logic for Rate Limits (429)
     retries = 5
     delay = 10.0  # Start with a 10-second delay
     
     for attempt in range(retries):
+        call_started = time.monotonic()
         try:
             from openai import OpenAI
             client = OpenAI(api_key=api_key, base_url=base_url, timeout=120.0)
@@ -72,14 +78,26 @@ def call_llm(system_prompt: str, user_prompt: str, model: Optional[str] = None, 
                 raise ValueError("LLM API returned an empty message")
             usage = response.usage
             if usage:
-                token_usage["input_tokens"] += usage.prompt_tokens
-                token_usage["output_tokens"] += usage.completion_tokens
+                in_tokens = int(usage.prompt_tokens)
+                out_tokens = int(usage.completion_tokens)
             else:
                 # Fallback token estimation
                 in_tokens = int(len(system_prompt.split()) * 1.3) + int(len(user_prompt.split()) * 1.3)
                 out_tokens = int(len(content.split()) * 1.3)
-                token_usage["input_tokens"] += in_tokens
-                token_usage["output_tokens"] += out_tokens
+            token_usage["input_tokens"] += in_tokens
+            token_usage["output_tokens"] += out_tokens
+            token_usage["calls"].append(
+                {
+                    "label": trace_label,
+                    "provider": provider or ("nvidia" if os.getenv("NVIDIA_API_KEY") else "gemini"),
+                    "model": model_name,
+                    "input_tokens": in_tokens,
+                    "output_tokens": out_tokens,
+                    "system_prompt_chars": len(system_prompt),
+                    "user_prompt_chars": len(user_prompt),
+                    "elapsed_seconds": time.monotonic() - call_started,
+                }
+            )
                 
             return content
             

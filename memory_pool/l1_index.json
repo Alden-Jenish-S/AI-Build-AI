@@ -19,7 +19,8 @@
     "description": "Encoders for mapping categorical variables into numeric values (Target encoding, Frequency encoding, etc.).",
     "l2_pointers": [
       "target_encoding",
-      "frequency_encoding"
+      "frequency_encoding",
+      "cv_target_encoding_smoothing"
     ]
   },
   "cv_strategies": {

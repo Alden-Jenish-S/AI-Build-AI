@@ -5,16 +5,26 @@ import subprocess
 from pathlib import Path
 from typing import Dict, Any
 from agents.llm_utils import call_llm
-from runtime_utils import sanitized_subprocess_env, validate_storage_identifier
+from agents.setup_agent import SetupAgent
+from runtime_utils import accelerator_subprocess_env, validate_storage_identifier
 
 class L2Builder:
-    def __init__(self, project_root: Path, model_name: str = None, venv_path: str = None):
+    def __init__(
+        self,
+        project_root: Path,
+        model_name: str = None,
+        venv_path: str = None,
+        preferred_accelerator: str = "cpu",
+    ):
         self.project_root = project_root
         self.model_name = model_name
         self.l1_path = project_root / "memory_pool" / "l1_index.json"
         self.l2_store = project_root / "memory_pool" / "l2_store"
         self.verifier_path = project_root / "memory_pool" / "builder" / "sandbox_verifier.py"
-        
+        self.preferred_accelerator = str(preferred_accelerator).lower()
+        if self.preferred_accelerator not in {"cpu", "cuda", "mps"}:
+            raise ValueError("preferred_accelerator must be cpu, cuda, or mps")
+
         import sys
         candidate_path = Path(venv_path or "./.venv/bin/python")
         if not candidate_path.is_absolute():
@@ -60,8 +70,12 @@ class L2Builder:
             "     \"category\": \"<category_name>\",\n"
             "     \"description\": \"<brief description of what this code does>\",\n"
             "     \"interface\": {\n"
-            "       \"entrypoint\": \"<entrypoint_function_name>(X_train, X_test, y_train=None, ...)\"\n"
+            "       \"entrypoint\": \"<entrypoint_function_name>(X_train, X_test, y_train=None, ...)\",\n"
+            "       \"output_contract\": {\"kind\": \"predictions|transformed_features\", \"aligned_to\": \"X_test\"}\n"
             "     },\n"
+            "     \"capabilities\": {\"supported_operators\": [\"refine\", \"tune\", \"diversify\"], \"tunable_parameters\": [\"parameter_name\"], \"gpu_accelerated\": <true|false>, \"supported_accelerators\": [\"cpu\", \"cuda\", \"mps\"]},\n"
+            "     \"scope\": \"<component|model_family|full_pipeline>\",\n"
+            "     \"resource_profile\": {\"accelerator\": \"<cpu|gpu|cuda|mps|any>\", \"min_ram_gb\": <number>, \"estimated_runtime_seconds\": <number>},\n"
             "     \"dependencies\": [\"numpy\", \"pandas\", ...],\n"
             "     \"verified\": false,\n"
             "     \"verification_log\": \"\"\n"
@@ -71,7 +85,11 @@ class L2Builder:
             "- The entrypoint function and all helper functions MUST be fully compatible with standard tabular inputs (Pandas DataFrames for X_train/X_test, and NumPy arrays or Pandas Series for y_train).\n"
             "- Do NOT assume inputs are PyTorch/TensorFlow tensors. If the technique requires neural networks, convert Pandas DataFrame/NumPy inputs to tensors inside the entrypoint function (e.g., using torch.tensor(X_train.values) or similar) and convert the outputs back to NumPy arrays or Pandas DataFrames/Series.\n"
             "- Ensure that any optional parameter has a default value (e.g. y_train=None).\n"
-            "- The function must execute successfully and return predictions or transformed features without throwing type/attribute errors (such as calling tensor methods directly on DataFrame inputs)."
+            "- The function must execute successfully and return predictions or transformed features without throwing type/attribute errors (such as calling tensor methods directly on DataFrame inputs).\n"
+            f"- The target runtime prefers {self.preferred_accelerator}, exposed through the "
+            "AIBUILDAI_ACCELERATOR environment variable. For compatible models, read that variable, "
+            "enable the framework-native accelerator, and retry safely on CPU if the installed package "
+            "does not provide that backend. Accurately declare GPU support in capabilities."
         )
         
         user_prompt = f"""
@@ -120,6 +138,17 @@ class L2Builder:
         if not isinstance(code, str) or not code.strip():
             print("L2Builder ERROR: Generated code must be a non-empty string.")
             return False, None, None, None
+        if model_card.get("scope") not in {
+            "component", "model_family", "full_pipeline"
+        }:
+            print("L2Builder ERROR: Model card must declare a valid artifact scope.")
+            return False, None, None, None
+        resource_profile = model_card.get("resource_profile")
+        if not isinstance(resource_profile, dict) or resource_profile.get(
+            "accelerator"
+        ) not in {"cpu", "gpu", "cuda", "mps", "any"}:
+            print("L2Builder ERROR: Model card must declare a valid resource profile.")
+            return False, None, None, None
             
         # Handle new category creation
         if commit and category not in l1_index:
@@ -160,55 +189,103 @@ class L2Builder:
             json.dump(model_card, f, indent=2)
             
         print(f"L2Builder: Wrote temporary artifact files to {cat_dir}")
-        
-        # Run sandbox verifier on the newly built files
-        cmd = [self.venv_python, str(self.verifier_path), str(card_file)]
-        
+
+        # Verification imports the generated module, so dependencies must exist
+        # first. Only packages and versions already present in the repository's
+        # human-controlled requirements file are eligible at this unverified stage.
         try:
-            res = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                check=True,
-                timeout=35,
-                env=sanitized_subprocess_env(),
+            SetupAgent(self.venv_python).install_allowlisted_dependencies(
+                [model_card], self.project_root / "requirements.txt"
             )
-            print(f"L2Builder: Sandbox verification passed for {artifact_id}!")
-            try:
-                with open(card_file, 'r', encoding='utf-8') as f:
-                    model_card = json.load(f)
-            except Exception:
-                pass
-            
-            # Commit to L1 pointers list if not already present
+        except Exception as exc:
+            print(
+                f"L2Builder ERROR: Could not prepare allowlisted dependencies for "
+                f"{artifact_id}: {exc}"
+            )
+            model_card["verified"] = False
+            model_card["verification_log"] = (
+                f"Dependency preparation failed before verification: {exc}"
+            )
+            with open(card_file, 'w', encoding='utf-8') as f:
+                json.dump(model_card, f, indent=2)
             if commit:
-                if artifact_id not in l1_index[category]["l2_pointers"]:
+                code_file.unlink(missing_ok=True)
+                card_file.unlink(missing_ok=True)
+                return False, None, None, None
+            return False, category, artifact_id, model_card
+
+        # Run sandbox verification with one focused repair pass. Most generated
+        # failures in practice are small interface/type defects that are cheaper to
+        # repair from the traceback than to discard and regenerate from scratch.
+        cmd = [self.venv_python, str(self.verifier_path), str(card_file)]
+        verification_output = ""
+        for verification_attempt in range(2):
+            try:
+                res = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                    timeout=35,
+                    env=accelerator_subprocess_env(self.preferred_accelerator),
+                )
+                print(f"L2Builder: Sandbox verification passed for {artifact_id}!")
+                try:
+                    with open(card_file, 'r', encoding='utf-8') as f:
+                        model_card = json.load(f)
+                except Exception:
+                    pass
+                if commit and artifact_id not in l1_index[category]["l2_pointers"]:
                     l1_index[category]["l2_pointers"].append(artifact_id)
                     with open(self.l1_path, 'w', encoding='utf-8') as f:
                         json.dump(l1_index, f, indent=2)
-            return True, category, artifact_id, model_card
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-            print(f"L2Builder ERROR: Sandbox verification failed for {artifact_id}.")
-            if e.stdout:
-                print(e.stdout)
-            if e.stderr:
-                print(e.stderr)
-            if commit:
-                # Never leave a failed artifact in the global reusable store.
-                if code_file.exists():
-                    code_file.unlink()
-                if card_file.exists():
-                    card_file.unlink()
-                return False, None, None, None
+                return True, category, artifact_id, model_card
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+                verification_output = (
+                    str(getattr(exc, "stdout", "") or "")
+                    + "\n"
+                    + str(getattr(exc, "stderr", "") or "")
+                )[-8000:]
+                print(f"L2Builder ERROR: Sandbox verification failed for {artifact_id}.")
+                if verification_output.strip():
+                    print(verification_output)
+                if verification_attempt == 0:
+                    try:
+                        repair_response = call_llm(
+                            "You repair a generated reusable Python artifact. Return only the complete "
+                            "corrected Python module in one code block. Preserve the declared entrypoint "
+                            "and methodology; fix the concrete traceback and ensure returned predictions "
+                            "align with X_test. Preserve use of AIBUILDAI_ACCELERATOR for supported models "
+                            "and retain a safe CPU fallback.",
+                            f"Entrypoint: {model_card.get('interface', {}).get('entrypoint')}\n"
+                            f"Verification failure:\n{verification_output}\n\n"
+                            f"Current module:\n```python\n{code_file.read_text(encoding='utf-8')}\n```",
+                            model=self.model_name,
+                            temperature=0.0,
+                        )
+                        if "```python" in repair_response:
+                            repaired = repair_response.split("```python", 1)[1].split("```", 1)[0]
+                        elif "```" in repair_response:
+                            repaired = repair_response.split("```", 1)[1].split("```", 1)[0]
+                        else:
+                            repaired = repair_response
+                        compile(repaired, str(code_file), "exec")
+                        code_file.write_text(repaired.strip() + "\n", encoding="utf-8")
+                        continue
+                    except Exception as repair_error:
+                        print(f"L2Builder ERROR: Artifact repair failed: {repair_error}")
+                        break
 
-            # Local failed candidates are valuable diagnostics for the node that
-            # proposed them. Keep both files, with verified=false, in its run dir.
-            try:
-                with open(card_file, 'r', encoding='utf-8') as f:
-                    model_card = json.load(f)
-            except Exception:
-                pass
-            return False, category, artifact_id, model_card
+        if commit:
+            code_file.unlink(missing_ok=True)
+            card_file.unlink(missing_ok=True)
+            return False, None, None, None
+        try:
+            with open(card_file, 'r', encoding='utf-8') as f:
+                model_card = json.load(f)
+        except Exception:
+            pass
+        return False, category, artifact_id, model_card
 
     def commit_artifact(self, category: str, artifact_id: str, local_code_file: Path, local_card_file: Path) -> bool:
         """

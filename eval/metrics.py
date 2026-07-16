@@ -41,6 +41,17 @@ def compute_medal(score: float, baseline_score: float, maximize: bool = True) ->
             
     return "None"
 
+
+def normalized_improvement(score: float, baseline_score: float, maximize: bool = True) -> float:
+    """Return relative error reduction where possible, otherwise relative change."""
+    if score is None:
+        return 0.0
+    if maximize and 0.0 <= baseline_score < 1.0 and 0.0 <= score <= 1.0:
+        return (score - baseline_score) / max(1.0 - baseline_score, 1e-12)
+    if maximize:
+        return (score - baseline_score) / max(abs(baseline_score), 1e-12)
+    return (baseline_score - score) / max(abs(baseline_score), 1e-12)
+
 def calculate_ablation_metrics(
     nodes_history: List[dict],
     baseline_score: float,
@@ -55,7 +66,11 @@ def calculate_ablation_metrics(
     - Overcome rate: Fraction of implementation nodes scoring higher than baseline
     """
     tech_nodes = [n for n in nodes_history if n.get("type") == "technique"]
-    impl_nodes = [n for n in nodes_history if n.get("type") == "implementation"]
+    impl_nodes = [
+        n for n in nodes_history
+        if n.get("type") == "implementation"
+        and not str(n.get("status", "")).startswith("skipped_")
+    ]
     
     total_tech = len(tech_nodes)
     total_impl = len(impl_nodes)
@@ -70,7 +85,7 @@ def calculate_ablation_metrics(
     
     for node in impl_nodes:
         score = node.get("score")
-        if score is None:
+        if score is None or node.get("status") != "completed":
             continue
             
         # Check if overcame baseline
@@ -96,5 +111,13 @@ def calculate_ablation_metrics(
         "overcome_rate": overcome_rate,
         "medal_rate": medal_rate,
         "gold_rate": gold_rate,
-        "medals_count": medals_count
+        "medals_count": medals_count,
+        "best_normalized_improvement": max(
+            (
+                normalized_improvement(node.get("score"), baseline_score, maximize)
+                for node in impl_nodes
+                if node.get("score") is not None and node.get("status") == "completed"
+            ),
+            default=0.0,
+        ),
     }

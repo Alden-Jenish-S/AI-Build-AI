@@ -3,6 +3,8 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import List
+from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
 from runtime_utils import sanitized_subprocess_env
 
 
@@ -107,7 +109,8 @@ class SetupAgent:
                 to_install.append(dep)
 
         if not to_install:
-            self._log("SetupAgent: All dependencies are already satisfied.")
+            self._verify_dependency_imports(dependencies)
+            self._log("SetupAgent: All dependencies are installed and importable.")
             return
 
         self._log(f"SetupAgent: Executing pip install for missing dependencies: {to_install}")
@@ -123,7 +126,86 @@ class SetupAgent:
             )
             self._log("SetupAgent: Package installation successful!")
             self._log(res.stdout)
+            self._verify_dependency_imports(dependencies)
         except subprocess.CalledProcessError as e:
             self._log("SetupAgent ERROR: Failed to install dependencies.")
             self._log(e.stderr)
             raise e
+
+    def _verify_dependency_imports(self, dependencies) -> None:
+        """Detect installed-but-broken dependency environments before execution."""
+        import_names = {
+            "scikit-learn": "sklearn",
+            "pytorch-tabnet": "pytorch_tabnet",
+            "pytorch-lightning": "pytorch_lightning",
+            "opencv-python": "cv2",
+        }
+        failures = []
+        for dependency in sorted(dependencies):
+            package = Requirement(dependency).name
+            module = import_names.get(package.lower(), package.replace("-", "_"))
+            result = subprocess.run(
+                [self.venv_python, "-c", f"import {module}"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=sanitized_subprocess_env(),
+            )
+            if result.returncode != 0:
+                failures.append(f"{package}: {result.stderr[-1200:]}")
+        if failures:
+            message = "Installed dependency failed import validation:\n" + "\n".join(failures)
+            self._log("SetupAgent ERROR: " + message)
+            raise RuntimeError(message)
+
+    def install_allowlisted_dependencies(
+        self,
+        artifact_cards: List[dict],
+        requirements_file: Path,
+    ) -> None:
+        """Install unverified-artifact dependencies only from the project allowlist.
+
+        Generated model cards cannot choose versions or arbitrary packages here. A
+        requested distribution must already exist in the human-controlled
+        requirements file, and the exact requirement from that file is installed.
+        """
+        requested = []
+        for card in artifact_cards:
+            dependencies = card.get("dependencies", [])
+            if not isinstance(dependencies, list):
+                raise ValueError("Model-card dependencies must be a list")
+            requested.extend(_validate_requirement(dep) for dep in dependencies)
+        if not requested:
+            return
+
+        requirements_file = Path(requirements_file)
+        if not requirements_file.is_file():
+            raise FileNotFoundError(
+                f"Project dependency allowlist does not exist: {requirements_file}"
+            )
+        allowlist = {}
+        for raw_line in requirements_file.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            validated = _validate_requirement(line)
+            parsed = Requirement(validated)
+            allowlist[canonicalize_name(parsed.name)] = validated
+
+        approved = set()
+        for dependency in requested:
+            name = canonicalize_name(Requirement(dependency).name)
+            if name not in allowlist:
+                raise ValueError(
+                    f"Generated dependency {dependency!r} is not allowlisted in "
+                    f"{requirements_file.name}"
+                )
+            approved.add(allowlist[name])
+
+        if not approved:
+            return
+        # Reuse the verified-card installation path after replacing generated
+        # requirements with the exact project-controlled specifications.
+        self.install_dependencies(
+            [{"verified": True, "dependencies": sorted(approved)}]
+        )

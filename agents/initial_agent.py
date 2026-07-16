@@ -8,6 +8,66 @@ class InitialAgent:
     def __init__(self, model_name: str = None):
         self.model_name = model_name
 
+    @staticmethod
+    def _extract_python_code(response: str) -> str:
+        """Remove an optional Markdown fence from a generated Python file."""
+        if "```python" in response:
+            return response.split("```python", 1)[1].split("```", 1)[0].strip()
+        if "```" in response:
+            return response.split("```", 1)[1].split("```", 1)[0].strip()
+        return response.strip()
+
+    def repair_initial_algorithm(
+        self,
+        dataloader_path: Path,
+        algorithm_path: Path,
+        failure_output: str,
+        metric_name: str,
+        metric_direction: str,
+    ) -> None:
+        """Repair a generated baseline after a failed local execution."""
+        dataloader_code = dataloader_path.read_text(encoding="utf-8")
+        algorithm_code = algorithm_path.read_text(encoding="utf-8")
+        system_prompt = (
+            "You are debugging a generated tabular-ML baseline. Return the complete "
+            "corrected initial_algorithm.py only, inside one Python code block. Treat "
+            "initial_dataloader.py as an immutable interface: inspect its lifecycle and "
+            "call it correctly. Keep the model a simple deterministic baseline, avoid "
+            "train/test leakage, write a finite result.json score with the requested "
+            "metric and direction, and write submission/submission.csv. Add a short "
+            "leading comment explaining the failure and fix. Keep the harness-owned "
+            "evaluation contract: call evaluation_contract.prepare_evaluation_data at "
+            "full fidelity, use its fold_ids, and write complete oof_predictions.csv."
+        )
+        user_prompt = f"""
+Requested metric: {metric_name}
+Requested direction: {metric_direction}
+
+Execution failure:
+{failure_output[-6000:]}
+
+Immutable initial_dataloader.py:
+```python
+{dataloader_code}
+```
+
+Failing initial_algorithm.py:
+```python
+{algorithm_code}
+```
+"""
+        response = call_llm(
+            system_prompt,
+            user_prompt,
+            model=self.model_name,
+            temperature=0.0,
+        )
+        repaired_code = self._extract_python_code(response)
+        if not repaired_code:
+            raise ValueError("Baseline debugging returned empty Python code")
+        compile(repaired_code, str(algorithm_path), "exec")
+        algorithm_path.write_text(repaired_code, encoding="utf-8")
+
     def generate_initial_code(self, task_dir: Path, temperature: float = 0.2):
         """
         Reads task_description.md and dynamically writes the initial_dataloader.py
@@ -58,6 +118,20 @@ class InitialAgent:
                 task_config = json.load(f)
             metric_name = task_config.get("metric_name", "score")
             metric_direction = task_config.get("metric_direction", "maximize")
+        elif metric_name == "score":
+            description_lower = description.lower()
+            if "area under" in description_lower and "roc" in description_lower:
+                metric_name = "roc_auc"
+                metric_direction = "maximize"
+            elif "root mean squared" in description_lower or "rmse" in description_lower:
+                metric_name = "rmse"
+                metric_direction = "minimize"
+            elif "mean absolute error" in description_lower or "mae" in description_lower:
+                metric_name = "mae"
+                metric_direction = "minimize"
+            elif "accuracy" in description_lower:
+                metric_name = "accuracy"
+                metric_direction = "maximize"
 
         print(f"InitialAgent: Generating dataloader for task in {task_dir}...")
         
@@ -65,7 +139,11 @@ class InitialAgent:
             "You are an expert ML engineering agent. Write a Python module 'initial_dataloader.py' containing "
             "a Class 'MyDataLoader' that reads raw data from './input/train.csv' and './input/test.csv' and pre-processes them.\n"
             "The class MUST define a method 'get_data()' which returns two dicts: train_data and test_data.\n"
-            "Format of train_data: {'X': pd.DataFrame, 'y': np.ndarray, 'X_val': pd.DataFrame, 'y_val': np.ndarray, "
+            "Both `MyDataLoader()()` and `MyDataLoader().get_data()` MUST work on a fresh instance. "
+            "Implement `__call__` and make `get_data()` lazily load/prepare data when necessary; do not require callers to invoke a private method first.\n"
+            "Format of train_data: {'X': pd.DataFrame, 'y': np.ndarray, 'row_ids': np.ndarray, "
+            "'X_val': pd.DataFrame, 'y_val': np.ndarray, 'val_row_ids': np.ndarray, "
+            "'X_full': pd.DataFrame, 'y_full': np.ndarray, 'row_ids_full': np.ndarray, "
             "'has_val': bool, 'cat_cols': list_of_str, 'cont_cols': list_of_str, 'cat_dims': list_of_int, 'n_cont': int}.\n"
             "Format of test_data: {'X_test': pd.DataFrame, 'test_ids': np.ndarray/pd.Series}.\n"
             "CRITICAL CONSTRAINTS:\n"
@@ -87,12 +165,7 @@ Please write the complete 'initial_dataloader.py' file.
 """
         dataloader_code = call_llm(dataloader_system, dataloader_user, model=self.model_name, temperature=temperature)
         
-        # Clean markdown code block
-        clean_loader = dataloader_code
-        if "```python" in dataloader_code:
-            clean_loader = dataloader_code.split("```python")[1].split("```")[0]
-        elif "```" in dataloader_code:
-            clean_loader = dataloader_code.split("```")[1].split("```")[0]
+        clean_loader = self._extract_python_code(dataloader_code)
             
         loader_path = task_dir / "initial_dataloader.py"
         with open(loader_path, 'w', encoding='utf-8') as f:
@@ -111,16 +184,21 @@ Please write the complete 'initial_dataloader.py' file.
             "2. Import MyDataLoader: 'from initial_dataloader import MyDataLoader'.\n"
             "3. Instantiate and load data EXACTLY like this:\n"
             "   loader = MyDataLoader()\n"
-            "   train_data, test_data = loader.get_data()\n"
+            "   train_data, test_data = loader()\n"
             "   X_train, y_train = train_data['X'], train_data['y']\n"
             "   X_val, y_val = train_data['X_val'], train_data['y_val']\n"
             "   X_test, test_ids = test_data['X_test'], test_data['test_ids']\n"
+            "   Then import `prepare_evaluation_data` from evaluation_contract and obtain the complete "
+            "full-fidelity rows and deterministic folds with: `X_eval, y_eval, row_ids, fold_ids, meta = "
+            "prepare_evaluation_data(train_data, 'full')`. Train/evaluate on X_eval/y_eval using fold_ids; "
+            "do not discard the loader-held validation rows or create another random split.\n"
             "4. Encode any categorical columns present in train_data['cat_cols'] using sklearn.preprocessing.LabelEncoder "
             "so sklearn models can fit without ValueError. Be sure to convert features to string or handle unseen labels gracefully.\n"
-            "5. Train the baseline model, evaluate it on the validation set (if available). Be careful of any rare classes in validation scoring.\n"
+            "5. Evaluate the baseline with the supplied deterministic folds and train final test-prediction models on all X_eval rows. "
+            "Save OOF predictions to oof_predictions.csv with columns row_id,target,prediction.\n"
             "6. Print the score to stdout in a format like 'Validation Score: <float>'.\n"
             f"7. At the END of the script, write a JSON file 'result.json' in the current directory with EXACTLY this structure:\n"
-            f'   {{"score": <float>, "metric": "{metric_name}", "direction": "{metric_direction}"}}\n'
+            f'   {{"score": <float>, "metric": "{metric_name}", "direction": "{metric_direction}", "fidelity": "full", "folds": 5}}\n'
             "   Example: import json; json.dump({{\"score\": 0.8521, \"metric\": \"roc_auc\", \"direction\": \"maximize\"}}, open('result.json', 'w'))\n"
             "8. Save test predictions to './submission/submission.csv'. If './input/sample_submission.csv' exists, "
             "read it and preserve its exact column names, identifier values, row order, and prediction-column order. "
@@ -139,11 +217,7 @@ Please write the complete 'initial_algorithm.py' file.
 """
         algo_code = call_llm(algo_system, algo_user, model=self.model_name, temperature=temperature)
         
-        clean_algo = algo_code
-        if "```python" in algo_code:
-            clean_algo = algo_code.split("```python")[1].split("```")[0]
-        elif "```" in algo_code:
-            clean_algo = algo_code.split("```")[1].split("```")[0]
+        clean_algo = self._extract_python_code(algo_code)
             
         algo_path = task_dir / "initial_algorithm.py"
         with open(algo_path, 'w', encoding='utf-8') as f:

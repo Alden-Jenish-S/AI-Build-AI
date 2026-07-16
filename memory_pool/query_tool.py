@@ -5,6 +5,53 @@ from runtime_utils import resolve_within, validate_storage_identifier
 # Base directory setup relative to this file
 BASE_DIR = Path(__file__).resolve().parent
 
+COMPONENT_CATEGORIES = {
+    "feature_engineering_tabular",
+    "categorical_encoding",
+    "cv_strategies",
+    "imbalance_handling",
+    "hyperparam_search",
+    "missing_value_imputation",
+    "outlier_handling",
+}
+FULL_PIPELINE_CATEGORIES = {"blending_stacking"}
+
+
+def infer_artifact_scope(card: dict, category: str = "") -> str:
+    """Return explicit scope, or a conservative scope for legacy model cards."""
+    scope = card.get("scope")
+    if scope in {"component", "model_family", "full_pipeline"}:
+        return scope
+    category = category or card.get("category", "")
+    if category in COMPONENT_CATEGORIES:
+        return "component"
+    if category in FULL_PIPELINE_CATEGORIES:
+        return "full_pipeline"
+    return "model_family"
+
+
+def normalize_resource_profile(card: dict) -> dict:
+    """Normalize the optional feasibility declaration used before experiments."""
+    profile = card.get("resource_profile")
+    if not isinstance(profile, dict):
+        profile = {}
+    accelerator = str(profile.get("accelerator", "cpu")).lower()
+    if accelerator not in {"cpu", "gpu", "cuda", "mps", "any"}:
+        accelerator = "cpu"
+    def non_negative_number(value: object) -> float:
+        try:
+            return max(0.0, float(value or 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+
+    return {
+        "accelerator": accelerator,
+        "min_ram_gb": non_negative_number(profile.get("min_ram_gb")),
+        "estimated_runtime_seconds": non_negative_number(
+            profile.get("estimated_runtime_seconds")
+        ),
+    }
+
 def query(*args) -> dict:
     """
     Query the memory pool index or specific artifacts.
@@ -56,14 +103,44 @@ def query_l1(category: str) -> dict:
                     continue
                 if card.get("artifact_id") != artifact_id or card.get("category") != category:
                     raise ValueError("Model-card identity does not match its L1 pointer")
+                validations = card.get("task_validations", [])
+                if not isinstance(validations, list):
+                    validations = []
+                completed = [
+                    item
+                    for item in validations
+                    if item.get("status") == "completed" and item.get("score") is not None
+                ]
+                improvements = [
+                    item for item in completed if item.get("improved_over_baseline") is True
+                ]
+                rewards = [
+                    float(item["reward"])
+                    for item in completed
+                    if isinstance(item.get("reward"), (int, float))
+                ]
                 # Keep only search/selection metadata, drop the source code or heavy details
                 summary = {
                     "artifact_id": card["artifact_id"],
                     "category": card["category"],
                     "description": card["description"],
                     "interface": card["interface"],
+                    "capabilities": card.get("capabilities", {}),
                     "verified": card.get("verified", False),
-                    "known_pitfalls": card.get("known_pitfalls", [])
+                    "verification_level": card.get("verification_level", "legacy"),
+                    "scope": infer_artifact_scope(card, category),
+                    "resource_profile": normalize_resource_profile(card),
+                    "known_pitfalls": card.get("known_pitfalls", []),
+                    "validation_summary": {
+                        "runs": len(validations),
+                        "completed": len(completed),
+                        "failures": len(validations) - len(completed),
+                        "improvement_rate": (
+                            len(improvements) / len(completed) if completed else None
+                        ),
+                        "mean_reward": sum(rewards) / len(rewards) if rewards else None,
+                    },
+                    "recent_validations": validations[-3:],
                 }
                 l2_summaries.append(summary)
             except Exception as e:
@@ -103,5 +180,7 @@ def query_l2(category: str, artifact_id: str) -> dict:
         
     # Return copy with code embedded
     card_with_code = card.copy()
+    card_with_code["scope"] = infer_artifact_scope(card, category)
+    card_with_code["resource_profile"] = normalize_resource_profile(card)
     card_with_code["code_content"] = code_content
     return card_with_code

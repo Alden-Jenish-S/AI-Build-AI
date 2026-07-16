@@ -168,7 +168,9 @@ try:
         'test_data': X_test_num,
         'train_df': train_df,
         'test_df': X_test_num,
+        'target': 'target',
         'target_col': 'target',
+        'label_col': 'target',
         'preds_list': preds_list,
         'predictions': preds_list,
         'preds': preds_list,
@@ -223,13 +225,38 @@ try:
     # Call the entrypoint
     result = {entrypoint_name}(**kwargs)
     
-    # Basic validation: it should return something without crashing
-    if result is not None:
-        print(f"Function returned type: {{type(result).__name__}}")
-        if hasattr(result, '__len__'):
-            print(f"Result length: {{len(result)}}")
-        if isinstance(result, tuple):
-            print(f"Tuple of {{len(result)}} elements")
+    # Contract validation: at least one returned tabular/numeric object must
+    # align with X_test, and all numeric outputs must be finite.
+    if result is None:
+        raise AssertionError("entrypoint returned None")
+    print(f"Function returned type: {{type(result).__name__}}")
+
+    returned_lengths = []
+    def inspect_output(value):
+        if isinstance(value, (pd.DataFrame, pd.Series, np.ndarray)):
+            array = np.asarray(value)
+            if array.ndim == 0:
+                return
+            returned_lengths.append(len(array))
+            if np.issubdtype(array.dtype, np.number) and not np.isfinite(array).all():
+                raise AssertionError("entrypoint returned NaN or infinite values")
+        elif isinstance(value, (tuple, list)):
+            if value and all(np.isscalar(item) for item in value):
+                array = np.asarray(value)
+                returned_lengths.append(len(array))
+                if np.issubdtype(array.dtype, np.number) and not np.isfinite(array).all():
+                    raise AssertionError("entrypoint returned NaN or infinite values")
+            else:
+                for item in value:
+                    inspect_output(item)
+
+    inspect_output(result)
+    print(f"Returned tabular lengths: {{returned_lengths}}")
+    if n_test not in returned_lengths:
+        raise AssertionError(
+            f"no returned prediction/transformation aligns with X_test length {{n_test}}; "
+            f"observed lengths={{returned_lengths}}"
+        )
     
     print("SUCCESS")
 
@@ -270,9 +297,9 @@ except Exception as ex:
 
     if success:
         print(f"Artifact {card['artifact_id']} passed sandbox verification!")
-        print("WARNING: Verified against synthetic mock data only (shape-only-mock-data), not real task data.")
+        print("WARNING: Verified against synthetic contract data only, not real task data.")
         card["verified"] = True
-        card["verification_level"] = "shape-only-mock-data"
+        card["verification_level"] = "contract-mock-data"
         card["verification_log"] = f"Passed subprocess verification at {time.strftime('%Y-%m-%d %H:%M:%S')}.\nOutput:\n{log_message.strip()}"
         
         # Write back to JSON

@@ -1,11 +1,41 @@
 {
   "artifact_id": "catboost_10fold_ensemble",
   "category": "gbdt_ensembling",
+  "scope": "model_family",
+  "resource_profile": {
+    "accelerator": "any",
+    "min_ram_gb": 4,
+    "estimated_runtime_seconds": 240
+  },
   "description": "10-fold CatBoost trained on tabular features, returns OOF and test predictions.",
   "interface": {
-    "entrypoint": "fit_predict(X_train, y_train, X_test, cat_features=None, n_folds=10, is_classification=True) -> (oof_preds, test_preds, model_list)",
+    "entrypoint": "fit_predict(X_train, y_train, X_test, cat_features=None, n_folds=10, is_classification=True, device=None, catboost_params=None) -> (oof_preds, test_preds, model_list)",
     "input_shapes": "X_train: pd.DataFrame, y_train: np.ndarray, X_test: pd.DataFrame",
-    "output_shapes": "oof_preds: np.ndarray, test_preds: np.ndarray, model_list: list"
+    "output_shapes": "oof_preds: np.ndarray, test_preds: np.ndarray, model_list: list",
+    "output_contract": {
+      "kind": "predictions",
+      "aligned_to": "X_test"
+    }
+  },
+  "capabilities": {
+    "supported_operators": [
+      "initial",
+      "refine",
+      "tune",
+      "diversify",
+      "promote"
+    ],
+    "tunable_parameters": [
+      "iterations",
+      "learning_rate",
+      "depth",
+      "l2_leaf_reg"
+    ],
+    "gpu_accelerated": true,
+    "supported_accelerators": [
+      "cpu",
+      "cuda"
+    ]
   },
   "code_path": "catboost_10fold_ensemble.py",
   "dependencies": [
@@ -17,12 +47,49 @@
   "usage_example": "oof, test_preds, models = fit_predict(X_train, y_train, X_test, cat_features=['sex','cp'])",
   "known_pitfalls": [
     "Categorical columns must be passed as cat_features by name or index, not one-hot encoded.",
-    "Requires y_train to be numeric-encoded for classification."
+    "Requires y_train to be numeric-encoded for classification.",
+    "CatBoost GPU supports CUDA, not Apple MPS; unavailable CUDA builds retry safely on CPU."
   ],
   "provenance": {
     "source_type": "prior_run_takeaway",
     "source_url_or_run_id": "manual"
   },
   "verified": true,
-  "verification_log": "Passed sandbox verification at 2026-07-09 20:53:10.\nOutput:\nSUCCESS"
+  "verification_log": "Passed subprocess verification at 2026-07-16 12:28:39.\nOutput:\nFunction returned type: tuple\nReturned tabular lengths: [100, 30]\nSUCCESS",
+  "task_validations": [
+    {
+      "task_name": "playground-series-s6e2",
+      "node_id": "node_4",
+      "score": 0.9533583665983651,
+      "metric_direction": "maximize",
+      "status": "completed",
+      "reward": 0.06416737101971014,
+      "fidelity": "screen",
+      "elapsed_seconds": 39.17916462500034,
+      "improved_over_baseline": true
+    },
+    {
+      "task_name": "playground-series-s6e2",
+      "node_id": "node_3",
+      "score": 0.9526723282906906,
+      "metric_direction": "maximize",
+      "status": "completed",
+      "reward": 0.05050185645509827,
+      "fidelity": "screen",
+      "elapsed_seconds": 44.679411832999904,
+      "improved_over_baseline": true
+    },
+    {
+      "task_name": "playground-series-s6e2",
+      "node_id": "node_12",
+      "score": 0.9532271626937245,
+      "metric_direction": "maximize",
+      "status": "completed",
+      "reward": 0.061633066096918626,
+      "fidelity": "full",
+      "elapsed_seconds": 36.80679274999784,
+      "improved_over_baseline": true
+    }
+  ],
+  "verification_level": "contract-mock-data"
 }

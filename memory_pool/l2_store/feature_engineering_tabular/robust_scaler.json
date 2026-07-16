@@ -1,6 +1,12 @@
 {
   "artifact_id": "robust_scaler",
   "category": "feature_engineering_tabular",
+  "scope": "component",
+  "resource_profile": {
+    "accelerator": "cpu",
+    "min_ram_gb": 1,
+    "estimated_runtime_seconds": 10
+  },
   "description": "Standardize features robust to outliers by removing the median and scaling by the IQR.",
   "interface": {
     "entrypoint": "transform(X_train, X_test, columns) -> (X_tr, X_te)",
@@ -22,5 +28,18 @@
     "source_url_or_run_id": "manual"
   },
   "verified": true,
-  "verification_log": "Passed sandbox verification at 2026-07-09 20:53:13.\nOutput:\nSUCCESS"
+  "verification_log": "Passed sandbox verification at 2026-07-09 20:53:13.\nOutput:\nSUCCESS",
+  "task_validations": [
+    {
+      "task_name": "playground-series-s6e2",
+      "node_id": "node_5",
+      "score": 0.9505782676507822,
+      "metric_direction": "maximize",
+      "status": "completed",
+      "reward": 0.008386577827105998,
+      "fidelity": "screen",
+      "elapsed_seconds": 24.98419445899981,
+      "improved_over_baseline": true
+    }
+  ]
 }

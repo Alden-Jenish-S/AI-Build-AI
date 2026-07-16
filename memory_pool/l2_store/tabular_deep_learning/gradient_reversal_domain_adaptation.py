@@ -1,5 +1,7 @@
 import numpy as np
 import pandas as pd
+import os
+import warnings
 from sklearn.base import BaseEstimator, ClassifierMixin
 from sklearn.preprocessing import StandardScaler, OrdinalEncoder
 from sklearn.model_selection import train_test_split
@@ -8,6 +10,29 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+
+
+def _resolve_torch_device(device=None):
+    requested = str(
+        device or os.environ.get("AIBUILDAI_ACCELERATOR", "cpu")
+    ).lower()
+    if requested in {"cuda", "gpu"} and torch.cuda.is_available():
+        os.environ["AIBUILDAI_ACTUAL_ACCELERATOR"] = "cuda"
+        return "cuda"
+    if (
+        requested == "mps"
+        and hasattr(torch.backends, "mps")
+        and torch.backends.mps.is_available()
+    ):
+        os.environ["AIBUILDAI_ACTUAL_ACCELERATOR"] = "mps"
+        return "mps"
+    if requested not in {"cpu", "auto"}:
+        warnings.warn(
+            f"Requested PyTorch accelerator {requested!r} is unavailable; using CPU.",
+            RuntimeWarning,
+        )
+    os.environ["AIBUILDAI_ACTUAL_ACCELERATOR"] = "cpu"
+    return "cpu"
 
 # ------------------------------------------------------------------
 # 1. Gradient Reversal Layer (autograd Function)
@@ -131,7 +156,7 @@ class GradientReversalDomainAdaptation(BaseEstimator, ClassifierMixin):
         self.lr = lr
         self.lambda_max = lambda_max
         self.lambda_schedule = lambda_schedule
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = _resolve_torch_device(device)
         self.random_state = random_state
         self.verbose = verbose
 
@@ -205,7 +230,13 @@ class GradientReversalDomainAdaptation(BaseEstimator, ClassifierMixin):
             domain_all = np.ones(len(y), dtype=np.int64)
 
         dataset = TabularDataset(X_num_all, X_cat_all, y_all, domain_all)
-        loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True, drop_last=False)
+        loader = DataLoader(
+            dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            drop_last=False,
+            pin_memory=self.device == "cuda",
+        )
 
         torch.manual_seed(self.random_state)
         self.model_ = _DomainAdaptationNet(
@@ -231,10 +262,10 @@ class GradientReversalDomainAdaptation(BaseEstimator, ClassifierMixin):
             self.model_.grl.lambda_ = lam
 
             for xb_num, xb_cat, yb, db in loader:
-                xb_num = xb_num.to(self.device)
-                xb_cat = xb_cat.to(self.device)
-                yb = yb.to(self.device)
-                db = db.to(self.device)
+                xb_num = xb_num.to(self.device, non_blocking=self.device == "cuda")
+                xb_cat = xb_cat.to(self.device, non_blocking=self.device == "cuda")
+                yb = yb.to(self.device, non_blocking=self.device == "cuda")
+                db = db.to(self.device, non_blocking=self.device == "cuda")
 
                 optimizer.zero_grad()
                 task_logit, domain_logit = self.model_(xb_num, xb_cat)
@@ -260,7 +291,8 @@ class GradientReversalDomainAdaptation(BaseEstimator, ClassifierMixin):
         with torch.no_grad():
             logits, _ = self.model_(tensor_num, tensor_cat)
             probs = torch.sigmoid(logits).cpu().numpy()
-        return probs.reshape(-1, 2)
+        probs = probs.reshape(-1)
+        return np.column_stack([1.0 - probs, probs])
 
     def predict_proba(self, X):
         """Return probability of class 0 and 1 (shape N×2)."""
