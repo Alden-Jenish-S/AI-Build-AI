@@ -1,10 +1,12 @@
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 from typing import List
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
+from packaging.version import InvalidVersion, Version
 from runtime_utils import sanitized_subprocess_env
 
 
@@ -80,29 +82,59 @@ class SetupAgent:
             self._log("SetupAgent: No dependencies to install.")
             return
             
+        self._log(f"SetupAgent: Selected interpreter: {self.venv_python}")
         self._log(f"SetupAgent: Checking/Installing dependencies: {list(dependencies)}")
         
         to_install = []
         for dep in dependencies:
-            # Basic parsing of requirement specifier to get package name
-            # e.g., 'catboost==1.2.3' -> 'catboost'
-            pkg_name = dep
-            for op in ['==', '>=', '<=', '>', '<', '~=']:
-                if op in dep:
-                    pkg_name = dep.split(op)[0].strip()
-                    break
-            
-            # Check if package is already installed
+            requirement = Requirement(dep)
+            if requirement.marker is not None and not requirement.marker.evaluate():
+                self._log(
+                    f"SetupAgent: Skipping inactive environment marker for {dep!r}."
+                )
+                continue
+            pkg_name = requirement.name
+
+            # `pip show` alone only establishes presence. Parse its Version field
+            # so stale environments cannot silently bypass an exact project pin.
             cmd_check = [self.venv_python, "-m", "pip", "show", pkg_name]
             try:
                 res_check = subprocess.run(
                     cmd_check,
                     capture_output=True,
                     text=True,
+                    timeout=30,
                     env=sanitized_subprocess_env(),
                 )
                 if res_check.returncode == 0:
-                    self._log(f"SetupAgent: Package '{pkg_name}' is already installed. Skipping.")
+                    version_text = next(
+                        (
+                            line.split(":", 1)[1].strip()
+                            for line in res_check.stdout.splitlines()
+                            if line.lower().startswith("version:")
+                        ),
+                        "",
+                    )
+                    try:
+                        version_matches = bool(version_text) and (
+                            not requirement.specifier
+                            or requirement.specifier.contains(
+                                Version(version_text), prereleases=True
+                            )
+                        )
+                    except InvalidVersion:
+                        version_matches = False
+                    if version_matches:
+                        self._log(
+                            f"SetupAgent: Package '{pkg_name}' {version_text} "
+                            "satisfies the resolved requirement. Skipping."
+                        )
+                    else:
+                        self._log(
+                            f"SetupAgent: Package '{pkg_name}' version "
+                            f"{version_text or '<unknown>'} does not satisfy {dep!r}."
+                        )
+                        to_install.append(dep)
                 else:
                     to_install.append(dep)
             except Exception:
@@ -113,8 +145,25 @@ class SetupAgent:
             self._log("SetupAgent: All dependencies are installed and importable.")
             return
 
+        free_bytes = shutil.disk_usage(Path(self.venv_python).resolve().parent).free
+        minimum_free_bytes = 1024 ** 3
+        if free_bytes < minimum_free_bytes:
+            message = (
+                "Dependency installation skipped because the selected environment "
+                f"has only {free_bytes / (1024 ** 3):.2f} GiB free; at least "
+                "1.00 GiB is required to avoid filling the worker disk."
+            )
+            self._log("SetupAgent ERROR: " + message)
+            raise OSError(28, message)
+
         self._log(f"SetupAgent: Executing pip install for missing dependencies: {to_install}")
-        cmd = [self.venv_python, "-m", "pip", "install"] + to_install
+        cmd = [
+            self.venv_python,
+            "-m",
+            "pip",
+            "install",
+            "--no-cache-dir",
+        ] + to_install
         
         try:
             res = subprocess.run(
@@ -122,6 +171,7 @@ class SetupAgent:
                 capture_output=True,
                 text=True,
                 check=True,
+                timeout=1800,
                 env=sanitized_subprocess_env(),
             )
             self._log("SetupAgent: Package installation successful!")
@@ -131,6 +181,9 @@ class SetupAgent:
             self._log("SetupAgent ERROR: Failed to install dependencies.")
             self._log(e.stderr)
             raise e
+        except subprocess.TimeoutExpired as e:
+            self._log("SetupAgent ERROR: Dependency installation timed out after 1800s.")
+            raise e
 
     def _verify_dependency_imports(self, dependencies) -> None:
         """Detect installed-but-broken dependency environments before execution."""
@@ -139,13 +192,22 @@ class SetupAgent:
             "pytorch-tabnet": "pytorch_tabnet",
             "pytorch-lightning": "pytorch_lightning",
             "opencv-python": "cv2",
+            "imbalanced-learn": "imblearn",
         }
         failures = []
+        resolved_versions = []
         for dependency in sorted(dependencies):
             package = Requirement(dependency).name
             module = import_names.get(package.lower(), package.replace("-", "_"))
             result = subprocess.run(
-                [self.venv_python, "-c", f"import {module}"],
+                [
+                    self.venv_python,
+                    "-c",
+                    (
+                        f"import {module}; import importlib.metadata as metadata; "
+                        f"print(metadata.version({package!r}))"
+                    ),
+                ],
                 capture_output=True,
                 text=True,
                 timeout=30,
@@ -153,10 +215,19 @@ class SetupAgent:
             )
             if result.returncode != 0:
                 failures.append(f"{package}: {result.stderr[-1200:]}")
+            else:
+                resolved_versions.append(
+                    f"{package}=={result.stdout.strip() or '<unknown>'}"
+                )
         if failures:
             message = "Installed dependency failed import validation:\n" + "\n".join(failures)
             self._log("SetupAgent ERROR: " + message)
             raise RuntimeError(message)
+        if resolved_versions:
+            self._log(
+                "SetupAgent: Validated imports in selected interpreter: "
+                + ", ".join(resolved_versions)
+            )
 
     def install_allowlisted_dependencies(
         self,

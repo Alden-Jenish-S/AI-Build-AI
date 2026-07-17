@@ -507,7 +507,31 @@ Decide: Output either one artifact_id from the list, or 'web_search'.
             f"Planned Technique to Implement:\n{branch_plan}\n\n"
             "Write only the query string."
         )
-        search_query = call_llm(query_prompt_sys, query_prompt_user, model=self.model_name).strip().replace('"', '')
+        query_error = None
+        try:
+            search_query = (
+                call_llm(
+                    query_prompt_sys,
+                    query_prompt_user,
+                    model=self.model_name,
+                )
+                .strip()
+                .replace('"', '')
+            )
+        except Exception as exc:
+            # Query generation is optional planning work. Provider-side parser
+            # errors must not destroy the whole branch; derive a bounded query
+            # deterministically and continue.
+            query_error = str(exc)
+            search_query = " ".join(
+                (branch_plan or task_description or "robust tabular machine learning")
+                .replace("\n", " ")
+                .split()
+            )[:240]
+            print(
+                "TechniqueAgent WARNING: LLM query generation failed; using "
+                f"deterministic query fallback: {query_error[-500:]}"
+            )
 
         print(f"TechniqueAgent: Running web search for query: '{search_query}'")
         search_results = search_web(search_query)
@@ -537,7 +561,31 @@ Planned Technique:
 
 Outline the new technique and return the raw source logic for our builder.
 """
-        new_technique_outline = call_llm(build_prompt_sys, build_prompt_user, model=self.model_name)
+        try:
+            new_technique_outline = call_llm(
+                build_prompt_sys, build_prompt_user, model=self.model_name
+            )
+        except Exception as exc:
+            # The implementation agent can still build a useful branch directly
+            # from the original plan using installed core libraries.
+            outline_error = str(exc)
+            print(
+                "TechniqueAgent WARNING: Web-outline generation failed; preserving "
+                "the branch as a self-contained implementation fallback."
+            )
+            return {
+                "status": "self_contained_fallback",
+                "artifact_id": None,
+                "category": "planning_fallback",
+                "plan": (
+                    "Implement the planned technique directly as a dependency-light, "
+                    "self-contained pipeline using only already importable project "
+                    f"libraries. Preserve this intent: {branch_plan}"
+                ),
+                "search_query": search_query,
+                "planning_error": outline_error,
+                "query_generation_error": query_error,
+            }
 
         return {
             "status": "pool_miss",
@@ -545,5 +593,6 @@ Outline the new technique and return the raw source logic for our builder.
             "category": "web_search_fallback",
             "plan": f"Bootstrap new technique from web search: {search_query}",
             "search_results": search_results,
-            "raw_outline": new_technique_outline
+            "raw_outline": new_technique_outline,
+            "query_generation_error": query_error,
         }

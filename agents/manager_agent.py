@@ -1,4 +1,5 @@
 import os
+import copy
 import json
 import math
 import shutil
@@ -95,12 +96,15 @@ class ManagerAgent:
         self.uncertainty_weight = 1.0
         self.max_l1_categories = 8
         self.max_artifact_candidates = 5
+        self.max_fine_tune_rounds = 2
+        self.max_debug_attempts = 2
         self.enforce_evaluation_contract = True
-        self.available_accelerators = detect_available_accelerators(self.venv_path)
+        self.accelerator_allowlist = None
+        self.accelerator_preference = "auto"
+        self.available_accelerators = {"cpu"}
         self.preferred_accelerator = "cpu"
         self.available_ram_gb = self._available_ram_gb()
 
-        accelerator_preference = "auto"
         config_file = self.task_dir / "task_config.json"
         if config_file.exists():
             try:
@@ -125,6 +129,12 @@ class ManagerAgent:
                 self.max_artifact_candidates = max(
                     1, int(task_config.get("max_artifact_candidates", 5))
                 )
+                self.max_fine_tune_rounds = max(
+                    0, int(task_config.get("max_fine_tune_rounds", 2))
+                )
+                self.max_debug_attempts = max(
+                    0, int(task_config.get("max_debug_attempts", 2))
+                )
                 resource_limits = task_config.get("resource_limits", {})
                 if isinstance(resource_limits, dict):
                     accelerators = resource_limits.get("accelerators")
@@ -135,9 +145,8 @@ class ManagerAgent:
                         if "gpu" in allowed_accelerators:
                             allowed_accelerators.update({"cuda", "mps"})
                         allowed_accelerators.add("cpu")
-                        self.available_accelerators &= allowed_accelerators
-                        self.available_accelerators.add("cpu")
-                    accelerator_preference = resource_limits.get(
+                        self.accelerator_allowlist = allowed_accelerators
+                    self.accelerator_preference = resource_limits.get(
                         "preferred_accelerator", "auto"
                     )
                     if resource_limits.get("max_ram_gb") is not None:
@@ -152,9 +161,7 @@ class ManagerAgent:
                             self.available_ram_gb = configured_ram_gb
             except Exception as e:
                 print(f"ManagerAgent WARNING: Failed to parse task_config.json: {e}")
-        self.preferred_accelerator = select_preferred_accelerator(
-            self.available_accelerators, accelerator_preference
-        )
+        self._refresh_accelerator_state()
         if self.metric_direction not in {"maximize", "minimize"}:
             raise ValueError(
                 f"task_config metric_direction must be 'maximize' or 'minimize', "
@@ -193,7 +200,12 @@ class ManagerAgent:
             except Exception:
                 pass
                 
-        print(f"ManagerAgent initialized: direction={self.metric_direction}, timeout={self.subprocess_timeout}, baseline_score={self.baseline_score}")
+        print(
+            "ManagerAgent initialized: "
+            f"direction={self.metric_direction}, "
+            f"baseline_timeout={self.subprocess_timeout}, "
+            f"implementation_timeout=None, baseline_score={self.baseline_score}"
+        )
 
     @staticmethod
     def _available_ram_gb() -> float:
@@ -203,6 +215,18 @@ class ManagerAgent:
             ) / (1024 ** 3)
         except (AttributeError, OSError, ValueError):
             return 0.0
+
+    def _refresh_accelerator_state(self) -> None:
+        """Re-probe the selected interpreter after dependency installation."""
+        available = detect_available_accelerators(self.venv_path)
+        allowlist = getattr(self, "accelerator_allowlist", None)
+        if allowlist:
+            available &= set(allowlist)
+            available.add("cpu")
+        self.available_accelerators = available
+        self.preferred_accelerator = select_preferred_accelerator(
+            available, getattr(self, "accelerator_preference", "auto")
+        )
 
     @staticmethod
     def _initial_fanout_for_budget(total_budget: int) -> int:
@@ -239,6 +263,9 @@ class ManagerAgent:
                 "elapsed_seconds": node.result.get("elapsed_seconds"),
                 "validation": node.result.get("validation", {}),
                 "oof_path": node.result.get("oof_path"),
+                "tuning": node.result.get("tuning"),
+                "artifact_repair": node.result.get("artifact_repair"),
+                "artifact_variant": node.result.get("artifact_variant"),
                 "no_effect_reason": node.result.get("no_effect_reason"),
                 "deduplicated_outputs": node.result.get("deduplicated_outputs", []),
             }
@@ -249,6 +276,10 @@ class ManagerAgent:
         if config.get("technique_record"):
             config["technique_record"] = self._compact_technique_record(
                 config["technique_record"]
+            )
+        if config.get("locked_technique_record"):
+            config["locked_technique_record"] = self._compact_technique_record(
+                config["locked_technique_record"]
             )
         return {
             "node_id": node.node_id,
@@ -439,6 +470,7 @@ class ManagerAgent:
                 0, self.total_budget - getattr(self, "initial_fanout", 0)
             ),
             "experiments_executed": getattr(self, "experiments_executed", 0),
+            "max_fine_tune_rounds": getattr(self, "max_fine_tune_rounds", 2),
             "resource_capacity": {
                 "accelerators": sorted(
                     getattr(self, "available_accelerators", {"cpu"})
@@ -487,15 +519,25 @@ class ManagerAgent:
             raise
         print("ManagerAgent: Baseline generated successfully!")
 
-    def _feasibility_reason(self, model_card: dict | None) -> str | None:
+    def _feasibility_reason(
+        self, model_card: dict | None, check_accelerator: bool = True
+    ) -> str | None:
         """Reject statically incompatible artifacts before charging an experiment."""
         if not model_card:
             return None
         profile = normalize_resource_profile(model_card)
         accelerator = profile["accelerator"]
-        if accelerator == "gpu" and not ({"cuda", "mps", "gpu"} & self.available_accelerators):
+        if (
+            check_accelerator
+            and accelerator == "gpu"
+            and not ({"cuda", "mps", "gpu"} & self.available_accelerators)
+        ):
             return "artifact requires a GPU but this run exposes CPU only"
-        if accelerator in {"cuda", "mps"} and accelerator not in self.available_accelerators:
+        if (
+            check_accelerator
+            and accelerator in {"cuda", "mps"}
+            and accelerator not in self.available_accelerators
+        ):
             return f"artifact requires {accelerator.upper()} but that accelerator is unavailable"
         if (
             self.available_ram_gb > 0
@@ -504,14 +546,6 @@ class ManagerAgent:
             return (
                 f"artifact requires {profile['min_ram_gb']:.1f} GB RAM but only "
                 f"{self.available_ram_gb:.1f} GB is available"
-            )
-        if (
-            profile["estimated_runtime_seconds"] > 0
-            and profile["estimated_runtime_seconds"] > self.subprocess_timeout
-        ):
-            return (
-                f"artifact estimates {profile['estimated_runtime_seconds']:.0f}s but "
-                f"the task timeout is {self.subprocess_timeout:.0f}s"
             )
         return None
 
@@ -708,8 +742,8 @@ class ManagerAgent:
             
         return best_node_id
 
-    def _score_to_reward(self, score: float, cv_std: float = 0.0) -> float:
-        """Normalize a conservative, uncertainty-discounted metric around baseline."""
+    def _conservative_score(self, score: float, cv_std: float = 0.0) -> float:
+        """Discount a point estimate by its measured fold uncertainty."""
         score = float(score)
         try:
             uncertainty = max(0.0, float(cv_std or 0.0)) * getattr(
@@ -717,11 +751,35 @@ class ManagerAgent:
             )
         except (TypeError, ValueError):
             uncertainty = 0.0
-        conservative_score = (
+        return (
             score - uncertainty
             if self.metric_direction == "maximize"
             else score + uncertainty
         )
+
+    def _beats_baseline(self, score: float, cv_std: float = 0.0) -> bool:
+        if self.baseline_score is None or score is None:
+            return False
+        conservative = self._conservative_score(score, cv_std)
+        return (
+            conservative > self.baseline_score
+            if self.metric_direction == "maximize"
+            else conservative < self.baseline_score
+        )
+
+    def _improves_on_score(
+        self, score: float, comparison_score: float, cv_std: float = 0.0
+    ) -> bool:
+        conservative = self._conservative_score(score, cv_std)
+        return (
+            conservative > float(comparison_score)
+            if self.metric_direction == "maximize"
+            else conservative < float(comparison_score)
+        )
+
+    def _score_to_reward(self, score: float, cv_std: float = 0.0) -> float:
+        """Normalize a conservative, uncertainty-discounted metric around baseline."""
+        conservative_score = self._conservative_score(score, cv_std)
         if self.baseline_score is None:
             reward = (
                 conservative_score
@@ -795,17 +853,127 @@ class ManagerAgent:
             },
         )
 
+    @staticmethod
+    def _artifact_validation_source(
+        tech_record: dict, artifact_variant: dict | None
+    ) -> dict:
+        """Do not credit a node-local code revision to the unchanged L2 card."""
+        return {} if artifact_variant else tech_record
+
+    @staticmethod
+    def _dependency_fallback_record(tech_record: dict, error: object) -> dict:
+        """Preserve branch intent when an optional artifact cannot be installed."""
+        fallback = copy.deepcopy(tech_record or {})
+        card = fallback.get("model_card") or (
+            fallback.get("candidate_artifact", {}).get("model_card")
+        ) or {}
+        artifact_id = card.get("artifact_id") or fallback.get("artifact_id")
+        original_plan = fallback.get("plan", "Build a robust tabular pipeline.")
+        fallback["unavailable_artifact"] = {
+            "artifact_id": artifact_id,
+            "category": card.get("category") or fallback.get("category"),
+            "reason": str(error),
+        }
+        for key in (
+            "model_card",
+            "candidate_artifact",
+            "artifact_id",
+            "category",
+            "scope",
+        ):
+            fallback.pop(key, None)
+        fallback["status"] = "dependency_fallback"
+        fallback["plan"] = (
+            "The selected optional artifact could not be installed. Implement a "
+            "dependency-light, self-contained equivalent using only libraries that "
+            "are already importable in the selected interpreter. Do not import the "
+            f"unavailable artifact {artifact_id or '<unknown>'!r}. Preserve the "
+            f"original branch intent: {original_plan}"
+        )
+        return fallback
+
     def _spawn_follow_up_nodes(self, node: NodeState, node_id: str) -> None:
         """Create cheap virtual operator slots; materialize only the selected slot."""
         if self.experiments_executed + 1 >= self.total_budget or not node.code:
             return
-        operator_priorities = {"refine": 0.02, "tune": 0.01, "diversify": 0.0}
+        result = node.result or {}
+        score = result.get("score")
+        validation = result.get("validation") or {}
+        cv_std = validation.get("cv_std", 0.0)
+        repaired_artifact = result.get("artifact_repair") or {}
+        artifact_variant = (
+            repaired_artifact
+            if repaired_artifact.get("verified")
+            else (node.config or {}).get("artifact_variant")
+        )
+        model_card = ((node.config or {}).get("technique_record") or {}).get(
+            "model_card", {}
+        )
+        model_capabilities = (
+            model_card.get("capabilities", {})
+            if isinstance(model_card, dict)
+            else {}
+        )
+        tunable_parameters_declared = (
+            isinstance(model_capabilities, dict)
+            and "tunable_parameters" in model_capabilities
+        )
+        tunable_parameters = (
+            model_capabilities.get("tunable_parameters", [])
+            if tunable_parameters_declared
+            else []
+        )
+        fine_tune_depth = int((node.config or {}).get("fine_tune_depth", 0) or 0)
+        tune_eligible = self._beats_baseline(score, cv_std) and fine_tune_depth < getattr(
+            self, "max_fine_tune_rounds", 2
+        )
+        if tunable_parameters_declared and not tunable_parameters:
+            tune_eligible = False
+        if tune_eligible and node.operator == "tune":
+            previous_node = self.all_nodes.get((node.config or {}).get("base_node_id"))
+            previous_score = (previous_node.result or {}).get("score") if previous_node else None
+            previous_validation = (
+                (previous_node.result or {}).get("validation") or {}
+                if previous_node
+                else {}
+            )
+            previous_conservative_score = (
+                self._conservative_score(
+                    previous_score, previous_validation.get("cv_std", 0.0)
+                )
+                if previous_score is not None
+                else None
+            )
+            tune_eligible = previous_score is not None and self._improves_on_score(
+                score, previous_conservative_score, cv_std
+            )
+
+        operator_priorities = {"refine": 0.02, "diversify": 0.0}
+        if tune_eligible:
+            # A measured winner earns a high-priority, model-locked fine-tuning slot.
+            operator_priorities["tune"] = 0.09
         for operator, priority in operator_priorities.items():
             child_fidelity = (
                 self._next_fidelity(node.fidelity)
-                if self.enable_multi_fidelity and operator in {"refine", "tune"}
+                if self.enable_multi_fidelity and operator == "refine"
                 else node.fidelity
             )
+            is_fine_tune = operator == "tune"
+            tuning_context = None
+            if is_fine_tune:
+                tuning_context = {
+                    "trigger": "conservative_score_beats_baseline",
+                    "parent_node_id": node_id,
+                    "parent_score": score,
+                    "parent_cv_std": cv_std,
+                    "baseline_score": self.baseline_score,
+                    "metric_direction": self.metric_direction,
+                    "comparison_fidelity": node.fidelity,
+                    "fine_tune_round": fine_tune_depth + 1,
+                    "artifact_variant": artifact_variant,
+                    "tunable_parameters_declared": tunable_parameters_declared,
+                    "tunable_parameters": tunable_parameters,
+                }
             new_id = self.get_new_node_id()
             child = NodeState(
                 node_id=new_id,
@@ -818,8 +986,20 @@ class ManagerAgent:
                     "base_node_id": node_id,
                     "base_code_path": node.code,
                     "priority": priority,
+                    "priority_locked": is_fine_tune,
                     "lazy_proposal": True,
                     "materialized": False,
+                    "fine_tune_triggered": is_fine_tune,
+                    "fine_tune_depth": (
+                        fine_tune_depth + 1 if is_fine_tune else fine_tune_depth
+                    ),
+                    "tuning_context": tuning_context,
+                    "artifact_variant": artifact_variant,
+                    "locked_technique_record": (
+                        copy.deepcopy((node.config or {}).get("technique_record"))
+                        if is_fine_tune
+                        else None
+                    ),
                     "allowed_scopes": (
                         ["full_pipeline", "model_family"]
                         if operator == "diversify"
@@ -834,6 +1014,17 @@ class ManagerAgent:
                 f"ManagerAgent: Spawned virtual {operator} slot {new_id} at "
                 f"{child_fidelity} fidelity"
             )
+            if is_fine_tune:
+                self._trace_search(
+                    {
+                        "event": "fine_tune_scheduled",
+                        "node_id": new_id,
+                        "parent_node_id": node_id,
+                        "parent_score": score,
+                        "baseline_score": self.baseline_score,
+                        "fine_tune_round": fine_tune_depth + 1,
+                    }
+                )
         self._persist_node(node_id)
         self._persist_tree_state()
 
@@ -841,6 +1032,20 @@ class ManagerAgent:
         """Spend one proposal-generation call only after the scheduler selects a slot."""
         config = dict(node.config or {})
         if not config.get("lazy_proposal") or config.get("materialized"):
+            return
+        if config.get("fine_tune_triggered"):
+            context = config.get("tuning_context") or {}
+            node.plan = (
+                "Fine-tune the measured winning parent without changing its model family, "
+                "features, preprocessing, folds, or output contract. Use the parent settings "
+                "as a control, run a bounded pruned search over its existing hyperparameters, "
+                "and apply early stopping. Trigger context: "
+                + json.dumps(context, default=str)
+            )
+            config["proposal_name"] = "baseline_winner_fine_tune"
+            config["materialized"] = True
+            node.config = config
+            self._persist_node(node.node_id)
             return
         base_node_id = config.get("base_node_id")
         parent = self.all_nodes.get(base_node_id)
@@ -874,7 +1079,12 @@ class ManagerAgent:
                 "priority": config.get("priority", 0.0),
             }
         node.plan = proposal["plan"]
-        config["priority"] = proposal.get("priority", config.get("priority", 0.0))
+        proposed_priority = proposal.get("priority", config.get("priority", 0.0))
+        config["priority"] = (
+            max(float(config.get("priority", 0.0)), float(proposed_priority))
+            if config.get("priority_locked")
+            else proposed_priority
+        )
         config["proposal_name"] = proposal.get("name")
         config["materialized"] = True
         node.config = config
@@ -887,26 +1097,84 @@ class ManagerAgent:
 
             self._materialize_lazy_proposal(node)
 
-            # Pool additions from earlier nodes in this same run must be visible.
-            with open(l1_path, 'r', encoding='utf-8') as f:
-                l1_index = json.load(f)
-            
-            # Fetch sibling/parent records from global memory
-            context = self.global_memory.get_default_context(selected_id, self.all_nodes)
-            
-            # Bug 3 fix: pass clean task_description separately from branch plan
-            tech_record = self.technique_agent.run(
-                task_description=self.task_description,
-                branch_plan=node.plan,
-                global_memory_context=context,
-                l1_index=l1_index,
-                available_accelerators=set(self.available_accelerators),
-                preferred_accelerator=self.preferred_accelerator,
-                allowed_scopes=set(
-                    (node.config or {}).get("allowed_scopes", [])
-                ) or None,
-            )
+            if (node.config or {}).get("fine_tune_triggered"):
+                # Fine-tuning is locked to the measured parent artifact/model
+                # family; querying the pool here could silently replace it.
+                tech_record = copy.deepcopy(
+                    (node.config or {}).get("locked_technique_record") or {}
+                )
+                tech_record["plan"] = node.plan
+                tech_record["fine_tune"] = True
+                tech_record["tuning_context"] = (node.config or {}).get(
+                    "tuning_context"
+                )
+                tech_record.setdefault("status", "self_contained_fine_tune")
+            else:
+                # Pool additions from earlier nodes in this same run must be visible.
+                with open(l1_path, 'r', encoding='utf-8') as f:
+                    l1_index = json.load(f)
+
+                context = self.global_memory.get_default_context(
+                    selected_id, self.all_nodes
+                )
+                try:
+                    tech_record = self.technique_agent.run(
+                        task_description=self.task_description,
+                        branch_plan=node.plan,
+                        global_memory_context=context,
+                        l1_index=l1_index,
+                        available_accelerators=set(self.available_accelerators),
+                        preferred_accelerator=self.preferred_accelerator,
+                        allowed_scopes=set(
+                            (node.config or {}).get("allowed_scopes", [])
+                        ) or None,
+                    )
+                except Exception as exc:
+                    # Planning is not an experiment. Preserve the branch intent and
+                    # let ImplementationAgent attempt a dependency-light pipeline
+                    # instead of exhausting the tree on a provider-side LLM error.
+                    tech_record = {
+                        "status": "self_contained_fallback",
+                        "plan": (
+                            "Technique planning failed before selecting an artifact. "
+                            "Implement a robust self-contained version of the branch "
+                            "using only already importable project libraries. Preserve "
+                            f"this branch intent: {node.plan}"
+                        ),
+                        "planning_error": str(exc),
+                    }
+                    self._trace_search(
+                        {
+                            "event": "technique_planning_fallback",
+                            "node_id": selected_id,
+                            "reason": str(exc),
+                        }
+                    )
+                    print(
+                        "ManagerAgent WARNING: Technique planning failed; "
+                        "continuing with a self-contained implementation fallback: "
+                        f"{exc}"
+                    )
             planning_config = dict(node.config or {})
+            artifact_variant = planning_config.get("artifact_variant")
+            selected_card = tech_record.get("model_card") or (
+                tech_record.get("candidate_artifact", {}).get("model_card")
+            )
+            selected_artifact_id = (
+                selected_card.get("artifact_id")
+                if isinstance(selected_card, dict)
+                else None
+            )
+            if (
+                artifact_variant
+                and selected_artifact_id
+                and selected_artifact_id
+                != artifact_variant.get("artifact_id")
+            ):
+                # This branch selected a different artifact, so evidence belongs
+                # to that new artifact rather than the inherited local variant.
+                artifact_variant = None
+            planning_config["artifact_variant"] = artifact_variant
             planning_config["technique_record"] = tech_record
             node.config = planning_config
             self._persist_node(selected_id)
@@ -926,6 +1194,12 @@ class ManagerAgent:
                     "base_node_id": planning_config.get("base_node_id"),
                     "base_code_path": planning_config.get("base_code_path"),
                     "priority": planning_config.get("priority", 0.0),
+                    "fine_tune_triggered": planning_config.get(
+                        "fine_tune_triggered", False
+                    ),
+                    "fine_tune_depth": planning_config.get("fine_tune_depth", 0),
+                    "tuning_context": planning_config.get("tuning_context"),
+                    "artifact_variant": planning_config.get("artifact_variant"),
                 },
             )
             self.all_nodes[child_id] = child_node
@@ -997,9 +1271,18 @@ class ManagerAgent:
                 feasibility_card = (
                     tech_record.get("candidate_artifact", {}).get("model_card")
                 )
-            feasibility_reason = self._feasibility_reason(feasibility_card)
-            compatibility_reason = self._operator_compatibility_reason(
-                feasibility_card, node.operator
+            # Accelerator libraries may not exist until dependency setup runs.
+            # Check static RAM constraints now and accelerator feasibility
+            # after installing into and re-probing the selected interpreter.
+            feasibility_reason = self._feasibility_reason(
+                feasibility_card, check_accelerator=False
+            )
+            compatibility_reason = (
+                None
+                if (node.config or {}).get("fine_tune_triggered")
+                else self._operator_compatibility_reason(
+                    feasibility_card, node.operator
+                )
             )
             feasibility_reason = feasibility_reason or compatibility_reason
             if feasibility_reason:
@@ -1056,8 +1339,110 @@ class ManagerAgent:
             
             # Install dependencies via Setup Agent
             model_card = tech_record.get("model_card")
-            if model_card:
-                self.setup_agent.install_dependencies([model_card])
+            candidate_card = None
+            try:
+                requirements_file = self.project_root / "requirements.txt"
+                if model_card:
+                    # Every selected artifact, including a verified pool hit, is
+                    # resolved to the exact human-controlled project requirement.
+                    # This prevents a bare card dependency such as `torch` from
+                    # accepting or installing an incompatible arbitrary version.
+                    self.setup_agent.install_allowlisted_dependencies(
+                        [model_card], requirements_file
+                    )
+                else:
+                    candidate_card = (
+                        tech_record.get("candidate_artifact", {}).get("model_card")
+                    )
+                    if candidate_card and candidate_card.get("dependencies"):
+                        self.setup_agent.install_allowlisted_dependencies(
+                            [candidate_card], requirements_file
+                        )
+            except Exception as exc:
+                if node.operator == "tune" or (node.config or {}).get(
+                    "fine_tune_triggered"
+                ):
+                    # A tuning node is model-locked; replacing its artifact would
+                    # invalidate the comparison, so it remains a free setup skip.
+                    node.executed = True
+                    node.result = {
+                        "score": None,
+                        "status": "skipped_dependency_setup",
+                        "reward": None,
+                        "diagnostics": str(exc),
+                    }
+                    self._trace_search(
+                        {
+                            "event": "skipped_dependency_setup",
+                            "node_id": selected_id,
+                            "reason": str(exc),
+                        }
+                    )
+                    self._persist_node(selected_id)
+                    self._persist_tree_state()
+                    print(
+                        f"ManagerAgent: Skipping locked tuning node {selected_id}; "
+                        f"dependency setup failed: {exc}"
+                    )
+                    return False
+
+                # For ordinary branches, an unavailable optional package should
+                # not exhaust the tree. Remove the unusable artifact contract and
+                # let the implementation agent attempt the closest core-library
+                # equivalent as a normal, budgeted experiment.
+                tech_record = self._dependency_fallback_record(tech_record, exc)
+                node.config = dict(node.config or {})
+                node.config["technique_record"] = tech_record
+                node.config["artifact_variant"] = None
+                model_card = None
+                candidate_card = None
+                self._trace_search(
+                    {
+                        "event": "dependency_fallback",
+                        "node_id": selected_id,
+                        "reason": str(exc),
+                        "unavailable_artifact": tech_record.get(
+                            "unavailable_artifact"
+                        ),
+                    }
+                )
+                self._persist_node(selected_id)
+                self._persist_tree_state()
+                print(
+                    f"ManagerAgent WARNING: Dependency setup failed for {selected_id}; "
+                    "continuing with a dependency-light self-contained fallback: "
+                    f"{exc}"
+                )
+
+            # Installing Torch or another backend can reveal CUDA/MPS support that
+            # was invisible when the manager started. Refresh before choosing the
+            # node device, then apply accelerator-only feasibility without charging
+            # the experiment budget on failure.
+            self._refresh_accelerator_state()
+            post_setup_card = model_card or candidate_card
+            accelerator_reason = self._feasibility_reason(post_setup_card)
+            if accelerator_reason:
+                node.executed = True
+                node.result = {
+                    "score": None,
+                    "status": "skipped_infeasible",
+                    "reward": None,
+                    "diagnostics": accelerator_reason,
+                }
+                self._trace_search(
+                    {
+                        "event": "skipped_infeasible_after_dependency_setup",
+                        "node_id": selected_id,
+                        "reason": accelerator_reason,
+                    }
+                )
+                self._persist_node(selected_id)
+                self._persist_tree_state()
+                print(
+                    f"ManagerAgent: Skipping {selected_id} before experiment budget; "
+                    f"post-setup feasibility failed: {accelerator_reason}"
+                )
+                return False
                 
             # Run implementation script in its own run folder
             node_dir = self.run_root / selected_id
@@ -1067,7 +1452,6 @@ class ManagerAgent:
                 node_dir,
                 tech_record,
                 self.task_dir,
-                timeout=self.subprocess_timeout,
                 metric_direction=self.metric_direction,
                 base_algorithm_path=(node.config or {}).get("base_code_path"),
                 parent_node_dir=(
@@ -1080,11 +1464,25 @@ class ManagerAgent:
                 enforce_evaluation_contract=True,
                 accelerator=self.preferred_accelerator,
                 available_accelerators=set(self.available_accelerators),
+                tuning_context=(node.config or {}).get("tuning_context"),
+                max_debug_attempts=getattr(self, "max_debug_attempts", 2),
             )
             
             # Bug 1 fix: Handle execution failures properly
             score = res.get("score")  # Will be None on failure
             status = res.get("status", "completed")
+            repaired_variant = res.get("artifact_repair") or {}
+            artifact_variant = (
+                repaired_variant
+                if repaired_variant.get("verified")
+                else (node.config or {}).get("artifact_variant")
+            )
+            if artifact_variant:
+                node.config = dict(node.config or {})
+                node.config["artifact_variant"] = artifact_variant
+            validation_tech_record = self._artifact_validation_source(
+                tech_record, artifact_variant
+            )
             
             # Record result to NodeState
             node.code = res.get("code_path")
@@ -1109,13 +1507,16 @@ class ManagerAgent:
                 ),
                 "validation": validation,
                 "oof_path": res.get("oof_path"),
+                "tuning": res.get("tuning"),
+                "artifact_repair": res.get("artifact_repair"),
+                "artifact_variant": artifact_variant,
             }
             node.executed = True
             
             if status == "failed":
                 print(f"ManagerAgent: Implementation Node {selected_id} FAILED. No score produced.")
                 self._record_artifact_validation(
-                    tech_record,
+                    validation_tech_record,
                     selected_id,
                     None,
                     "failed",
@@ -1147,7 +1548,7 @@ class ManagerAgent:
                     }
                 )
                 self._record_artifact_validation(
-                    tech_record,
+                    validation_tech_record,
                     selected_id,
                     score,
                     status,
@@ -1178,7 +1579,7 @@ class ManagerAgent:
                 node.result["deduplicated_outputs"] = deduplicated_outputs
 
             self._record_artifact_validation(
-                tech_record,
+                validation_tech_record,
                 selected_id,
                 score,
                 status,
@@ -1198,6 +1599,9 @@ class ManagerAgent:
                     "validation": res.get("validation", {}),
                     "elapsed_seconds": res.get("elapsed_seconds"),
                     "reward": reward,
+                    "tuning": res.get("tuning"),
+                    "artifact_repair": res.get("artifact_repair"),
+                    "artifact_variant": artifact_variant,
                 },
                 score,
                 "completed",
@@ -1212,6 +1616,9 @@ class ManagerAgent:
                     "score": score,
                     "reward": reward,
                     "fidelity": node.fidelity,
+                    "tuning": res.get("tuning"),
+                    "artifact_repair": res.get("artifact_repair"),
+                    "artifact_variant": artifact_variant,
                 }
             )
             self._persist_node(selected_id)

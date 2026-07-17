@@ -3,6 +3,7 @@ import pandas as pd
 import os
 import warnings
 from sklearn.base import BaseEstimator, ClassifierMixin
+from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler, OrdinalEncoder
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_auc_score
@@ -10,6 +11,25 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+
+
+def _runtime_limit(name, default):
+    try:
+        return max(1, int(os.environ.get(name, default)))
+    except (TypeError, ValueError):
+        return max(1, int(default))
+
+
+def _encode_binary_target(y):
+    values = np.asarray(y).reshape(-1)
+    if pd.isna(values).any():
+        raise ValueError("binary target contains missing values")
+    classes = sorted(pd.unique(values).tolist(), key=lambda value: str(value))
+    if len(classes) != 2:
+        raise ValueError(f"binary target must contain exactly two classes; got {classes}")
+    mapping = {value: index for index, value in enumerate(classes)}
+    encoded = np.asarray([mapping[value] for value in values], dtype=np.float32)
+    return np.asarray(classes), encoded
 
 
 def _resolve_torch_device(device=None):
@@ -96,7 +116,9 @@ class _DomainAdaptationNet(nn.Module):
         in_dim = num_numeric + embed_out
         for h in hidden_dims:
             layers.append(nn.Linear(in_dim, h))
-            layers.append(nn.BatchNorm1d(h))
+            # LayerNorm remains valid for singleton final mini-batches; BatchNorm
+            # raises when a shuffled fold leaves one row in the last batch.
+            layers.append(nn.LayerNorm(h))
             layers.append(nn.ReLU())
             layers.append(nn.Dropout(dropout))
             in_dim = h
@@ -143,6 +165,7 @@ class GradientReversalDomainAdaptation(BaseEstimator, ClassifierMixin):
                  lr=1e-3,
                  lambda_max=1.0,
                  lambda_schedule='linear',
+                 early_stopping_patience=5,
                  device=None,
                  random_state=42,
                  verbose=1):
@@ -156,6 +179,7 @@ class GradientReversalDomainAdaptation(BaseEstimator, ClassifierMixin):
         self.lr = lr
         self.lambda_max = lambda_max
         self.lambda_schedule = lambda_schedule
+        self.early_stopping_patience = early_stopping_patience
         self.device = _resolve_torch_device(device)
         self.random_state = random_state
         self.verbose = verbose
@@ -167,25 +191,65 @@ class GradientReversalDomainAdaptation(BaseEstimator, ClassifierMixin):
         if self.numeric_features is None:
             self.numeric_features_ = X.select_dtypes(include=[np.number]).columns.tolist()
         else:
-            self.numeric_features_ = list(self.numeric_features)
+            self.numeric_features_ = [
+                column for column in self.numeric_features if column in X.columns
+            ]
         if self.categorical_features is None:
             self.categorical_features_ = X.select_dtypes(exclude=[np.number]).columns.tolist()
         else:
-            self.categorical_features_ = list(self.categorical_features)
+            self.categorical_features_ = [
+                column for column in self.categorical_features if column in X.columns
+            ]
+        self.numeric_features_ = [
+            column for column in self.numeric_features_
+            if not X[column].isna().all()
+        ]
+        self.categorical_features_ = [
+            column for column in self.categorical_features_
+            if not X[column].isna().all()
+        ]
+        if not self.numeric_features_ and not self.categorical_features_:
+            raise ValueError("training data has no usable non-empty feature columns")
         self.numeric_features_.sort()
         self.categorical_features_.sort()
 
     def _fit_preprocessors(self, X):
-        self.num_scaler_ = StandardScaler()
-        self.num_scaler_.fit(X[self.numeric_features_])
-        self.cat_encoder_ = OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=-1)
-        self.cat_encoder_.fit(X[self.categorical_features_])
-        self.cat_cardinalities_ = [int(self.cat_encoder_.categories_[i].shape[0]) + 1
-                                   for i in range(len(self.categorical_features_))]
+        self.num_imputer_ = self.num_scaler_ = None
+        if self.numeric_features_:
+            self.num_imputer_ = SimpleImputer(
+                strategy="median", keep_empty_features=True
+            )
+            numeric = self.num_imputer_.fit_transform(X[self.numeric_features_])
+            self.num_scaler_ = StandardScaler().fit(numeric)
+
+        self.cat_imputer_ = self.cat_encoder_ = None
+        self.cat_cardinalities_ = []
+        if self.categorical_features_:
+            self.cat_imputer_ = SimpleImputer(
+                strategy="most_frequent", keep_empty_features=True
+            )
+            categorical = self.cat_imputer_.fit_transform(
+                X[self.categorical_features_]
+            )
+            self.cat_encoder_ = OrdinalEncoder(
+                handle_unknown='use_encoded_value', unknown_value=-1
+            ).fit(categorical)
+            self.cat_cardinalities_ = [
+                int(categories.shape[0]) + 1
+                for categories in self.cat_encoder_.categories_
+            ]
 
     def _transform(self, X):
-        X_num = self.num_scaler_.transform(X[self.numeric_features_])
-        X_cat = self.cat_encoder_.transform(X[self.categorical_features_])
+        if self.numeric_features_:
+            X_num = self.num_imputer_.transform(X[self.numeric_features_])
+            X_num = self.num_scaler_.transform(X_num)
+        else:
+            X_num = np.zeros((len(X), 0), dtype=np.float32)
+        if self.categorical_features_:
+            categorical = self.cat_imputer_.transform(X[self.categorical_features_])
+            X_cat = self.cat_encoder_.transform(categorical)
+        else:
+            X_cat = np.zeros((len(X), 0), dtype=np.int64)
         for i, card in enumerate(self.cat_cardinalities_):
             X_cat[:, i] = np.where(X_cat[:, i] == -1, card - 1, X_cat[:, i])
         return X_num.astype(np.float32), X_cat.astype(np.int64)
@@ -209,16 +273,19 @@ class GradientReversalDomainAdaptation(BaseEstimator, ClassifierMixin):
             compatibility.
         """
         # column handling & preprocessing
-        self._prepare_columns(X)
         combined = pd.concat([X, aux_X]) if aux_X is not None else X
+        self._prepare_columns(combined)
         self._fit_preprocessors(combined)
         X_num, X_cat = self._transform(X)
-        y = np.asarray(y).astype(np.float32)
+        self.classes_, y = _encode_binary_target(y)
 
         # build auxiliary tensors if provided
-        if aux_X is not None:
+        self.has_auxiliary_domain_ = aux_X is not None and len(aux_X) > 0
+        if self.has_auxiliary_domain_:
             aux_num, aux_cat = self._transform(aux_X)
-            aux_y = np.zeros_like(aux_num[:, 0]) if aux_y is None else np.asarray(aux_y).astype(np.float32)
+            # Auxiliary labels do not participate in the task-head loss; keep a
+            # shape-compatible placeholder and train their domain labels only.
+            aux_y = np.zeros(len(aux_X), dtype=np.float32)
             domain_main = np.ones(len(y), dtype=np.int64)
             domain_aux = np.zeros(len(aux_num), dtype=np.int64)
             X_num_all = np.concatenate([aux_num, X_num], axis=0)
@@ -248,15 +315,29 @@ class GradientReversalDomainAdaptation(BaseEstimator, ClassifierMixin):
         ).to(self.device)
 
         optimizer = torch.optim.Adam(self.model_.parameters(), lr=self.lr)
+        best_loss = float("inf")
+        best_state = None
+        stale_epochs = 0
 
-        for epoch in range(1, self.epochs + 1):
+        runtime_epochs = min(
+            max(1, int(self.epochs)),
+            _runtime_limit("AIBUILDAI_MAX_EPOCHS", self.epochs),
+        )
+        runtime_patience = min(
+            max(1, int(self.early_stopping_patience)),
+            _runtime_limit(
+                "AIBUILDAI_EARLY_STOPPING_PATIENCE",
+                self.early_stopping_patience,
+            ),
+        )
+        for epoch in range(1, runtime_epochs + 1):
             self.model_.train()
             epoch_losses = []
             # schedule λ
             if self.lambda_schedule == 'linear':
-                lam = self.lambda_max * epoch / self.epochs
+                lam = self.lambda_max * epoch / runtime_epochs
             elif self.lambda_schedule == 'exp':
-                lam = self.lambda_max * (2.0 ** (epoch - self.epochs) - 1)
+                lam = self.lambda_max * (2.0 ** (epoch - runtime_epochs) - 1)
             else:
                 lam = self.lambda_max
             self.model_.grl.lambda_ = lam
@@ -269,15 +350,42 @@ class GradientReversalDomainAdaptation(BaseEstimator, ClassifierMixin):
 
                 optimizer.zero_grad()
                 task_logit, domain_logit = self.model_(xb_num, xb_cat)
-                task_loss = F.binary_cross_entropy_with_logits(task_logit, yb)
-                domain_loss = F.cross_entropy(domain_logit, db)
+                main_domain = db == 1
+                task_loss = (
+                    F.binary_cross_entropy_with_logits(
+                        task_logit[main_domain], yb[main_domain]
+                    )
+                    if bool(main_domain.any())
+                    else task_logit.sum() * 0.0
+                )
+                domain_loss = (
+                    F.cross_entropy(domain_logit, db)
+                    if self.has_auxiliary_domain_
+                    else domain_logit.sum() * 0.0
+                )
                 loss = task_loss + domain_loss
                 loss.backward()
                 optimizer.step()
                 epoch_losses.append(loss.item())
 
             if self.verbose:
-                print(f"Epoch {epoch:02d}/{self.epochs} | λ={lam:.3f} | loss={np.mean(epoch_losses):.4f}")
+                print(f"Epoch {epoch:02d}/{runtime_epochs} | λ={lam:.3f} | loss={np.mean(epoch_losses):.4f}")
+            mean_loss = float(np.mean(epoch_losses))
+            if mean_loss < best_loss - 1e-5:
+                best_loss = mean_loss
+                best_state = {
+                    key: value.detach().cpu().clone()
+                    for key, value in self.model_.state_dict().items()
+                }
+                stale_epochs = 0
+            else:
+                stale_epochs += 1
+                if stale_epochs >= runtime_patience:
+                    if self.verbose:
+                        print(f"Early stopping after {epoch} epochs.")
+                    break
+        if best_state is not None:
+            self.model_.load_state_dict(best_state)
         return self
 
     # ------------------------------------------------------------------
@@ -286,12 +394,18 @@ class GradientReversalDomainAdaptation(BaseEstimator, ClassifierMixin):
     def _predict_proba_internal(self, X):
         self.model_.eval()
         X_num, X_cat = self._transform(X)
-        tensor_num = torch.from_numpy(X_num).float().to(self.device)
-        tensor_cat = torch.from_numpy(X_cat).long().to(self.device)
+        dataset = torch.utils.data.TensorDataset(
+            torch.from_numpy(X_num).float(), torch.from_numpy(X_cat).long()
+        )
+        loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=False)
+        predictions = []
         with torch.no_grad():
-            logits, _ = self.model_(tensor_num, tensor_cat)
-            probs = torch.sigmoid(logits).cpu().numpy()
-        probs = probs.reshape(-1)
+            for tensor_num, tensor_cat in loader:
+                logits, _ = self.model_(
+                    tensor_num.to(self.device), tensor_cat.to(self.device)
+                )
+                predictions.append(torch.sigmoid(logits).cpu().numpy())
+        probs = np.concatenate(predictions).reshape(-1)
         return np.column_stack([1.0 - probs, probs])
 
     def predict_proba(self, X):
@@ -344,7 +458,29 @@ def train_predict(X_train, X_test, y_train=None, aux_X=None, **model_kwargs):
     """
     if y_train is None:
         raise ValueError("y_train must be provided for training.")
+    if os.environ.get("AIBUILDAI_VERIFY") == "1":
+        model_kwargs.setdefault("epochs", 2)
+        model_kwargs.setdefault("early_stopping_patience", 1)
+        model_kwargs.setdefault("batch_size", 32)
+        model_kwargs.setdefault("verbose", 0)
     model = GradientReversalDomainAdaptation(**model_kwargs)
-    model.fit(X_train, y_train, aux_X=aux_X)
+    try:
+        model.fit(X_train, y_train, aux_X=aux_X)
+    except RuntimeError as exc:
+        if model.device == "cpu" or not any(
+            marker in str(exc).lower()
+            for marker in ("out of memory", "cuda", "cudnn", "mps")
+        ):
+            raise
+        warnings.warn(
+            f"Accelerator training failed ({exc}); retrying on CPU.", RuntimeWarning
+        )
+        retry_kwargs = dict(model_kwargs)
+        retry_kwargs["device"] = "cpu"
+        retry_kwargs["batch_size"] = min(
+            int(retry_kwargs.get("batch_size", 256)), 256
+        )
+        model = GradientReversalDomainAdaptation(**retry_kwargs)
+        model.fit(X_train, y_train, aux_X=aux_X)
     probs = model._predict_proba_internal(X_test)[:, 1]
     return probs

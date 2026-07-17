@@ -12,7 +12,8 @@
     "entrypoint": "train_predict(X_train, X_test, y_train=None, aux_X=None, **model_kwargs)",
     "output_contract": {
       "kind": "predictions",
-      "aligned_to": "X_test"
+      "aligned_to": "X_test",
+      "value_type": "probability"
     }
   },
   "capabilities": {
@@ -29,13 +30,22 @@
       "lr",
       "hidden_dims",
       "dropout",
-      "lambda_max"
+      "lambda_max",
+      "early_stopping_patience"
     ],
     "gpu_accelerated": true,
     "supported_accelerators": [
       "cpu",
       "cuda",
       "mps"
+    ],
+    "input_types": [
+      "numeric",
+      "categorical",
+      "missing"
+    ],
+    "target_types": [
+      "binary_classification"
     ]
   },
   "dependencies": [
@@ -45,12 +55,15 @@
     "torch"
   ],
   "known_pitfalls": [
-    "CUDA/MPS use requires a matching accelerator-enabled PyTorch build; unavailable backends fall back to CPU."
+    "CUDA/MPS use requires a matching accelerator-enabled PyTorch build; unavailable backends fall back to CPU.",
+    "Domain adaptation is useful only when auxiliary rows represent a meaningful shifted domain; otherwise a simpler tabular model may be stronger.",
+    "The lexicographically second binary target class is treated as the positive probability.",
+    "Training obeys the harness AIBUILDAI_MAX_EPOCHS and AIBUILDAI_EARLY_STOPPING_PATIENCE ceilings."
   ],
   "verified": true,
-  "verification_log": "Passed subprocess verification at 2026-07-16 12:28:49.\nOutput:\nEpoch 01/30 | \u03bb=0.033 | loss=1.5656\nEpoch 02/30 | \u03bb=0.067 | loss=1.5386\nEpoch 03/30 | \u03bb=0.100 | loss=1.5119\nEpoch 04/30 | \u03bb=0.133 | loss=1.4179\nEpoch 05/30 | \u03bb=0.167 | loss=1.4311\nEpoch 06/30 | \u03bb=0.200 | loss=1.4159\nEpoch 07/30 | \u03bb=0.233 | loss=1.3425\nEpoch 08/30 | \u03bb=0.267 | loss=1.3119\nEpoch 09/30 | \u03bb=0.300 | loss=1.3331\nEpoch 10/30 | \u03bb=0.333 | loss=1.3177\nEpoch 11/30 | \u03bb=0.367 | loss=1.2811\nEpoch 12/30 | \u03bb=0.400 | loss=1.2973\nEpoch 13/30 | \u03bb=0.433 | loss=1.2686\nEpoch 14/30 | \u03bb=0.467 | loss=1.2322\nEpoch 15/30 | \u03bb=0.500 | loss=1.2494\nEpoch 16/30 | \u03bb=0.533 | loss=1.2287\nEpoch 17/30 | \u03bb=0.567 | loss=1.2206\nEpoch 18/30 | \u03bb=0.600 | loss=1.2163\nEpoch 19/30 | \u03bb=0.633 | loss=1.1972\nEpoch 20/30 | \u03bb=0.667 | loss=1.2154\nEpoch 21/30 | \u03bb=0.700 | loss=1.1974\nEpoch 22/30 | \u03bb=0.733 | loss=1.1683\nEpoch 23/30 | \u03bb=0.767 | loss=1.2014\nEpoch 24/30 | \u03bb=0.800 | loss=1.1550\nEpoch 25/30 | \u03bb=0.833 | loss=1.2129\nEpoch 26/30 | \u03bb=0.867 | loss=1.1628\nEpoch 27/30 | \u03bb=0.900 | loss=1.1836\nEpoch 28/30 | \u03bb=0.933 | loss=1.2253\nEpoch 29/30 | \u03bb=0.967 | loss=1.1764\nEpoch 30/30 | \u03bb=1.000 | loss=1.1795\nFunction returned type: ndarray\nReturned tabular lengths: [30]\nSUCCESS",
+  "verification_log": "Passed subprocess verification at 2026-07-16 20:27:40.\nOutput:\nFunction returned type: ndarray\nReturned tabular lengths: [30]\nSUCCESS",
   "code_path": "gradient_reversal_domain_adaptation.py",
-  "verification_level": "contract-mock-data",
+  "verification_level": "mixed-missing-contract-mock-data",
   "task_validations": [
     {
       "task_name": "playground-series-s6e2",
@@ -71,5 +84,6 @@
       "elapsed_seconds": 235.69499150000047,
       "improved_over_baseline": null
     }
-  ]
+  ],
+  "verification_isolation": "resource-limited-subprocess"
 }

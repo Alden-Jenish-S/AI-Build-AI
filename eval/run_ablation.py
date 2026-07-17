@@ -23,7 +23,7 @@ from agents.llm_utils import get_token_usage, reset_token_usage
 from agents.initial_agent import InitialAgent
 from agents.manager_agent import ManagerAgent
 from eval.metrics import calculate_ablation_metrics
-from runtime_utils import accelerator_subprocess_env
+from runtime_utils import accelerator_subprocess_env, expose_task_data
 from evaluation_contract import validate_evaluation_outputs
 
 
@@ -82,31 +82,7 @@ def _write_token_usage_report(
 
 def _prepare_run_input(task_dir: Path, run_dir: Path) -> None:
     """Expose task data below a run directory without copying large datasets."""
-    destination = run_dir / "input"
-    source = task_dir / "input"
-    if source.is_dir():
-        if not destination.exists() and not destination.is_symlink():
-            try:
-                os.symlink(source, destination)
-            except OSError:
-                shutil.copytree(source, destination)
-        return
-
-    destination.mkdir(parents=True, exist_ok=True)
-    for source_file in task_dir.iterdir():
-        if (
-            not source_file.is_file()
-            or source_file.suffix not in {".csv", ".tsv", ".txt", ".json"}
-            or source_file.name in {"task_config.json", "submission.csv"}
-        ):
-            continue
-        target = destination / source_file.name
-        if target.exists() or target.is_symlink():
-            continue
-        try:
-            os.symlink(source_file, target)
-        except OSError:
-            shutil.copy(source_file, target)
+    expose_task_data(task_dir, run_dir)
 
 
 def _run_baseline(

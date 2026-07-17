@@ -30,6 +30,23 @@ _SENSITIVE_ENV_EXACT = {
     "NETRC",
 }
 _ACCELERATORS = {"cpu", "cuda", "mps"}
+_TASK_DATA_SUFFIXES = {
+    ".csv",
+    ".feather",
+    ".json",
+    ".jsonl",
+    ".npy",
+    ".npz",
+    ".parquet",
+    ".pickle",
+    ".pkl",
+    ".tsv",
+    ".txt",
+}
+_TASK_DATA_EXCLUSIONS = {
+    "submission.csv",
+    "task_config.json",
+}
 
 
 def validate_storage_identifier(value: object, field_name: str) -> str:
@@ -59,6 +76,71 @@ def resolve_within(base_dir: Path, *parts: str) -> Path:
     if candidate != base and base not in candidate.parents:
         raise ValueError(f"Path escapes allowed directory {base}: {candidate}")
     return candidate
+
+
+def expose_task_data(task_dir: Path, run_dir: Path) -> list[Path]:
+    """Expose task-owned input data in a run directory without copying it.
+
+    Dataloaders execute from the run directory and expect ``./input``. For tasks
+    with an ``input`` directory, that directory is linked as a whole. For the
+    legacy flat-file task layout, a small ``input`` directory containing links
+    to the task-owned data files is created. A failed link is an error: silently
+    copying a dataset per implementation node would make run storage grow with
+    the search budget.
+    """
+    task_dir = Path(task_dir).resolve()
+    run_dir = Path(run_dir)
+    destination = run_dir / "input"
+    source_directory = task_dir / "input"
+
+    def link(source: Path, target: Path, *, is_directory: bool = False) -> None:
+        try:
+            os.symlink(
+                str(source.resolve()),
+                str(target),
+                target_is_directory=is_directory,
+            )
+        except OSError as exc:
+            raise RuntimeError(
+                f"Could not link task data {source} into {target}; refusing to "
+                "copy the dataset into the run directory."
+            ) from exc
+
+    if source_directory.is_dir():
+        if destination.exists() or destination.is_symlink():
+            if (
+                destination.is_symlink()
+                and destination.resolve() == source_directory.resolve()
+            ):
+                return [destination]
+            raise FileExistsError(
+                f"Run input path already exists and is not the task-data link: "
+                f"{destination}"
+            )
+        run_dir.mkdir(parents=True, exist_ok=True)
+        link(source_directory, destination, is_directory=True)
+        return [destination]
+
+    destination.mkdir(parents=True, exist_ok=True)
+    linked_files = []
+    for source_file in sorted(task_dir.iterdir()):
+        if (
+            not source_file.is_file()
+            or source_file.suffix.lower() not in _TASK_DATA_SUFFIXES
+            or source_file.name in _TASK_DATA_EXCLUSIONS
+        ):
+            continue
+        target = destination / source_file.name
+        if target.exists() or target.is_symlink():
+            if target.is_symlink() and target.resolve() == source_file.resolve():
+                linked_files.append(target)
+                continue
+            raise FileExistsError(
+                f"Run input path already exists and is not a task-data link: {target}"
+            )
+        link(source_file, target)
+        linked_files.append(target)
+    return linked_files
 
 
 def sanitized_subprocess_env(

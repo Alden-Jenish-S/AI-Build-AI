@@ -22,9 +22,30 @@ from sklearn.model_selection import KFold, StratifiedKFold, StratifiedShuffleSpl
 
 
 FIDELITY_PROFILES = {
-    "screen": {"data_fraction": 0.25, "cv_folds": 2, "max_tuning_trials": 8},
-    "medium": {"data_fraction": 0.60, "cv_folds": 3, "max_tuning_trials": 20},
-    "full": {"data_fraction": 1.0, "cv_folds": 5, "max_tuning_trials": 40},
+    "screen": {
+        "data_fraction": 0.25,
+        "cv_folds": 2,
+        "max_tuning_trials": 8,
+        "max_epochs": 8,
+        "early_stopping_patience": 2,
+        "max_estimator_iterations": 500,
+    },
+    "medium": {
+        "data_fraction": 0.60,
+        "cv_folds": 3,
+        "max_tuning_trials": 20,
+        "max_epochs": 20,
+        "early_stopping_patience": 4,
+        "max_estimator_iterations": 1500,
+    },
+    "full": {
+        "data_fraction": 1.0,
+        "cv_folds": 5,
+        "max_tuning_trials": 40,
+        "max_epochs": 50,
+        "early_stopping_patience": 7,
+        "max_estimator_iterations": 4000,
+    },
 }
 
 

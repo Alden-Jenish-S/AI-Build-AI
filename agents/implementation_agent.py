@@ -1,3 +1,5 @@
+import ast
+import hashlib
 import re
 import os
 import sys
@@ -14,6 +16,7 @@ from .validation_guard import inspect_generated_code
 from evaluation_contract import FIDELITY_PROFILES, validate_evaluation_outputs
 from runtime_utils import (
     accelerator_subprocess_env,
+    expose_task_data,
     resolve_within,
     validate_storage_identifier,
 )
@@ -41,6 +44,669 @@ class ImplementationAgent:
         self.model_name = model_name
         self.project_root = Path(__file__).resolve().parent.parent
 
+    @staticmethod
+    def _looks_like_deep_learning(code: str) -> bool:
+        lowered = str(code).lower()
+        return any(
+            marker in lowered
+            for marker in (
+                "import torch",
+                "tensorflow",
+                "keras",
+                "pytorch_tabnet",
+                "dataloader(",
+                "nn.module",
+                "epochs",
+            )
+        )
+
+    @classmethod
+    def _debug_repair_guidance(
+        cls,
+        code: str,
+        stderr: str,
+        stdout: str,
+        timeout_kill: bool,
+        accelerator: str,
+        fidelity_profile: dict,
+    ) -> str:
+        """Return deterministic, failure-specific constraints for the LLM debugger."""
+        combined = (str(stderr) + "\n" + str(stdout)).lower()
+        guidance = []
+        if timeout_kill or "timeout" in combined or "deadline" in combined:
+            guidance.append(
+                "Runtime repair: keep the required rows/folds, but reduce work inside each fold; "
+                "cap epochs/iterations, add early stopping, avoid repeated final refits, and emit "
+                "progress at least once per epoch or trial. Do not increase training duration while debugging."
+            )
+        if any(
+            marker in combined
+            for marker in ("out of memory", "cuda error", "cublas", "cudnn", "mps backend")
+        ):
+            guidance.append(
+                "Accelerator repair: use mini-batches, clear references between folds, call "
+                "torch.cuda.empty_cache() only when CUDA exists, retry once with a smaller batch, "
+                "and fall back to CPU only if the selected backend is unusable."
+            )
+        if any(marker in combined for marker in ("dtype", "expected scalar type", "object", "can't convert")):
+            guidance.append(
+                "Dtype repair: encode categorical/object columns using training-fold state; use float32 "
+                "features, float labels for BCE losses, and long labels for cross-entropy/embedding indices."
+            )
+        if any(marker in combined for marker in ("shape", "size mismatch", "mat1 and mat2", "dimension")):
+            guidance.append(
+                "Shape repair: derive the network input width after fold-local transformation, keep "
+                "binary logits one-dimensional, and assert prediction length before writing outputs."
+            )
+        if any(marker in combined for marker in ("no module named", "modulenotfounderror", "importerror")):
+            guidance.append(
+                "Dependency repair: use only installed/project-allowlisted packages and the copied local "
+                "artifact module; do not invent package paths."
+            )
+        if any(
+            marker in combined
+            for marker in ("result contract", "oof", "fold_id", "evaluation_manifest", "submission")
+        ):
+            guidance.append(
+                "Evaluation repair: preserve evaluation_contract rows and fold_ids exactly, write one "
+                "OOF prediction per scheduled row, and regenerate result.json and submission.csv."
+            )
+        if cls._looks_like_deep_learning(code):
+            guidance.append(
+                "Deep-learning invariant: never move the complete dataset to GPU; use DataLoader "
+                "mini-batches, place model and each batch on the same device, detach predictions to CPU, "
+                f"use at most {fidelity_profile['max_epochs']} epochs with patience "
+                f"{fidelity_profile['early_stopping_patience']}, and release the model between folds."
+            )
+        if not guidance:
+            guidance.append(
+                "Trace the first concrete exception to its source, make the smallest causal repair, "
+                "and preserve the measured parent method and evaluation contract."
+            )
+        return "\n".join(f"- {item}" for item in guidance)
+
+    @staticmethod
+    def _fine_tuning_instruction(
+        operator: Optional[str], tuning_context: Optional[dict], fidelity_profile: dict
+    ) -> str:
+        if operator != "tune" or not tuning_context:
+            return ""
+        return (
+            "This is a baseline-triggered fine-tuning run, not an architecture rewrite. Preserve the "
+            "parent preprocessing, feature set, model family, folds, and output schema. Search only "
+            "meaningful existing hyperparameters, reuse the parent settings as a control trial, and use "
+            f"at most {fidelity_profile['max_tuning_trials']} deterministic/pruned trials. For neural "
+            f"models, tune learning rate, batch size, weight decay, dropout/width, and epochs up to "
+            f"{fidelity_profile['max_epochs']} with early-stopping patience "
+            f"{fidelity_profile['early_stopping_patience']}; increasing epochs is allowed only within "
+            "that cap. For boosted trees, tune depth/leaves, learning rate, regularization, sampling, "
+            f"and iterations up to {fidelity_profile['max_estimator_iterations']}. Optimize only the "
+            "harness-provided validation folds—never the test set. result.json must include a non-empty "
+            "`hyperparameters` object and integer `tuning_trials`.\n"
+            f"Fine-tuning trigger context: {json.dumps(tuning_context, default=str)}\n"
+        )
+
+    @staticmethod
+    def _validate_tuning_metadata(
+        result_data: Dict[str, Any],
+        fidelity_profile: dict,
+        allowed_parameters: Optional[list[str]] = None,
+    ) -> tuple[dict, int]:
+        """Validate that a tuning run stayed inside harness-owned search limits."""
+        hyperparameters = result_data.get("hyperparameters")
+        if not isinstance(hyperparameters, dict) or not hyperparameters:
+            raise ValueError(
+                "fine-tuning result must include non-empty hyperparameters"
+            )
+        raw_tuning_trials = result_data.get("tuning_trials", 0)
+        if (
+            isinstance(raw_tuning_trials, bool)
+            or not isinstance(raw_tuning_trials, (int, float))
+            or not math.isfinite(float(raw_tuning_trials))
+            or not float(raw_tuning_trials).is_integer()
+        ):
+            raise ValueError("fine-tuning tuning_trials must be an integer")
+        tuning_trials = int(raw_tuning_trials)
+        if tuning_trials < 1:
+            raise ValueError("fine-tuning result must complete at least one trial")
+        if tuning_trials > int(fidelity_profile["max_tuning_trials"]):
+            raise ValueError("fine-tuning result exceeds the fidelity trial cap")
+
+        epoch_names = {"epochs", "n_epochs", "num_epochs", "max_epochs"}
+        patience_names = {"patience", "early_stopping_patience"}
+        iteration_names = {
+            "iterations",
+            "n_estimators",
+            "num_iterations",
+            "num_boost_round",
+            "max_iter",
+        }
+        caps = (
+            (epoch_names, int(fidelity_profile["max_epochs"]), "epoch"),
+            (
+                patience_names,
+                int(fidelity_profile["early_stopping_patience"]),
+                "early-stopping patience",
+            ),
+            (
+                iteration_names,
+                int(fidelity_profile["max_estimator_iterations"]),
+                "estimator iteration",
+            ),
+        )
+        def iter_parameters(mapping):
+            for raw_name, raw_value in mapping.items():
+                if isinstance(raw_value, dict):
+                    yield from iter_parameters(raw_value)
+                else:
+                    yield raw_name, raw_value
+
+        allowed = (
+            None
+            if allowed_parameters is None
+            else {
+                str(name).strip().lower() for name in allowed_parameters
+            }
+        )
+        for raw_name, raw_value in iter_parameters(hyperparameters):
+            name = str(raw_name).strip().lower()
+            if allowed is not None and name not in allowed:
+                raise ValueError(
+                    f"fine-tuning parameter {raw_name!r} is not declared tunable"
+                )
+            for aliases, cap, label in caps:
+                if name not in aliases:
+                    continue
+                if (
+                    isinstance(raw_value, bool)
+                    or not isinstance(raw_value, (int, float))
+                    or not math.isfinite(float(raw_value))
+                    or not float(raw_value).is_integer()
+                ):
+                    raise ValueError(
+                        f"fine-tuning {raw_name!r} must be an integer"
+                    )
+                value = int(raw_value)
+                if value < 1 or value > cap:
+                    raise ValueError(
+                        f"fine-tuning {label} {raw_name!r}={value} exceeds "
+                        f"the allowed range 1..{cap}"
+                    )
+        return hyperparameters, tuning_trials
+
+    @staticmethod
+    def _uses_locked_artifact(code: str, model_card: dict) -> bool:
+        """Require a fine-tuning script to consume the selected artifact output."""
+        if not model_card:
+            return True
+        module_name = Path(str(model_card.get("code_path", ""))).stem
+        entrypoint = str(
+            (model_card.get("interface") or {}).get("entrypoint", "")
+        ).split("(", 1)[0].strip()
+        if not module_name or not entrypoint:
+            return False
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            return False
+        direct_names = set()
+        module_aliases = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module == module_name:
+                for imported in node.names:
+                    if imported.name == entrypoint:
+                        direct_names.add(imported.asname or imported.name)
+            elif isinstance(node, ast.Import):
+                for imported in node.names:
+                    if imported.name == module_name:
+                        module_aliases.add(imported.asname or imported.name)
+        parents = {
+            id(child): parent
+            for parent in ast.walk(tree)
+            for child in ast.iter_child_nodes(parent)
+        }
+
+        def artifact_call(node):
+            return (
+                isinstance(node.func, ast.Name)
+                and node.func.id in direct_names
+            ) or (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == entrypoint
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in module_aliases
+            )
+
+        def assigned_names(target):
+            return {
+                child.id
+                for child in ast.walk(target)
+                if isinstance(child, ast.Name)
+            }
+
+        def enclosing_function(node):
+            current = parents.get(id(node))
+            while current is not None:
+                if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    return current.name
+                current = parents.get(id(current))
+            return None
+
+        def in_constant_dead_branch(node):
+            current = parents.get(id(node))
+            while current is not None:
+                if (
+                    isinstance(current, ast.If)
+                    and isinstance(current.test, ast.Constant)
+                    and not bool(current.test.value)
+                ):
+                    return True
+                current = parents.get(id(current))
+            return False
+
+        # Mark functions reachable from module-level calls. A mere name reference
+        # (or a recursive self-reference) is not enough to make dead code valid.
+        reachable_functions = set()
+        changed = True
+        while changed:
+            changed = False
+            for candidate in ast.walk(tree):
+                if (
+                    not isinstance(candidate, ast.Call)
+                    or not isinstance(candidate.func, ast.Name)
+                    or in_constant_dead_branch(candidate)
+                ):
+                    continue
+                scope = enclosing_function(candidate)
+                if scope is None or scope in reachable_functions:
+                    if candidate.func.id not in reachable_functions:
+                        reachable_functions.add(candidate.func.id)
+                        changed = True
+
+        def is_live(node):
+            return (
+                not in_constant_dead_branch(node)
+                and (
+                    enclosing_function(node) is None
+                    or enclosing_function(node) in reachable_functions
+                )
+            )
+
+        artifact_call_ids = {
+            id(node)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and artifact_call(node) and is_live(node)
+        }
+        if not artifact_call_ids:
+            return False
+
+        def contains_taint(node, names):
+            return any(
+                id(child) in artifact_call_ids
+                or (
+                    isinstance(child, ast.Name)
+                    and isinstance(child.ctx, ast.Load)
+                    and child.id in names
+                )
+                for child in ast.walk(node)
+            )
+
+        tainted_names = set()
+        changed = True
+        while changed:
+            changed = False
+            for node in ast.walk(tree):
+                if not is_live(node):
+                    continue
+                targets = []
+                value = None
+                if isinstance(node, ast.Assign):
+                    targets, value = node.targets, node.value
+                elif isinstance(node, ast.AnnAssign):
+                    targets, value = [node.target], node.value
+                elif isinstance(node, ast.AugAssign):
+                    targets, value = [node.target], node.value
+                if targets and value is not None and (
+                    contains_taint(value, tainted_names)
+                    or any(
+                        isinstance(target, ast.Name)
+                        and target.id in tainted_names
+                        for target in targets
+                    )
+                ):
+                    discovered = set().union(
+                        *(assigned_names(target) for target in targets)
+                    )
+                    if not discovered.issubset(tainted_names):
+                        tainted_names.update(discovered)
+                        changed = True
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr
+                    in {"append", "extend", "update", "fit", "partial_fit"}
+                    and contains_taint(node, tainted_names)
+                ):
+                    receiver_names = assigned_names(node.func.value)
+                    if not receiver_names.issubset(tainted_names):
+                        tainted_names.update(receiver_names)
+                        changed = True
+
+        output_methods = {"to_csv", "savetxt", "save", "write_text"}
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not is_live(node):
+                continue
+            if isinstance(node.func, ast.Attribute) and node.func.attr in output_methods:
+                output_expression = ast.Tuple(
+                    elts=[
+                        node.func.value,
+                        *node.args,
+                        *(keyword.value for keyword in node.keywords),
+                    ],
+                    ctx=ast.Load(),
+                )
+                if contains_taint(output_expression, tainted_names):
+                    return True
+        return False
+
+    @staticmethod
+    def _model_family_imports(code: str) -> set[str]:
+        """Extract model-library imports while ignoring preprocessing utilities."""
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            return set()
+        model_roots = {
+            "catboost",
+            "lightgbm",
+            "xgboost",
+            "torch",
+            "tensorflow",
+            "keras",
+            "pytorch_tabnet",
+        }
+        sklearn_model_modules = {
+            "ensemble",
+            "linear_model",
+            "naive_bayes",
+            "neighbors",
+            "neural_network",
+            "svm",
+            "tree",
+            "discriminant_analysis",
+            "gaussian_process",
+        }
+        families = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for imported in node.names:
+                    parts = imported.name.split(".")
+                    if parts[0] in model_roots:
+                        families.add(parts[0])
+                    elif (
+                        len(parts) > 1
+                        and parts[0] == "sklearn"
+                        and parts[1] in sklearn_model_modules
+                    ):
+                        families.add(".".join(parts[:2]))
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                parts = node.module.split(".")
+                if parts[0] in model_roots:
+                    families.add(parts[0])
+                elif (
+                    len(parts) > 1
+                    and parts[0] == "sklearn"
+                    and parts[1] in sklearn_model_modules
+                ):
+                    families.add(".".join(parts[:2]))
+        return families
+
+    @classmethod
+    def _tuning_lock_issues(
+        cls, code: str, parent_code: str, model_card: dict
+    ) -> list[str]:
+        issues = []
+        if model_card and not cls._uses_locked_artifact(code, model_card):
+            issues.append(
+                "fine-tuning code must consume the locked artifact entrypoint output"
+            )
+        parent_families = cls._model_family_imports(parent_code)
+        candidate_families = cls._model_family_imports(code)
+        introduced = candidate_families - parent_families
+        if introduced:
+            issues.append(
+                "fine-tuning code introduces a different model family: "
+                + ", ".join(sorted(introduced))
+            )
+        if not model_card and parent_families - candidate_families:
+            issues.append(
+                "fine-tuning code removes the measured parent's model family: "
+                + ", ".join(sorted(parent_families - candidate_families))
+            )
+        return issues
+
+    @staticmethod
+    def _resource_limit_issues(code: str, fidelity_profile: dict) -> list[str]:
+        """Reject common literal hyperparameters above harness-owned caps."""
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            return []
+        caps = {
+            "epochs": (int(fidelity_profile["max_epochs"]), "epochs"),
+            "n_epochs": (int(fidelity_profile["max_epochs"]), "epochs"),
+            "num_epochs": (int(fidelity_profile["max_epochs"]), "epochs"),
+            "max_epochs": (int(fidelity_profile["max_epochs"]), "epochs"),
+            "patience": (
+                int(fidelity_profile["early_stopping_patience"]),
+                "early-stopping patience",
+            ),
+            "early_stopping_patience": (
+                int(fidelity_profile["early_stopping_patience"]),
+                "early-stopping patience",
+            ),
+            "iterations": (
+                int(fidelity_profile["max_estimator_iterations"]),
+                "estimator iterations",
+            ),
+            "n_estimators": (
+                int(fidelity_profile["max_estimator_iterations"]),
+                "estimator iterations",
+            ),
+            "num_iterations": (
+                int(fidelity_profile["max_estimator_iterations"]),
+                "estimator iterations",
+            ),
+            "num_boost_round": (
+                int(fidelity_profile["max_estimator_iterations"]),
+                "estimator iterations",
+            ),
+            "max_iter": (
+                int(fidelity_profile["max_estimator_iterations"]),
+                "estimator iterations",
+            ),
+            "n_trials": (
+                int(fidelity_profile["max_tuning_trials"]),
+                "tuning trials",
+            ),
+            "max_trials": (
+                int(fidelity_profile["max_tuning_trials"]),
+                "tuning trials",
+            ),
+        }
+
+        def literal_values(value):
+            if isinstance(value, ast.Constant) and isinstance(value.value, (int, float)):
+                return [float(value.value)]
+            if isinstance(value, (ast.List, ast.Tuple, ast.Set)):
+                values = []
+                for item in value.elts:
+                    values.extend(literal_values(item))
+                return values
+            return []
+
+        candidates = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.keyword) and node.arg in caps:
+                candidates.append((node.arg, node.value, getattr(node, "lineno", 0)))
+            elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                for target in targets:
+                    if isinstance(target, ast.Name) and target.id in caps:
+                        candidates.append((target.id, node.value, getattr(node, "lineno", 0)))
+            elif isinstance(node, ast.Dict):
+                for key, value in zip(node.keys, node.values):
+                    if isinstance(key, ast.Constant) and key.value in caps:
+                        candidates.append((key.value, value, getattr(node, "lineno", 0)))
+        issues = []
+        for name, value_node, line in candidates:
+            cap, label = caps[name]
+            over = [value for value in literal_values(value_node) if value > cap]
+            if over:
+                issues.append(
+                    f"line {line}: {label} literal {max(over):g} exceeds fidelity cap {cap}"
+                )
+        return list(dict.fromkeys(issues))
+
+    def _repair_node_local_artifact(
+        self,
+        node_dir: Path,
+        model_card: dict,
+        technique_code: str,
+        failure_output: str,
+        fidelity_profile: dict,
+    ) -> tuple[str, bool, str]:
+        """Repair a copied artifact once, then re-verify it without mutating L2."""
+        if not model_card or not technique_code:
+            return technique_code, False, "no copied artifact is available"
+        try:
+            artifact_id = validate_storage_identifier(
+                model_card.get("artifact_id"), "artifact_id"
+            )
+            code_name = str(model_card.get("code_path", ""))
+            if code_name != f"{artifact_id}.py":
+                raise ValueError("code_path must match '<artifact_id>.py'")
+            artifact_path = resolve_within(node_dir, code_name)
+        except ValueError as exc:
+            return technique_code, False, f"invalid local artifact metadata: {exc}"
+        if not artifact_path.is_file():
+            return technique_code, False, f"copied artifact is missing: {code_name}"
+
+        try:
+            response = call_llm(
+                "You repair a node-local tabular-ML artifact after a concrete runtime failure. "
+                "Return the complete corrected artifact in one ```python block. Preserve its public "
+                "entrypoint and model family, add no dependencies, and make only causal reliability "
+                "changes. For neural code, handle mixed/missing inputs with training-fit preprocessing, "
+                "use float32 mini-batches on one device, restore the best early-stopped state, predict "
+                "in batches on CPU output, and retain accelerator-to-CPU fallback. Never fit on test data.",
+                f"""
+Artifact model card:
+{json.dumps({key: value for key, value in model_card.items() if key != 'verification_log'}, indent=2, default=str)}
+
+Fidelity resource limits:
+{json.dumps(fidelity_profile)}
+
+Runtime failure:
+```
+{str(failure_output)[-8000:]}
+```
+
+Current copied artifact:
+```python
+{technique_code[-20000:]}
+```
+""",
+                model=self.model_name,
+                temperature=0.0,
+            )
+        except Exception as exc:
+            return technique_code, False, f"artifact repair LLM call failed: {exc}"
+        repaired_code = response
+        if "```python" in response:
+            repaired_code = response.split("```python", 1)[1].split("```", 1)[0]
+        elif "```" in response:
+            repaired_code = response.split("```", 1)[1].split("```", 1)[0]
+        repaired_code = repaired_code.strip()
+        try:
+            ast.parse(repaired_code)
+        except SyntaxError as exc:
+            return technique_code, False, f"artifact repair produced invalid Python: {exc}"
+        repair_issues = inspect_generated_code(repaired_code)
+        repair_issues.extend(
+            self._resource_limit_issues(repaired_code, fidelity_profile)
+        )
+        original_families = self._model_family_imports(technique_code)
+        repaired_families = self._model_family_imports(repaired_code)
+        if original_families and repaired_families != original_families:
+            repair_issues.append(
+                "artifact repair must preserve model-library families exactly; "
+                f"expected={sorted(original_families)}, got={sorted(repaired_families)}"
+            )
+        if repair_issues:
+            return (
+                technique_code,
+                False,
+                "artifact repair failed static validation: " + "; ".join(repair_issues),
+            )
+
+        original_code = artifact_path.read_text(encoding="utf-8")
+        local_card_path = resolve_within(node_dir, f"{artifact_id}.json")
+        local_card = {
+            key: value
+            for key, value in model_card.items()
+            if key not in {"verification_log", "task_validations"}
+        }
+        local_card["verified"] = False
+        local_card["verification_log"] = "Pending node-local repair verification."
+        artifact_path.write_text(repaired_code + "\n", encoding="utf-8")
+        local_card_path.write_text(
+            json.dumps(local_card, indent=2, default=str) + "\n", encoding="utf-8"
+        )
+
+        verifier = self.project_root / "memory_pool" / "builder" / "sandbox_verifier.py"
+        verify_env = accelerator_subprocess_env("cpu")
+        verify_env.update(
+            {
+                "AIBUILDAI_MAX_EPOCHS": "2",
+                "AIBUILDAI_EARLY_STOPPING_PATIENCE": "1",
+            }
+        )
+        try:
+            verification = subprocess.run(
+                [self.venv_python, str(verifier), str(local_card_path)],
+                cwd=node_dir,
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env=verify_env,
+            )
+            verification_output = (
+                verification.stdout + "\n" + verification.stderr
+            ).strip()
+            verified = verification.returncode == 0
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            verification_output = f"node-local verification failed to run: {exc}"
+            verified = False
+
+        audit = {
+            "artifact_id": artifact_id,
+            "verified": verified,
+            "code_sha256": hashlib.sha256(
+                repaired_code.encode("utf-8")
+            ).hexdigest(),
+            "fidelity_limits": fidelity_profile,
+            "verification_output_tail": verification_output[-4000:],
+        }
+        (node_dir / "artifact_repair.json").write_text(
+            json.dumps(audit, indent=2, default=str) + "\n", encoding="utf-8"
+        )
+        if not verified:
+            artifact_path.write_text(original_code, encoding="utf-8")
+            local_card_path.unlink(missing_ok=True)
+            return technique_code, False, verification_output[-4000:]
+        return repaired_code, True, verification_output[-4000:]
+
     def _inherit_parent_workspace(self, parent_node_dir: Path, node_dir: Path) -> list[str]:
         """Seed a child with reusable parent artifacts without copying stale outputs/data."""
         inherited = []
@@ -55,10 +721,12 @@ class ImplementationAgent:
             "oof_predictions.csv",
             "evaluation_manifest.json",
             "fold_assignments.csv",
+            "execution_resource.json",
+            "fine_tuning.json",
+            "artifact_repair.json",
         }
         allowed_suffixes = {
-            ".py", ".json", ".yaml", ".yml", ".txt", ".pkl", ".joblib",
-            ".cbm", ".bin", ".pt", ".pth",
+            ".py", ".json", ".yaml", ".yml", ".txt",
         }
         for source in parent_node_dir.iterdir():
             if (
@@ -80,7 +748,7 @@ class ImplementationAgent:
         node_dir: Path,
         technique_record: dict,
         task_dir: Path,
-        timeout: int = 300,
+        timeout: Optional[float] = None,
         metric_direction: str = "maximize",
         base_algorithm_path: Optional[Path] = None,
         parent_node_dir: Optional[Path] = None,
@@ -89,6 +757,8 @@ class ImplementationAgent:
         enforce_evaluation_contract: bool = False,
         accelerator: str = "cpu",
         available_accelerators: Optional[set[str]] = None,
+        tuning_context: Optional[dict] = None,
+        max_debug_attempts: int = 2,
     ) -> Dict[str, Any]:
         """
         1. Reads task skeletons from task_dir.
@@ -100,15 +770,27 @@ class ImplementationAgent:
             node_dir: Directory for this node's run outputs
             technique_record: Dict from TechniqueAgent with plan/model_card
             task_dir: Task directory with initial code and data
-            timeout: Subprocess timeout in seconds (default 300)
+            timeout: Optional subprocess timeout in seconds. Normal search nodes
+                pass ``None`` and have no inactivity or wall-clock execution limit.
             metric_direction: "maximize" or "minimize" — used in the prompt
         """
-        if not isinstance(timeout, (int, float)) or timeout <= 0:
-            raise ValueError(f"timeout must be a positive number, got {timeout!r}")
+        if timeout is not None and (
+            not isinstance(timeout, (int, float))
+            or isinstance(timeout, bool)
+            or not math.isfinite(float(timeout))
+            or timeout <= 0
+        ):
+            raise ValueError(
+                f"timeout must be None or a positive finite number, got {timeout!r}"
+            )
         if metric_direction not in {"maximize", "minimize"}:
             raise ValueError(
                 f"metric_direction must be 'maximize' or 'minimize', got {metric_direction!r}"
             )
+        if not isinstance(max_debug_attempts, int) or max_debug_attempts < 0:
+            raise ValueError("max_debug_attempts must be a non-negative integer")
+        if tuning_context is not None and not isinstance(tuning_context, dict):
+            raise ValueError("tuning_context must be a dictionary when provided")
         accelerator = str(accelerator).lower()
         if accelerator not in {"cpu", "cuda", "mps"}:
             raise ValueError(f"Unsupported accelerator: {accelerator!r}")
@@ -127,6 +809,7 @@ class ImplementationAgent:
             "available_accelerators": sorted(exposed_accelerators),
             "environment_variable": "AIBUILDAI_ACCELERATOR",
             "fallback": "cpu",
+            "subprocess_timeout_seconds": timeout,
         }
         with open(node_dir / "execution_resource.json", "w", encoding="utf-8") as f:
             json.dump(execution_resource, f, indent=2)
@@ -158,39 +841,25 @@ class ImplementationAgent:
                 store = self.project_root / "memory_pool" / "l2_store"
                 src_tech = resolve_within(store, category, code_name)
                 dest_tech = resolve_within(node_dir, code_name)
-                if src_tech.is_file():
+                if dest_tech.is_file():
+                    print(
+                        "ImplementationAgent: Reusing inherited node-local "
+                        f"artifact {dest_tech}"
+                    )
+                elif src_tech.is_file():
                     shutil.copy(src_tech, dest_tech)
                     print(f"ImplementationAgent: Copied technique from {src_tech} to {dest_tech}")
-                elif not dest_tech.is_file():
+                else:
                     print(f"ImplementationAgent WARNING: Technique code file not found at {src_tech}")
             except ValueError as exc:
                 raise ValueError(f"Unsafe or invalid model card: {exc}") from exc
 
-        # Symlink input directory so dataloader can find datasets (Fixes FileNotFoundError)
-        src_input = task_dir / "input"
-        dest_input = node_dir / "input"
-        if src_input.exists():
-            if not dest_input.exists():
-                try:
-                    os.symlink(src_input, dest_input)
-                except Exception:
-                    if src_input.is_dir():
-                        shutil.copytree(src_input, dest_input)
-        else:
-            # Fallback: if data files are directly in task_dir, copy/symlink them under 'input'
-            if not dest_input.exists():
-                dest_input.mkdir(parents=True, exist_ok=True)
-                for f in task_dir.glob("*"):
-                    if (
-                        f.is_file()
-                        and f.suffix in [".csv", ".tsv", ".txt", ".json"]
-                        and f.name not in {"task_config.json", "submission.csv"}
-                    ):
-                        try:
-                            os.symlink(f, dest_input / f.name)
-                        except Exception:
-                            shutil.copy(f, dest_input / f.name)
-                print(f"ImplementationAgent: Prepared 'input' folder fallback at {dest_input}")
+        # Dataloaders use ./input while the dataset remains owned by tasks/<task>.
+        linked_inputs = expose_task_data(task_dir, node_dir)
+        print(
+            "ImplementationAgent: Linked task-owned input data into "
+            f"{node_dir / 'input'} ({len(linked_inputs)} link(s); no dataset copy)."
+        )
 
         # Descendants evolve the measured parent implementation. Only root-level
         # candidates start from the generated baseline.
@@ -284,16 +953,37 @@ class ImplementationAgent:
         fidelity_profile = FIDELITY_PROFILES[fidelity]
         operator_instruction = {
             "refine": "Modify only the highest-impact relevant component; preserve working parent behavior elsewhere.",
-            "tune": "Preserve the model family and run a compact Optuna search with pruning and a fixed seed.",
+            "tune": "Act as a fine-tuner: preserve the measured architecture and run a compact pruned hyperparameter search with a fixed seed.",
             "diversify": "Favor a sound model or representation whose errors are likely less correlated with the parent.",
             "promote": "Preserve the parent method and evaluate it more rigorously at the requested fidelity.",
         }.get(operator or "", "Apply the requested technique as a focused change to the parent pipeline.")
+        fine_tuning_instruction = self._fine_tuning_instruction(
+            operator, tuning_context, fidelity_profile
+        )
+        deep_learning_instruction = (
+            "Deep-learning execution contract (when applicable): use fold-local numeric/categorical "
+            "preprocessing; float32 features; the loss-appropriate label dtype; mini-batch DataLoaders; "
+            "model and batches on the same selected device; validation-based early stopping with the "
+            "best state restored; and CPU-detached predictions. Never place the full dataset on GPU or "
+            "retain models/tensors across folds. "
+            f"Use no more than {fidelity_profile['max_epochs']} epochs and patience "
+            f"{fidelity_profile['early_stopping_patience']} at this fidelity. Print concise progress "
+            "at least once per epoch so long-running training remains observable.\n"
+        )
+        tuning_result_fields = (
+            ', "hyperparameters": {"parameter_name": <selected value>}, '
+            '"tuning_trials": <int>'
+            if operator == "tune" and tuning_context
+            else ""
+        )
 
         system_prompt = (
             "You are the Implementation Agent. Produce a complete executable revision of the supplied parent algorithm. "
             f"{integration_instruction} Ensure the output is valid Python code wrapped in a ```python block.\n"
             f"Search operator: {operator or 'initial'}. {operator_instruction}\n"
             f"Evaluation fidelity: {fidelity} ({json.dumps(fidelity_profile)}). These limits are mandatory.\n"
+            f"{fine_tuning_instruction}"
+            f"{deep_learning_instruction}"
             f"Execution accelerator: {accelerator}; available={sorted(exposed_accelerators)}. "
             "The subprocess also exposes this value as AIBUILDAI_ACCELERATOR. When the selected accelerator is "
             "CUDA or MPS, use the framework-native GPU/device option for every compatible training component "
@@ -314,7 +1004,7 @@ class ImplementationAgent:
             f"IMPORTANT: At the END of your script, write a JSON file 'result.json' in the current directory:\n"
             f'  import json; json.dump({{"score": <float>, "metric": "{metric_name}", "direction": "{metric_direction}", '
             f'"cv_mean": <float>, "cv_std": <float>, "folds": <int>, "fidelity": "{fidelity}", '
-            f'"accelerator": <actual "cpu"|"cuda"|"mps">}}, open("result.json", "w"))\n'
+            f'"accelerator": <actual "cpu"|"cuda"|"mps">{tuning_result_fields}}}, open("result.json", "w"))\n'
             "The score must be the cross-validation mean when CV is used, otherwise the held-out validation score."
         )
         
@@ -356,15 +1046,21 @@ class ImplementationAgent:
             clean_code = response.split("```")[1].split("```")[0]
 
         guard_issues = inspect_generated_code(clean_code)
+        guard_issues.extend(self._resource_limit_issues(clean_code, fidelity_profile))
+        if operator == "tune" and tuning_context:
+            guard_issues.extend(
+                self._tuning_lock_issues(clean_code, original_code, model_card)
+            )
         if guard_issues:
             print(
-                "ImplementationAgent: Validation guard found leakage risks; "
+                "ImplementationAgent: Validation guard found contract risks; "
                 "requesting a pre-execution repair."
             )
             repair_response = call_llm(
-                "You are an ML validation-safety reviewer. Repair every listed leakage defect while "
-                "preserving the intended model and focused change. Fit preprocessing only on training "
-                "folds. Return the complete corrected Python file in a ```python block.",
+                "You are an ML execution-contract reviewer. Repair every listed defect while "
+                "preserving the intended and locked model family. Fit preprocessing only on training "
+                "folds, obey fidelity resource caps, and call the selected local artifact entrypoint "
+                "when one is locked. Return the complete corrected Python file in a ```python block.",
                 f"""
 Leakage defects:
 {json.dumps(guard_issues, indent=2)}
@@ -383,9 +1079,18 @@ Code:
             else:
                 clean_code = repair_response
             remaining_issues = inspect_generated_code(clean_code)
+            remaining_issues.extend(
+                self._resource_limit_issues(clean_code, fidelity_profile)
+            )
+            if operator == "tune" and tuning_context:
+                remaining_issues.extend(
+                    self._tuning_lock_issues(
+                        clean_code, original_code, model_card
+                    )
+                )
             if remaining_issues:
                 raise ValueError(
-                    "Generated implementation failed leakage guard after repair: "
+                    "Generated implementation failed execution-contract guard after repair: "
                     + "; ".join(remaining_issues)
                 )
             
@@ -398,7 +1103,7 @@ Code:
         cmd = [self.venv_python, "algorithm.py"]
         
         # Debug/Coder retry loop
-        max_attempts = 3
+        max_attempts = max_debug_attempts + 1
         attempt = 0
         score = None
         score_source = "none"
@@ -409,14 +1114,97 @@ Code:
         timeout_kill = False
         diagnostics = ""
         result_data: Dict[str, Any] = {}
+        artifact_repair_attempted = False
+        artifact_repair_summary = None
         
         while attempt < max_attempts:
             if attempt > 0:
-                print(f"ImplementationAgent: Debug Attempt {attempt}/{max_attempts - 1} — Previous execution failed. Invoking coder debugging agent...")
+                repair_guidance = self._debug_repair_guidance(
+                    clean_code,
+                    stderr,
+                    stdout,
+                    timeout_kill,
+                    accelerator,
+                    fidelity_profile,
+                )
+                artifact_debug_context = ""
+                failure_output = (stderr + "\n" + stdout).strip()
+                should_repair_artifact = (
+                    not artifact_repair_attempted
+                    and bool(model_card)
+                    and bool(technique_code)
+                    and self._looks_like_deep_learning(technique_code)
+                    and (
+                        timeout_kill
+                        or Path(str(model_card.get("code_path", ""))).stem.lower()
+                        in failure_output.lower()
+                        or any(
+                            marker in failure_output.lower()
+                            for marker in (
+                                "dtype",
+                                "expected scalar type",
+                                "out of memory",
+                                "size mismatch",
+                                "mat1 and mat2",
+                                "nan",
+                            )
+                        )
+                    )
+                )
+                if should_repair_artifact:
+                    print(
+                        "ImplementationAgent: Failure points to copied neural "
+                        "artifact; attempting one node-local repair and re-verification..."
+                    )
+                    repaired_artifact, verified, verification_note = (
+                        self._repair_node_local_artifact(
+                            node_dir,
+                            model_card,
+                            technique_code,
+                            failure_output,
+                            fidelity_profile,
+                        )
+                    )
+                    artifact_repair_attempted = True
+                    artifact_repair_summary = {
+                        "attempted": True,
+                        "verified": verified,
+                        "artifact_id": model_card.get("artifact_id"),
+                        "code_sha256": (
+                            hashlib.sha256(
+                                repaired_artifact.encode("utf-8")
+                            ).hexdigest()
+                            if verified
+                            else None
+                        ),
+                        "diagnostics_tail": verification_note[-2000:],
+                    }
+                    if verified:
+                        artifact_repair_summary["variant_id"] = (
+                            f"{model_card.get('artifact_id')}@"
+                            f"{artifact_repair_summary['code_sha256'][:12]}"
+                        )
+                    if verified:
+                        technique_code = repaired_artifact
+                if technique_code and (
+                    self._looks_like_deep_learning(technique_code)
+                    or Path(model_card.get("code_path", "")).stem.lower()
+                    in (stderr or "").lower()
+                ):
+                    artifact_debug_context = (
+                        "Copied artifact source (a node-local version may already have been "
+                        "repaired and re-verified; integrate its public API exactly):\n```python\n"
+                        + technique_code[-12000:]
+                        + "\n```"
+                    )
+                print(
+                    f"ImplementationAgent: Debug Attempt {attempt}/{max_debug_attempts} "
+                    "— invoking failure-focused repair..."
+                )
                 debug_system_prompt = (
-                    "You are a Coder/Debugging Agent. The previous implementation of the machine learning code failed with an error.\n"
-                    "Review the original baseline code, your previous generated code, and the error traceback/stderr output.\n"
-                    "Identify the issue, fix it, and write the corrected code.\n"
+                    "You are the Implementation Agent in failure-repair mode. The previous generated ML script failed.\n"
+                    "Use the supplied code, concrete output, and deterministic repair focus to fix the causal defect.\n"
+                    "Do not opportunistically fine-tune a failing model: first make it complete within the fidelity caps.\n"
                     f"{integration_instruction}\n"
                     "CRITICAL: Start your Python code response with a brief comment block explaining the cause of the error and how you are fixing it. "
                     "This helps trace execution logical errors correctly.\n"
@@ -427,10 +1215,12 @@ Code:
                     f"The selected accelerator is {accelerator}, exposed as AIBUILDAI_ACCELERATOR. Preserve "
                     "framework-native GPU configuration when supported and retain a safe CPU fallback. Report "
                     "AIBUILDAI_ACTUAL_ACCELERATOR after training.\n"
+                    f"{fine_tuning_instruction}"
+                    f"{deep_learning_instruction}"
                     f"IMPORTANT: At the END of your script, write a JSON file 'result.json' in the current directory:\n"
                     f'  import json; json.dump({{"score": <float>, "metric": "{metric_name}", "direction": "{metric_direction}", '
                     f'"cv_mean": <float>, "cv_std": <float>, "folds": <int>, "fidelity": "{fidelity}", '
-                    f'"accelerator": <actual "cpu"|"cuda"|"mps">}}, open("result.json", "w"))\n'
+                    f'"accelerator": <actual "cpu"|"cuda"|"mps">{tuning_result_fields}}}, open("result.json", "w"))\n'
                     "The score should be the final validation metric value."
                 )
                 
@@ -450,6 +1240,9 @@ Code:
 
                 Stdout output (if any):
                 ```
+
+                Deterministic repair focus:
+                {repair_guidance}
                 {stdout}
                 ```
 
@@ -459,9 +1252,19 @@ Code:
                 Required evaluation profile:
                 {json.dumps(fidelity_profile)}
 
+                Dataset/schema context:
+                {dataset_snapshot[-6000:]}
+
+                {artifact_debug_context}
+
                 Please debug and fix the code. Follow the integration instruction exactly and ensure all variables/datasets are loaded properly. Return the complete corrected code file.
                 """
-                response = call_llm(debug_system_prompt, debug_user_prompt, model=self.model_name)
+                response = call_llm(
+                    debug_system_prompt,
+                    debug_user_prompt,
+                    model=self.model_name,
+                    temperature=0.0,
+                )
                 
                 # Clean markdown code block formatting
                 clean_code = response
@@ -471,6 +1274,15 @@ Code:
                     clean_code = response.split("```")[1].split("```")[0]
 
                 debug_guard_issues = inspect_generated_code(clean_code)
+                debug_guard_issues.extend(
+                    self._resource_limit_issues(clean_code, fidelity_profile)
+                )
+                if operator == "tune" and tuning_context:
+                    debug_guard_issues.extend(
+                        self._tuning_lock_issues(
+                            clean_code, original_code, model_card
+                        )
+                    )
                 if debug_guard_issues:
                     stderr = (
                         "Static leakage guard rejected the debug revision:\n"
@@ -506,19 +1318,27 @@ Code:
                 if stale_output.exists() or stale_output.is_symlink():
                     stale_output.unlink()
             
-            remaining_deadline = float(timeout) - (time.monotonic() - run_started)
-            if remaining_deadline <= 0:
-                exit_code = -1
-                timeout_kill = True
-                stderr = "overall experiment deadline exhausted before this attempt"
-                break
-
+            child_env = accelerator_subprocess_env(accelerator)
+            child_env.update(
+                {
+                    "AIBUILDAI_MAX_EPOCHS": str(fidelity_profile["max_epochs"]),
+                    "AIBUILDAI_EARLY_STOPPING_PATIENCE": str(
+                        fidelity_profile["early_stopping_patience"]
+                    ),
+                    "AIBUILDAI_MAX_ESTIMATOR_ITERATIONS": str(
+                        fidelity_profile["max_estimator_iterations"]
+                    ),
+                    "AIBUILDAI_MAX_TUNING_TRIALS": str(
+                        fidelity_profile["max_tuning_trials"]
+                    ),
+                }
+            )
             proc = subprocess.Popen(
                 cmd,
                 cwd=node_dir,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                env=accelerator_subprocess_env(accelerator),
+                env=child_env,
                 start_new_session=True,
             )
 
@@ -542,8 +1362,13 @@ Code:
                 
             start_time = time.time()
             last_output_time = time.time()
-            hard_timeout = remaining_deadline
-            inactivity_timeout = min(1200.0, hard_timeout)
+            # Search nodes run without a wall-clock or inactivity limit. The
+            # optional timeout remains available only for explicit direct callers
+            # (for example, focused safety tests or external integrations).
+            hard_timeout = float(timeout) if timeout is not None else None
+            inactivity_timeout = (
+                min(1200.0, hard_timeout) if hard_timeout is not None else None
+            )
             
             while True:
                 ret = proc.poll()
@@ -595,14 +1420,17 @@ Code:
                 elapsed = now - start_time
                 inactive_elapsed = now - last_output_time
                 
-                if inactive_elapsed > inactivity_timeout:
+                if (
+                    inactivity_timeout is not None
+                    and inactive_elapsed > inactivity_timeout
+                ):
                     print(f"\nImplementationAgent: INACTIVITY TIMEOUT after {inactivity_timeout}s with no output. Killing process.")
                     terminate_process_group()
                     exit_code = -1
                     timeout_kill = True
                     break
                     
-                if elapsed > hard_timeout:
+                if hard_timeout is not None and elapsed > hard_timeout:
                     print(f"\nImplementationAgent: HARD TIMEOUT ceiling of {hard_timeout}s reached. Killing process.")
                     terminate_process_group()
                     exit_code = -1
@@ -613,13 +1441,18 @@ Code:
 
             stdout = "".join(stdout_lines)
             stderr = "".join(stderr_lines)
+            if timeout_kill:
+                stderr = (
+                    stderr
+                    + f"\nExecution attempt exceeded the {hard_timeout:.1f}s runtime limit."
+                ).strip()
             proc.stdout.close()
             proc.stderr.close()
                 
             # Preserve individual failed-attempt diagnostics. error.log is reserved
             # for the final failed state so recovered nodes are not mislabeled.
             diagnostics = stdout + "\n" + stderr
-            if stderr.strip():
+            if stderr.strip() or exit_code != 0 or timeout_kill:
                 attempt_log_path = node_dir / f"attempt_{attempt + 1}.log"
                 with open(attempt_log_path, 'w', encoding='utf-8') as f:
                     f.write(f"Attempt={attempt + 1}\nexit_code={exit_code}\ntimeout_kill={timeout_kill}\n\n")
@@ -684,6 +1517,19 @@ Code:
                             folds = int(result_data["folds"])
                             if folds < 1:
                                 raise ValueError("folds must be positive")
+                        if operator == "tune" and tuning_context:
+                            _, tuning_trials = self._validate_tuning_metadata(
+                                result_data,
+                                fidelity_profile,
+                                (
+                                    tuning_context.get("tunable_parameters", [])
+                                    if tuning_context.get(
+                                        "tunable_parameters_declared", False
+                                    )
+                                    else None
+                                ),
+                            )
+                            result_data["tuning_trials"] = tuning_trials
                         if enforce_evaluation_contract:
                             contract_validation = validate_evaluation_outputs(
                                 node_dir, fidelity, metric_name
@@ -717,6 +1563,7 @@ Code:
                 and exit_code == 0
                 and not timeout_kill
                 and not enforce_evaluation_contract
+                and operator != "tune"
             ):
                 # Match patterns like: "Score: 0.93245", "AUC: -0.123", "accuracy = 9.5e-3"
                 score_matches = re.findall(
@@ -737,6 +1584,19 @@ Code:
             # If successful execution and a score was found, stop debugging
             if exit_code == 0 and score is not None:
                 break
+
+            # Rewrite the attempt log after result-contract parsing so clean exits
+            # with invalid OOF/result files are as diagnosable as process crashes.
+            attempt_log_path = node_dir / f"attempt_{attempt + 1}.log"
+            with open(attempt_log_path, "w", encoding="utf-8") as f:
+                f.write(
+                    f"Attempt={attempt + 1}\nexit_code={exit_code}\n"
+                    f"timeout_kill={timeout_kill}\n\n"
+                )
+                f.write("=== STDERR ===\n")
+                f.write(stderr)
+                f.write("\n\n=== STDOUT ===\n")
+                f.write(stdout)
                 
             attempt += 1
         
@@ -746,7 +1606,10 @@ Code:
             score = None
             score_source = "none"
             if timeout_kill:
-                print(f"ImplementationAgent: FAILED — timeout after {timeout}s (exit_code={exit_code})")
+                print(
+                    f"ImplementationAgent: FAILED — timeout after {timeout}s "
+                    f"(exit_code={exit_code})"
+                )
             else:
                 print(f"ImplementationAgent: FAILED — subprocess crashed (exit_code={exit_code}). "
                       f"See {node_dir / 'error.log'} for details.")
@@ -772,6 +1635,19 @@ Code:
         with open(node_dir / "execution_resource.json", "w", encoding="utf-8") as f:
             json.dump(execution_resource, f, indent=2)
             f.write("\n")
+
+        tuning_summary = None
+        if status == "completed" and operator == "tune" and tuning_context:
+            tuning_summary = {
+                **tuning_context,
+                "hyperparameters": result_data.get("hyperparameters"),
+                "tuning_trials": result_data.get("tuning_trials"),
+                "score": score,
+                "fidelity": fidelity,
+            }
+            with open(node_dir / "fine_tuning.json", "w", encoding="utf-8") as f:
+                json.dump(tuning_summary, f, indent=2, default=str)
+                f.write("\n")
         
         return {
             "status": status,
@@ -790,6 +1666,8 @@ Code:
             "fidelity": fidelity,
             "accelerator": actual_accelerator,
             "selected_accelerator": accelerator,
+            "tuning": tuning_summary,
+            "artifact_repair": artifact_repair_summary,
             "elapsed_seconds": time.monotonic() - run_started,
             "validation": {
                 key: result_data.get(key)
