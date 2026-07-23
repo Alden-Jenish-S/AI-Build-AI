@@ -5,7 +5,30 @@ from typing import List, Dict, Optional
 
 class AggregatorAgent:
     def __init__(self):
-        pass
+        self.last_ensemble_manifest: Dict = {}
+
+    @staticmethod
+    def _rank_compatible_metric(metric_name: str) -> bool:
+        """Rank averaging is useful for ranking metrics, not calibrated values."""
+        return "auc" in str(metric_name).lower()
+
+    @classmethod
+    def _resolve_strategy(cls, strategy: str, metric_name: str) -> str:
+        if strategy == "auto":
+            return (
+                "rank_average"
+                if cls._rank_compatible_metric(metric_name)
+                else "average"
+            )
+        if strategy == "rank_average" and not cls._rank_compatible_metric(
+            metric_name
+        ):
+            print(
+                "AggregatorAgent WARNING: rank_average is incompatible with "
+                f"metric {metric_name!r}; preserving prediction scale with average."
+            )
+            return "average"
+        return strategy
 
     def aggregate_submissions(
         self,
@@ -108,7 +131,10 @@ class AggregatorAgent:
         return True
 
     @staticmethod
-    def _validation_metric(y_true: np.ndarray, prediction: np.ndarray, metric: str) -> float:
+    def _metric_value(
+        y_true: np.ndarray, prediction: np.ndarray, metric: str
+    ) -> float:
+        """Return a metric in its natural reporting direction."""
         metric = metric.lower()
         if "auc" in metric:
             y_true = np.asarray(y_true, dtype=float)
@@ -123,10 +149,17 @@ class AggregatorAgent:
                 / (n_pos * n_neg)
             )
         if "mae" in metric:
-            return -float(np.mean(np.abs(y_true - prediction)))
+            return float(np.mean(np.abs(y_true - prediction)))
+        if "rmse" in metric:
+            return float(np.sqrt(np.mean((y_true - prediction) ** 2)))
         if "log_loss" in metric or "logloss" in metric:
             clipped = np.clip(prediction, 1e-12, 1 - 1e-12)
-            return float(np.mean(y_true * np.log(clipped) + (1 - y_true) * np.log(1 - clipped)))
+            return -float(
+                np.mean(
+                    y_true * np.log(clipped)
+                    + (1 - y_true) * np.log(1 - clipped)
+                )
+            )
         if "accuracy" in metric:
             return float(np.mean((prediction >= 0.5) == y_true))
         if metric in {"f1", "f1_score"}:
@@ -137,11 +170,41 @@ class AggregatorAgent:
         if metric in {"r2", "r2_score"}:
             denominator = np.sum((y_true - np.mean(y_true)) ** 2)
             return float(1 - np.sum((y_true - prediction) ** 2) / denominator) if denominator else 0.0
-        return -float(np.sqrt(np.mean((y_true - prediction) ** 2)))
+        raise ValueError(f"unsupported OOF ensemble metric: {metric!r}")
 
-    def _oof_weights(
-        self, run_root: Path, node_ids: List[str], metric_name: str
-    ) -> Optional[List[float]]:
+    @classmethod
+    def _validation_metric(
+        cls, y_true: np.ndarray, prediction: np.ndarray, metric: str
+    ) -> float:
+        """Return a higher-is-better objective for ensemble optimization."""
+        value = cls._metric_value(y_true, prediction, metric)
+        normalized = metric.lower()
+        if (
+            "mae" in normalized
+            or "rmse" in normalized
+            or "log_loss" in normalized
+            or "logloss" in normalized
+        ):
+            return -value
+        return value
+
+    @staticmethod
+    def _rank_predictions(predictions: np.ndarray) -> np.ndarray:
+        return np.stack(
+            [
+                pd.Series(model_prediction).rank(pct=True).to_numpy()
+                for model_prediction in predictions
+            ]
+        )
+
+    def _oof_plan(
+        self,
+        run_root: Path,
+        node_ids: List[str],
+        metric_name: str,
+        strategy: str,
+    ) -> Optional[Dict]:
+        """Optimize a blend on aligned OOF rows and compare it to every single."""
         frames = []
         for node_id in node_ids:
             path = run_root / node_id / "oof_predictions.csv"
@@ -149,34 +212,173 @@ class AggregatorAgent:
                 return None
             frame = pd.read_csv(path)
             required = {"row_id", "target", "prediction"}
-            if not required.issubset(frame.columns) or frame["row_id"].duplicated().any():
+            if (
+                not required.issubset(frame.columns)
+                or frame["row_id"].duplicated().any()
+            ):
                 return None
-            frames.append(frame[list(required)].set_index("row_id").sort_index())
-        if not frames or any(not frame.index.equals(frames[0].index) for frame in frames[1:]):
+            frames.append(
+                frame[["row_id", "target", "prediction"]]
+                .set_index("row_id")
+                .sort_index()
+            )
+        if not frames or any(
+            not frame.index.equals(frames[0].index) for frame in frames[1:]
+        ):
             return None
         targets = frames[0]["target"].to_numpy(dtype=float)
-        if any(not np.array_equal(frame["target"].to_numpy(dtype=float), targets) for frame in frames[1:]):
+        if any(
+            not np.array_equal(
+                frame["target"].to_numpy(dtype=float), targets
+            )
+            for frame in frames[1:]
+        ):
             return None
         predictions = np.stack(
             [frame["prediction"].to_numpy(dtype=float) for frame in frames]
         )
-        weights = np.full(len(frames), 1.0 / len(frames))
-        best = self._validation_metric(targets, weights @ predictions, metric_name)
-        # Deterministic coordinate hill climbing is cheap and robust for small ensembles.
-        for step in (0.20, 0.10, 0.05):
+        if (
+            not np.isfinite(targets).all()
+            or not np.isfinite(predictions).all()
+        ):
+            return None
+        if strategy == "rank_average":
+            predictions = self._rank_predictions(predictions)
+
+        try:
+            single_objectives = [
+                self._validation_metric(targets, prediction, metric_name)
+                for prediction in predictions
+            ]
+        except ValueError as exc:
+            print(f"AggregatorAgent WARNING: {exc}")
+            return None
+        single_scores = [
+            self._metric_value(targets, prediction, metric_name)
+            for prediction in predictions
+        ]
+        best_single_index = int(np.argmax(single_objectives))
+        best_single_objective = single_objectives[best_single_index]
+
+        uniform = np.full(len(frames), 1.0 / len(frames))
+        uniform_prediction = uniform @ predictions
+        uniform_objective = self._validation_metric(
+            targets, uniform_prediction, metric_name
+        )
+        best_weights = uniform
+        best_objective = uniform_objective
+
+        # Always include every single model as a candidate. This is the primary
+        # guardrail: an OOF-selected ensemble can never score below the strongest
+        # constituent merely because an optimizer or blend is unhelpful.
+        for index, objective in enumerate(single_objectives):
+            if objective > best_objective + 1e-12:
+                best_weights = np.eye(len(frames))[index]
+                best_objective = objective
+
+        # SLSQP efficiently solves smooth constrained blends such as RMSE and
+        # log-loss. The deterministic transfer search below remains the fallback
+        # and also handles threshold/ranking metrics.
+        if len(frames) > 1:
+            try:
+                from scipy.optimize import minimize
+
+                optimized = minimize(
+                    lambda candidate: -self._validation_metric(
+                        targets, candidate @ predictions, metric_name
+                    ),
+                    x0=uniform,
+                    method="SLSQP",
+                    bounds=[(0.0, 1.0)] * len(frames),
+                    constraints={
+                        "type": "eq",
+                        "fun": lambda candidate: float(candidate.sum() - 1.0),
+                    },
+                    options={"maxiter": 200, "ftol": 1e-12},
+                )
+                candidate = np.asarray(optimized.x, dtype=float)
+                if (
+                    optimized.success
+                    and np.isfinite(candidate).all()
+                    and candidate.sum() > 0
+                ):
+                    candidate = np.clip(candidate, 0.0, None)
+                    candidate /= candidate.sum()
+                    objective = self._validation_metric(
+                        targets, candidate @ predictions, metric_name
+                    )
+                    if objective > best_objective + 1e-12:
+                        best_weights, best_objective = candidate, objective
+            except Exception as exc:
+                print(
+                    "AggregatorAgent WARNING: Continuous OOF weight "
+                    f"optimization failed; using deterministic search: {exc}"
+                )
+
+        # Transfer mass in both directions. The old implementation could only
+        # increase a coordinate and renormalize all others, which missed useful
+        # mixtures and made its result dependent on coordinate order.
+        for step in (0.20, 0.10, 0.05, 0.02, 0.01):
             improved = True
             while improved:
                 improved = False
-                for index in range(len(weights)):
-                    candidate = weights.copy()
-                    candidate[index] += step
-                    candidate /= candidate.sum()
-                    value = self._validation_metric(
-                        targets, candidate @ predictions, metric_name
-                    )
-                    if value > best + 1e-12:
-                        weights, best, improved = candidate, value, True
-        return weights.tolist()
+                for source in range(len(best_weights)):
+                    for target in range(len(best_weights)):
+                        if source == target or best_weights[source] <= 0:
+                            continue
+                        amount = min(step, best_weights[source])
+                        candidate = best_weights.copy()
+                        candidate[source] -= amount
+                        candidate[target] += amount
+                        objective = self._validation_metric(
+                            targets, candidate @ predictions, metric_name
+                        )
+                        if objective > best_objective + 1e-12:
+                            best_weights = candidate
+                            best_objective = objective
+                            improved = True
+
+        final_prediction = best_weights @ predictions
+        final_score = self._metric_value(
+            targets, final_prediction, metric_name
+        )
+        uniform_score = self._metric_value(
+            targets, uniform_prediction, metric_name
+        )
+        guardrail_applied = (
+            uniform_objective < best_single_objective - 1e-12
+            and np.count_nonzero(best_weights > 1e-8) == 1
+        )
+        return {
+            "weights": best_weights.tolist(),
+            "oof_scores": {
+                node_id: score
+                for node_id, score in zip(node_ids, single_scores)
+            },
+            "uniform_oof_score": uniform_score,
+            "ensemble_oof_score": final_score,
+            "best_single_node_id": node_ids[best_single_index],
+            "best_single_oof_score": single_scores[best_single_index],
+            "guardrail_applied": guardrail_applied,
+            "guardrail_reason": (
+                "The candidate blend did not beat the best single model on "
+                "aligned OOF rows."
+                if guardrail_applied
+                else None
+            ),
+        }
+
+    def _oof_weights(
+        self,
+        run_root: Path,
+        node_ids: List[str],
+        metric_name: str,
+        strategy: str = "average",
+    ) -> Optional[List[float]]:
+        plan = self._oof_plan(
+            run_root, node_ids, metric_name, strategy=strategy
+        )
+        return plan["weights"] if plan else None
 
     def aggregate_ranked_candidates(
         self,
@@ -185,11 +387,12 @@ class AggregatorAgent:
         dest_file: Path,
         maximize: bool = True,
         top_k: int = 3,
-        strategy: str = "rank_average",
+        strategy: str = "auto",
         metric_name: str = "score",
         correlation_limit: float = 0.995,
     ) -> List[str]:
         """Select strong, prediction-diverse candidates and aggregate them."""
+        self.last_ensemble_manifest = {}
         ordered = sorted(
             candidates,
             key=lambda item: float(item["score"]),
@@ -239,13 +442,47 @@ class AggregatorAgent:
                 break
         if not selected:
             return []
-        weights = self._oof_weights(run_root, selected, metric_name)
+        applied_strategy = self._resolve_strategy(strategy, metric_name)
+        oof_plan = self._oof_plan(
+            run_root,
+            selected,
+            metric_name,
+            strategy=applied_strategy,
+        )
+        if oof_plan is None:
+            # Blind equal-weight blending has no evidence that it improves the
+            # selected model. Fall back to the strongest reported candidate.
+            selected = selected[:1]
+            weights = None
+            applied_strategy = "average"
+            oof_plan = {
+                "weights": [1.0],
+                "oof_scores": {},
+                "uniform_oof_score": None,
+                "ensemble_oof_score": None,
+                "best_single_node_id": selected[0],
+                "best_single_oof_score": None,
+                "guardrail_applied": True,
+                "guardrail_reason": (
+                    "Aligned OOF predictions were unavailable or the metric was "
+                    "unsupported; used the strongest reported candidate."
+                ),
+            }
+        else:
+            weights = oof_plan["weights"]
         if not self.aggregate_submissions(
             run_root,
             selected,
             dest_file,
             weights=weights,
-            strategy=strategy,
+            strategy=applied_strategy,
         ):
             return []
+        self.last_ensemble_manifest = {
+            "requested_strategy": strategy,
+            "strategy": applied_strategy,
+            "metric_name": metric_name,
+            "node_ids": selected,
+            **oof_plan,
+        }
         return selected

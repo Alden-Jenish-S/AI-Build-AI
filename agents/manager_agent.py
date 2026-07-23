@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import copy
 import json
@@ -7,10 +9,11 @@ import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Any, List
+from packaging.requirements import Requirement
 from tree.node import NodeState
 from tree.scheduler import UCB1Scheduler
 from tree.global_memory import GlobalMemory
-from .initial_agent import InitialAgent
+from .initial_agent import InitialAgent, infer_metric_from_description
 from .technique_agent import TechniqueAgent
 from .implementation_agent import ImplementationAgent
 from .aggregator_agent import AggregatorAgent
@@ -18,13 +21,23 @@ from .setup_agent import SetupAgent
 from memory_pool.builder.l2_builder import L2Builder
 from memory_pool.query_tool import normalize_resource_profile
 from runtime_utils import (
+    absolute_path_without_symlink_resolution,
     detect_available_accelerators,
+    infer_task_type,
     select_preferred_accelerator,
     validate_path_component,
 )
 
 class ManagerAgent:
-    def __init__(self, task_name: str, total_budget: int = 10, venv_path: str = "./.venv/bin/python", baseline_score: float = None, model_name: str = None, run_suffix: str = None):
+    def __init__(
+        self,
+        task_name: str,
+        total_budget: int = 10,
+        venv_path: str | None = None,
+        baseline_score: float = None,
+        model_name: str = None,
+        run_suffix: str = None,
+    ):
         self.task_name = validate_path_component(task_name, "task_name")
         if run_suffix is not None:
             run_suffix = validate_path_component(run_suffix, "run_suffix")
@@ -40,33 +53,63 @@ class ManagerAgent:
         
         # Directories
         self.project_root = Path(__file__).resolve().parent.parent
+        requirements_file = self.project_root / "requirements.txt"
+        self.allowed_dependencies = []
+        if requirements_file.is_file():
+            for raw_line in requirements_file.read_text(
+                encoding="utf-8"
+            ).splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                try:
+                    self.allowed_dependencies.append(Requirement(line).name)
+                except ValueError:
+                    continue
         
         import sys
         import subprocess
-        resolved_venv = Path(venv_path)
-        if not resolved_venv.is_absolute():
-            resolved_venv = self.project_root / resolved_venv
-        resolved_path = str(resolved_venv.resolve())
-        
-        # Check if the resolved venv python is fully functional
-        use_fallback = True
-        if Path(resolved_path).exists():
-            try:
-                res = subprocess.run([resolved_path, "-c", "import sys; print('ok')"], capture_output=True, text=True, timeout=5)
-                if res.returncode == 0 and "ok" in res.stdout:
-                    use_fallback = False
-            except Exception:
-                pass
-                
-        if use_fallback:
-            print(f"ManagerAgent WARNING: Specified python path '{resolved_path}' is invalid or non-functional. Falling back to active running interpreter: {sys.executable}")
+        if venv_path is None:
             self.venv_path = sys.executable
         else:
-            self.venv_path = resolved_path
+            resolved_venv = Path(venv_path)
+            if not resolved_venv.is_absolute():
+                resolved_venv = self.project_root / resolved_venv
+            resolved_path = str(
+                absolute_path_without_symlink_resolution(resolved_venv)
+            )
+
+            # Check if the explicitly selected interpreter is functional.
+            use_fallback = True
+            if Path(resolved_path).exists():
+                try:
+                    res = subprocess.run(
+                        [resolved_path, "-c", "import sys; print('ok')"],
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                    )
+                    if res.returncode == 0 and "ok" in res.stdout:
+                        use_fallback = False
+                except Exception:
+                    pass
+
+            if use_fallback:
+                print(
+                    f"ManagerAgent WARNING: Specified python path "
+                    f"'{resolved_path}' is invalid or non-functional. Falling "
+                    f"back to active running interpreter: {sys.executable}"
+                )
+                self.venv_path = sys.executable
+            else:
+                self.venv_path = resolved_path
         
         self.task_dir = self.project_root / "tasks" / self.task_name
         if not self.task_dir.is_dir():
             raise FileNotFoundError(f"Task directory does not exist: {self.task_dir}")
+        self.baseline_dir = (
+            self.project_root / "runs" / self.task_name / "baseline"
+        )
         if run_suffix:
             self.run_root = self.project_root / "runs" / self.task_name / run_suffix
         else:
@@ -86,18 +129,19 @@ class ManagerAgent:
         self.node_counter = 0
         self.experiments_executed = 0
 
-        # Load task config for metric direction and timeout
+        # Load task config for metric direction and the renewable progress lease.
         self.metric_direction = "maximize"
         self.metric_name = "score"
-        self.subprocess_timeout = 300
+        self.baseline_fidelity = "screen"
+        self.progress_stall_seconds = 1800
         self.enable_multi_fidelity = True
         self.ensemble_top_k = 3
-        self.ensemble_strategy = "rank_average"
+        self.ensemble_strategy = "auto"
         self.uncertainty_weight = 1.0
         self.max_l1_categories = 8
         self.max_artifact_candidates = 5
         self.max_fine_tune_rounds = 2
-        self.max_debug_attempts = 2
+        self.max_debug_attempts = 3
         self.enforce_evaluation_contract = True
         self.accelerator_allowlist = None
         self.accelerator_preference = "auto"
@@ -106,19 +150,26 @@ class ManagerAgent:
         self.available_ram_gb = self._available_ram_gb()
 
         config_file = self.task_dir / "task_config.json"
+        configured_task_type = None
         if config_file.exists():
             try:
                 with open(config_file, 'r', encoding='utf-8') as f:
                     task_config = json.load(f)
                 self.metric_direction = task_config.get("metric_direction", "maximize")
                 self.metric_name = task_config.get("metric_name", "score")
-                self.subprocess_timeout = task_config.get("subprocess_timeout", 300)
+                self.baseline_fidelity = str(
+                    task_config.get("baseline_fidelity", "screen")
+                ).lower()
+                configured_task_type = task_config.get("task_type")
+                self.progress_stall_seconds = task_config.get(
+                    "progress_stall_seconds", 1800
+                )
                 self.enable_multi_fidelity = bool(
                     task_config.get("enable_multi_fidelity", True)
                 )
                 self.ensemble_top_k = max(1, int(task_config.get("ensemble_top_k", 3)))
                 self.ensemble_strategy = task_config.get(
-                    "ensemble_strategy", "rank_average"
+                    "ensemble_strategy", "auto"
                 )
                 self.uncertainty_weight = max(
                     0.0, float(task_config.get("uncertainty_weight", 1.0))
@@ -133,7 +184,7 @@ class ManagerAgent:
                     0, int(task_config.get("max_fine_tune_rounds", 2))
                 )
                 self.max_debug_attempts = max(
-                    0, int(task_config.get("max_debug_attempts", 2))
+                    0, int(task_config.get("max_debug_attempts", 3))
                 )
                 resource_limits = task_config.get("resource_limits", {})
                 if isinstance(resource_limits, dict):
@@ -161,25 +212,38 @@ class ManagerAgent:
                             self.available_ram_gb = configured_ram_gb
             except Exception as e:
                 print(f"ManagerAgent WARNING: Failed to parse task_config.json: {e}")
+        else:
+            description_file = self.task_dir / "task_description.md"
+            if description_file.exists():
+                description = description_file.read_text(encoding="utf-8")
+                self.metric_name, self.metric_direction = (
+                    infer_metric_from_description(description)
+                )
         self._refresh_accelerator_state()
         if self.metric_direction not in {"maximize", "minimize"}:
             raise ValueError(
                 f"task_config metric_direction must be 'maximize' or 'minimize', "
                 f"got {self.metric_direction!r}"
             )
+        if self.baseline_fidelity not in {"screen", "medium", "full"}:
+            raise ValueError(
+                "task_config baseline_fidelity must be screen, medium, or full; "
+                f"got {self.baseline_fidelity!r}"
+            )
         if (
-            not isinstance(self.subprocess_timeout, (int, float))
-            or isinstance(self.subprocess_timeout, bool)
-            or not math.isfinite(self.subprocess_timeout)
-            or self.subprocess_timeout <= 0
+            not isinstance(self.progress_stall_seconds, (int, float))
+            or isinstance(self.progress_stall_seconds, bool)
+            or not math.isfinite(self.progress_stall_seconds)
+            or self.progress_stall_seconds <= 0
         ):
             raise ValueError(
-                f"task_config subprocess_timeout must be positive and finite, "
-                f"got {self.subprocess_timeout!r}"
+                "task_config progress_stall_seconds must be positive and finite, "
+                f"got {self.progress_stall_seconds!r}"
             )
-        if self.ensemble_strategy not in {"average", "rank_average"}:
+        if self.ensemble_strategy not in {"auto", "average", "rank_average"}:
             raise ValueError(
-                "task_config ensemble_strategy must be 'average' or 'rank_average'"
+                "task_config ensemble_strategy must be 'auto', 'average', or "
+                "'rank_average'"
             )
         self.technique_agent.max_l1_categories = self.max_l1_categories
         self.technique_agent.max_artifact_candidates = self.max_artifact_candidates
@@ -199,12 +263,16 @@ class ManagerAgent:
                     self.task_description = f.read().strip()
             except Exception:
                 pass
+        self.task_type = infer_task_type(
+            self.task_description, configured_task_type
+        )
                 
         print(
             "ManagerAgent initialized: "
             f"direction={self.metric_direction}, "
-            f"baseline_timeout={self.subprocess_timeout}, "
-            f"implementation_timeout=None, baseline_score={self.baseline_score}"
+            "runtime_limit=None, "
+            f"progress_stall_seconds={self.progress_stall_seconds}, "
+            f"baseline_score={self.baseline_score}"
         )
 
     @staticmethod
@@ -231,6 +299,56 @@ class ManagerAgent:
     @staticmethod
     def _initial_fanout_for_budget(total_budget: int) -> int:
         return min(3, max(1, int(total_budget) // 3))
+
+    def _spawn_root_approach(
+        self, root_id: str, approach: dict, *, replacement: bool = False
+    ) -> str:
+        """Materialize one primary or backup root approach."""
+        name = approach.get("name", "Branch_Plan")
+        plan = approach.get("plan", "")
+        node_id = self.get_new_node_id()
+        child_node = NodeState(
+            node_id=node_id,
+            parent_id=root_id,
+            node_type="technique",
+            plan=plan,
+            operator="initial",
+            fidelity="screen" if self.enable_multi_fidelity else "full",
+            config={
+                "priority": 0.0,
+                "allowed_scopes": ["full_pipeline", "model_family"],
+                "replacement_branch": replacement,
+            },
+        )
+        self.all_nodes[node_id] = child_node
+        self.all_nodes[root_id].children_ids.append(node_id)
+        self._persist_node(node_id)
+        label = "replacement branch" if replacement else "branch"
+        print(
+            f"ManagerAgent: Spawned {label} {node_id}: {name} "
+            f"(Plan: {plan[:60]}...)"
+        )
+        return node_id
+
+    def _promote_backup_approach(self, root_id: str) -> str | None:
+        """Replace a failed root experiment without spending planning budget."""
+        backups = getattr(self, "_backup_initial_approaches", [])
+        if not backups:
+            return None
+        approach = backups.pop(0)
+        node_id = self._spawn_root_approach(
+            root_id, approach, replacement=True
+        )
+        self.initial_fanout += 1
+        self.scheduler.set_warmup_budget(self.initial_fanout)
+        self._trace_search(
+            {
+                "event": "backup_root_promoted",
+                "node_id": node_id,
+                "remaining_backups": len(backups),
+            }
+        )
+        return node_id
 
     def _prepare_run_root(self) -> None:
         """Start with an empty run directory while preserving prior attempts."""
@@ -490,13 +608,16 @@ class ManagerAgent:
 
     def initialize_task(self, temperature: float = 0.2):
         """
-        Deletes any pre-existing initial algorithms/dataloaders and calls the 
-        InitialAgent to generate them fresh from scratch based on the task description.
+        Generate fresh baseline assets under ``runs/<task>/baseline``.
+
+        The task directory is an immutable input boundary: task descriptions,
+        configuration, and datasets are read from it but never changed.
         """
         print(f"ManagerAgent: Dynamically generating initial task baselines for {self.task_name}...")
         
-        loader_path = self.task_dir / "initial_dataloader.py"
-        algo_path = self.task_dir / "initial_algorithm.py"
+        self.baseline_dir.mkdir(parents=True, exist_ok=True)
+        loader_path = self.baseline_dir / "initial_dataloader.py"
+        algo_path = self.baseline_dir / "initial_algorithm.py"
 
         original_files = {
             path: path.read_bytes() for path in (loader_path, algo_path) if path.exists()
@@ -507,7 +628,12 @@ class ManagerAgent:
                     path.unlink()
 
             initial_agent = InitialAgent(model_name=self.model_name)
-            initial_agent.generate_initial_code(self.task_dir, temperature=temperature)
+            initial_agent.generate_initial_code(
+                self.task_dir,
+                self.baseline_dir,
+                temperature=temperature,
+                fidelity=self.baseline_fidelity,
+            )
             if not loader_path.is_file() or not algo_path.is_file():
                 raise RuntimeError("InitialAgent did not produce both required baseline files")
         except Exception:
@@ -593,35 +719,24 @@ class ManagerAgent:
         # If ideation fails, stop clearly instead of silently biasing the run with canned defaults.
         self.initial_fanout = self._initial_fanout_for_budget(self.total_budget)
         self.scheduler.set_warmup_budget(self.initial_fanout)
+        candidate_count = min(3, self.total_budget)
         dynamic_approaches = self.technique_agent.generate_initial_approaches(
-            self.task_description, count=self.initial_fanout
+            self.task_description, count=candidate_count
         )
         print("ManagerAgent: LLM initial branch ideas:")
         for idx, app in enumerate(dynamic_approaches, start=1):
-            print(f"  {idx}. {app.get('name', 'unnamed_branch')}: {app.get('plan', '')}")
-        
-        root_node = self.all_nodes[root_id]
-        
-        for app in dynamic_approaches:
-            name = app.get("name", "Branch_Plan")
-            plan = app.get("plan", "")
-            node_id = self.get_new_node_id()
-            child_node = NodeState(
-                node_id=node_id,
-                parent_id=root_id,
-                node_type="technique",
-                plan=plan,
-                operator="initial",
-                fidelity="screen" if self.enable_multi_fidelity else "full",
-                config={
-                    "priority": 0.0,
-                    "allowed_scopes": ["full_pipeline", "model_family"],
-                },
+            role = "primary" if idx <= self.initial_fanout else "backup"
+            print(
+                f"  {idx}. {app.get('name', 'unnamed_branch')} [{role}]: "
+                f"{app.get('plan', '')}"
             )
-            self.all_nodes[node_id] = child_node
-            root_node.children_ids.append(node_id)
-            self._persist_node(node_id)
-            print(f"ManagerAgent: Spawned branch {node_id}: {name} (Plan: {plan[:60]}...)")
+
+        primary_approaches = dynamic_approaches[: self.initial_fanout]
+        self._backup_initial_approaches = list(
+            dynamic_approaches[self.initial_fanout :]
+        )
+        for app in primary_approaches:
+            self._spawn_root_approach(root_id, app)
 
         self._persist_tree_state()
 
@@ -873,6 +988,7 @@ class ManagerAgent:
             "artifact_id": artifact_id,
             "category": card.get("category") or fallback.get("category"),
             "reason": str(error),
+            "dependencies": list(card.get("dependencies", [])),
         }
         for key in (
             "model_card",
@@ -887,7 +1003,8 @@ class ManagerAgent:
             "The selected optional artifact could not be installed. Implement a "
             "dependency-light, self-contained equivalent using only libraries that "
             "are already importable in the selected interpreter. Do not import the "
-            f"unavailable artifact {artifact_id or '<unknown>'!r}. Preserve the "
+            f"unavailable artifact {artifact_id or '<unknown>'!r} or any of its "
+            f"unavailable dependencies {card.get('dependencies', [])!r}. Preserve the "
             f"original branch intent: {original_plan}"
         )
         return fallback
@@ -948,7 +1065,13 @@ class ManagerAgent:
                 score, previous_conservative_score, cv_std
             )
 
-        operator_priorities = {"refine": 0.02, "diversify": 0.0}
+        operator_priorities = {"refine": 0.02, "diversify": 0.06}
+        parent_technique_record = (node.config or {}).get(
+            "technique_record"
+        ) or {}
+        parent_artifact_id = parent_technique_record.get("artifact_id") or (
+            parent_technique_record.get("model_card") or {}
+        ).get("artifact_id")
         if tune_eligible:
             # A measured winner earns a high-priority, model-locked fine-tuning slot.
             operator_priorities["tune"] = 0.09
@@ -1004,6 +1127,11 @@ class ManagerAgent:
                         ["full_pipeline", "model_family"]
                         if operator == "diversify"
                         else ["full_pipeline", "model_family", "component"]
+                    ),
+                    "excluded_artifact_ids": (
+                        [parent_artifact_id]
+                        if operator == "diversify" and parent_artifact_id
+                        else []
                     ),
                 },
             )
@@ -1125,9 +1253,15 @@ class ManagerAgent:
                         l1_index=l1_index,
                         available_accelerators=set(self.available_accelerators),
                         preferred_accelerator=self.preferred_accelerator,
+                        available_dependencies=set(self.allowed_dependencies),
                         allowed_scopes=set(
                             (node.config or {}).get("allowed_scopes", [])
                         ) or None,
+                        excluded_artifact_ids=set(
+                            (node.config or {}).get(
+                                "excluded_artifact_ids", []
+                            )
+                        ),
                     )
                 except Exception as exc:
                     # Planning is not an experiment. Preserve the branch intent and
@@ -1452,6 +1586,8 @@ class ManagerAgent:
                 node_dir,
                 tech_record,
                 self.task_dir,
+                baseline_dir=self.baseline_dir,
+                stall_seconds=self.progress_stall_seconds,
                 metric_direction=self.metric_direction,
                 base_algorithm_path=(node.config or {}).get("base_code_path"),
                 parent_node_dir=(
@@ -1465,7 +1601,8 @@ class ManagerAgent:
                 accelerator=self.preferred_accelerator,
                 available_accelerators=set(self.available_accelerators),
                 tuning_context=(node.config or {}).get("tuning_context"),
-                max_debug_attempts=getattr(self, "max_debug_attempts", 2),
+                max_debug_attempts=getattr(self, "max_debug_attempts", 3),
+                metric_name=self.metric_name,
             )
             
             # Bug 1 fix: Handle execution failures properly
@@ -1510,6 +1647,9 @@ class ManagerAgent:
                 "tuning": res.get("tuning"),
                 "artifact_repair": res.get("artifact_repair"),
                 "artifact_variant": artifact_variant,
+                "implementation_families": res.get(
+                    "implementation_families", []
+                ),
             }
             node.executed = True
             
@@ -1528,6 +1668,13 @@ class ManagerAgent:
                 self.global_memory.record_implementation(selected_id, {"node_id": selected_id}, 0.0, "failed")
                 # Backpropagate zero reward
                 self.scheduler.backpropagate(selected_id, -1.0, self.all_nodes)
+                if node.operator == "initial":
+                    replacement_id = self._promote_backup_approach(root_id)
+                    if replacement_id:
+                        print(
+                            "ManagerAgent: Promoted a backup approach so the "
+                            "remaining experiment budget can still be used."
+                        )
                 self._persist_node(selected_id)
                 self._persist_tree_state()
                 # Do NOT spawn follow-up technique nodes from failed implementations
@@ -1602,6 +1749,9 @@ class ManagerAgent:
                     "tuning": res.get("tuning"),
                     "artifact_repair": res.get("artifact_repair"),
                     "artifact_variant": artifact_variant,
+                    "implementation_families": res.get(
+                        "implementation_families", []
+                    ),
                 },
                 score,
                 "completed",
@@ -1619,6 +1769,9 @@ class ManagerAgent:
                     "tuning": res.get("tuning"),
                     "artifact_repair": res.get("artifact_repair"),
                     "artifact_variant": artifact_variant,
+                    "implementation_families": res.get(
+                        "implementation_families", []
+                    ),
                 }
             )
             self._persist_node(selected_id)
@@ -1633,7 +1786,7 @@ class ManagerAgent:
     def generate_final_submission(self, best_node_id: str):
         """
         Locates the submission file of the best node, aligns it with the sample_submission.csv 
-        in the task directory, and saves the final submission to the run and task folders.
+        in the task directory, and saves the final submission inside the run.
         """
         if not best_node_id:
             print("ManagerAgent: No best node found to generate final submission.")
@@ -1677,19 +1830,19 @@ class ManagerAgent:
         )
         if selected_ensemble_nodes:
             generated_sub_path = ensemble_path
+            ensemble_manifest = dict(
+                self.aggregator_agent.last_ensemble_manifest
+            )
+            ensemble_manifest.update(
+                {
+                    "fidelity": best_fidelity,
+                    "node_ids": selected_ensemble_nodes,
+                }
+            )
             with open(self.run_root / "ensemble_manifest.json", "w", encoding="utf-8") as f:
-                json.dump(
-                    {
-                        "strategy": self.ensemble_strategy,
-                        "fidelity": best_fidelity,
-                        "node_ids": selected_ensemble_nodes,
-                    },
-                    f,
-                    indent=2,
-                )
+                json.dump(ensemble_manifest, f, indent=2)
             
-        # Target output paths
-        task_output_path = self.task_dir / "submission.csv"
+        # The task directory is read-only; final predictions belong to the run.
         run_output_path = self.run_root / "submission.csv"
         
         if sample_sub_path.exists():
@@ -1735,9 +1888,11 @@ class ManagerAgent:
                 if final_df[prediction_cols].isnull().any().any():
                     raise ValueError("generated predictions contain missing values")
 
-                final_df.to_csv(task_output_path, index=False)
                 final_df.to_csv(run_output_path, index=False)
-                print(f"ManagerAgent: Aligned final submission saved to {task_output_path} and {run_output_path}")
+                print(
+                    "ManagerAgent: Aligned final submission saved to "
+                    f"{run_output_path}"
+                )
                 return True
             except Exception as e:
                 print(f"ManagerAgent ERROR: Refusing invalid final submission: {e}")
@@ -1748,7 +1903,6 @@ class ManagerAgent:
                 generated_df = pd.read_csv(generated_sub_path)
                 if generated_df.empty or generated_df.isnull().any().any():
                     raise ValueError("generated submission is empty or contains missing values")
-                generated_df.to_csv(task_output_path, index=False)
                 generated_df.to_csv(run_output_path, index=False)
                 return True
             except Exception as e:

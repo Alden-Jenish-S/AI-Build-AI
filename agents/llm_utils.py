@@ -23,7 +23,7 @@ _PROVIDER_DEFAULTS = {
     "nvidia": {
         "api_key_env": "NVIDIA_API_KEY",
         "base_url": "https://integrate.api.nvidia.com/v1",
-        "model": "openai/gpt-oss-120b",
+        "model": "deepseek-ai/deepseek-v4-pro",
     },
     "gemini": {
         "api_key_env": "GEMINI_API_KEY",

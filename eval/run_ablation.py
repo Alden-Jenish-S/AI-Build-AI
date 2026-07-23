@@ -8,7 +8,6 @@ import math
 import os
 import re
 import shutil
-import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -22,8 +21,13 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from agents.llm_utils import get_token_usage, reset_token_usage
 from agents.initial_agent import InitialAgent
 from agents.manager_agent import ManagerAgent
+from agents.validation_guard import inspect_generated_code
 from eval.metrics import calculate_ablation_metrics
-from runtime_utils import accelerator_subprocess_env, expose_task_data
+from runtime_utils import (
+    accelerator_subprocess_env,
+    expose_task_data,
+    run_supervised_process,
+)
 from evaluation_contract import validate_evaluation_outputs
 
 
@@ -96,8 +100,17 @@ def _run_baseline(
     baseline_dir.mkdir(parents=True, exist_ok=True)
     loader = baseline_dir / "initial_dataloader.py"
     algorithm = baseline_dir / "initial_algorithm.py"
-    shutil.copy(manager.task_dir / "initial_dataloader.py", loader)
-    shutil.copy(manager.task_dir / "initial_algorithm.py", algorithm)
+    baseline_source = Path(
+        getattr(manager, "baseline_dir", manager.task_dir)
+    )
+    for source, destination in (
+        (baseline_source / "initial_dataloader.py", loader),
+        (baseline_source / "initial_algorithm.py", algorithm),
+    ):
+        if not source.is_file():
+            raise FileNotFoundError(f"Generated baseline file is missing: {source}")
+        if source.resolve() != destination.resolve():
+            shutil.copy2(source, destination)
     contract_source = PROJECT_ROOT / "evaluation_contract.py"
     if contract_source.is_file():
         shutil.copy2(contract_source, baseline_dir / "evaluation_contract.py")
@@ -109,6 +122,7 @@ def _run_baseline(
     if debug_log.exists() or debug_log.is_symlink():
         debug_log.unlink()
     debugger = InitialAgent(model_name=getattr(manager, "model_name", None))
+    baseline_fidelity = getattr(manager, "baseline_fidelity", "screen")
 
     for attempt in range(max_debug_attempts + 1):
         for stale_file in (
@@ -122,16 +136,57 @@ def _run_baseline(
                 stale_file.unlink()
 
         try:
-            result = subprocess.run(
+            guard_issues = inspect_generated_code(
+                algorithm.read_text(encoding="utf-8")
+            )
+            if guard_issues:
+                raise ValueError(
+                    "generated baseline failed the read-only task/leakage guard: "
+                    + "; ".join(guard_issues)
+                )
+            result = run_supervised_process(
                 [manager.venv_path, str(algorithm)],
                 cwd=baseline_dir,
-                capture_output=True,
-                text=True,
-                timeout=manager.subprocess_timeout,
                 env=accelerator_subprocess_env(
                     getattr(manager, "preferred_accelerator", "cpu")
                 ),
+                stall_seconds=float(manager.progress_stall_seconds),
+                hard_limit_seconds=None,
+                activity_root=baseline_dir,
+                stdout_stream=sys.stdout,
+                stderr_stream=sys.stderr,
+                label="Baseline",
             )
+            supervision_report = {
+                "attempt": attempt + 1,
+                "execution_mode": "renewable_progress_lease",
+                "total_runtime_limit_seconds": None,
+                "progress_stall_seconds": float(
+                    manager.progress_stall_seconds
+                ),
+                "elapsed_seconds": result.elapsed_seconds,
+                "returncode": result.returncode,
+                "stalled": result.stalled,
+                "termination_reason": result.termination_reason,
+                "progress_events": result.progress_events,
+                "last_progress_source": result.last_progress_source,
+                "last_progress_age_seconds": result.last_progress_age_seconds,
+            }
+            for report_path in (
+                baseline_dir / "execution_supervision.json",
+                baseline_dir
+                / f"execution_supervision_attempt_{attempt + 1}.json",
+            ):
+                with open(report_path, "w", encoding="utf-8") as f:
+                    json.dump(supervision_report, f, indent=2)
+                    f.write("\n")
+            if result.stalled:
+                raise RuntimeError(
+                    "baseline execution made no observable progress and was "
+                    "automatically recycled by the progress lease; "
+                    f"last progress source={result.last_progress_source}\n"
+                    f"stderr tail:\n{result.stderr[-2000:]}"
+                )
             if result.returncode != 0:
                 raise RuntimeError(
                     f"baseline process exited with {result.returncode}\n"
@@ -162,7 +217,7 @@ def _run_baseline(
                     )
                 if contract_files_exist:
                     validated = validate_evaluation_outputs(
-                        baseline_dir, "full", manager.metric_name
+                        baseline_dir, baseline_fidelity, manager.metric_name
                     )
                     score = float(validated["cv_mean"])
                     result_data.update(validated)
@@ -189,7 +244,6 @@ def _run_baseline(
             print(f"Derived baseline score: {score}")
             return score
         except (
-            subprocess.TimeoutExpired,
             RuntimeError,
             ValueError,
             TypeError,
@@ -216,6 +270,8 @@ def _run_baseline(
                 failure_output,
                 getattr(manager, "metric_name", "score"),
                 manager.metric_direction,
+                baseline_fidelity,
+                getattr(manager, "task_type", "supervised"),
             )
 
     raise AssertionError("unreachable baseline execution state")
@@ -245,8 +301,7 @@ def run_complete_system(
         manager.metric_name = metric_name
     if metric_direction:
         manager.metric_direction = metric_direction
-    shutil.copy(baseline_dir / "initial_dataloader.py", manager.task_dir / "initial_dataloader.py")
-    shutil.copy(baseline_dir / "initial_algorithm.py", manager.task_dir / "initial_algorithm.py")
+    manager.baseline_dir = Path(baseline_dir)
 
     started = time.time()
     best_node_id = manager.run_tree_search()
@@ -311,8 +366,10 @@ def _write_results(
     baseline_usage: Dict[str, Any],
     complete_result: Dict[str, Any],
     overall_usage: Dict[str, Any],
+    baseline_fidelity: str = "screen",
 ) -> Path:
-    result_file = PROJECT_ROOT / "eval" / "results.md"
+    result_file = PROJECT_ROOT / "runs" / task_name / "results.md"
+    result_file.parent.mkdir(parents=True, exist_ok=True)
     improvement = (
         complete_result["best_score"] - baseline_score
         if direction == "maximize"
@@ -329,7 +386,7 @@ def _write_results(
         f.write("|---|---:|---:|---:|---:|---:|---:|---:|---|---:|\n")
         f.write(
             f"| Baseline | {baseline_score:.6f} | — | {baseline_usage['total_tokens']} "
-            "| n/a | 0 | n/a | 1 | full | 0.0% |\n"
+            f"| n/a | 0 | n/a | 1 | {baseline_fidelity} | 0.0% |\n"
         )
         f.write(
             f"| Complete system | {complete_result['best_score']:.6f} "
@@ -425,6 +482,7 @@ def main() -> None:
         baseline_usage,
         complete_result,
         overall_usage,
+        baseline_manager.baseline_fidelity,
     )
     print(
         "\nOverall LLM token usage: "

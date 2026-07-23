@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import math
 import os
@@ -7,6 +9,7 @@ from typing import List, Dict, Any
 from .llm_utils import call_llm
 from .web_search import search_web
 from memory_pool.query_tool import query
+from runtime_utils import infer_task_type
 
 class TechniqueAgent:
     def __init__(
@@ -40,7 +43,9 @@ class TechniqueAgent:
             "2. 'plan': A detailed description of the approach, serving as a strategic direction for the technique selection.\n"
             "Do not reuse stock branch labels like Branch_A_Ensembling, Branch_B_Features, or Branch_C_DeepLearning. "
             "Each root branch must specify a complete pipeline or model family, not a standalone scaler, encoder, imputer, or CV utility. "
-            "The branches must be task-specific, complementary, and directly implementable.\n"
+            "The branches must be task-specific, complementary, and directly implementable. "
+            "Use a different primary model family in every branch; do not repeat CatBoost, XGBoost, LightGBM, "
+            "random forests, linear models, or the same neural architecture across branches.\n"
             "Do not include any explanation or markdown formatting, just the raw JSON list."
         )
         user_prompt = (
@@ -327,6 +332,8 @@ Return the three child experiments as JSON only.
         allowed_scopes: set[str] | None = None,
         available_accelerators: set[str] | None = None,
         preferred_accelerator: str = "cpu",
+        excluded_artifact_ids: set[str] | None = None,
+        available_dependencies: set[str] | None = None,
     ) -> Dict[str, Any]:
         """
         1. Decides if relevant techniques are in the Memory Pool.
@@ -339,9 +346,17 @@ Return the three child experiments as JSON only.
             l1_index: The L1 category index
         """
         use_pool = os.environ.get("ABLATION_USE_POOL", "1") != "0"
+        task_type = infer_task_type(task_description)
+        excluded_artifact_ids = {
+            str(item) for item in (excluded_artifact_ids or set()) if item
+        }
         if not use_pool or not l1_index:
             print("TechniqueAgent: Memory pool disabled or empty. Generating a new technique outline.")
-            return self._bootstrap_from_web(task_description, branch_plan)
+            return self._bootstrap_from_web(
+                task_description,
+                branch_plan,
+                available_dependencies=available_dependencies,
+            )
 
         # Use both the branch direction and measured lineage context. The latter
         # prevents repeating failed sibling experiments and enables evidence-based reuse.
@@ -387,7 +402,11 @@ Which 1-2 categories best match the strategic direction? Output a comma-separate
         
         if not selected_categories:
             print("TechniqueAgent: No valid L1 category matched the branch plan. Initiating web search...")
-            return self._bootstrap_from_web(task_description, branch_plan)
+            return self._bootstrap_from_web(
+                task_description,
+                branch_plan,
+                available_dependencies=available_dependencies,
+            )
             
         print(f"TechniqueAgent: Selected L1 categories: {selected_categories} (for branch: {branch_plan[:60]}...)")
         
@@ -398,6 +417,23 @@ Which 1-2 categories best match the strategic direction? Output a comma-separate
             verified_artifacts = [
                 artifact for artifact in res.get("artifacts", [])
                 if artifact.get("verified") is True
+                and artifact.get("artifact_id") not in excluded_artifact_ids
+                and (
+                    task_type != "unsupervised_clustering"
+                    or "unsupervised_clustering"
+                    in {
+                        str(item).lower()
+                        for item in (
+                            artifact.get("capabilities", {}).get(
+                                "target_types", []
+                            )
+                            if isinstance(
+                                artifact.get("capabilities"), dict
+                            )
+                            else []
+                        )
+                    }
+                )
                 and (
                     not allowed_scopes
                     or artifact.get("scope") in allowed_scopes
@@ -460,6 +496,9 @@ Strategic Direction:
 Measured Parent/Sibling Context:
 {json.dumps(global_memory_context or {}, indent=2, default=str)}
 
+Artifacts excluded by the search operator:
+{sorted(excluded_artifact_ids)}
+
 Candidate Artifacts in Memory Pool:
 {candidates_str}
 
@@ -489,9 +528,18 @@ Decide: Output either one artifact_id from the list, or 'web_search'.
         else:
             # Memory Pool Miss -> Web Search
             print("TechniqueAgent: Memory Pool Miss. Initiating web search...")
-            return self._bootstrap_from_web(task_description, branch_plan)
+            return self._bootstrap_from_web(
+                task_description,
+                branch_plan,
+                available_dependencies=available_dependencies,
+            )
 
-    def _bootstrap_from_web(self, task_description: str, branch_plan: str) -> Dict[str, Any]:
+    def _bootstrap_from_web(
+        self,
+        task_description: str,
+        branch_plan: str,
+        available_dependencies: set[str] | None = None,
+    ) -> Dict[str, Any]:
         """Searches or synthesizes a new technique outline for later L2 building."""
         # Bug 3 fix: Use clean task_description for query generation, NOT branch_plan alone
         query_prompt_sys = (
@@ -545,10 +593,20 @@ Decide: Output either one artifact_id from the list, or 'web_search'.
 
         build_prompt_sys = (
             "You are the Technique Agent. Review the search results and outline ONE new reusable tabular ML technique "
-            "we should implement. It should be meaningfully different from generic memory-pool defaults when possible. "
+            "we should implement. The technique MUST faithfully implement the Planned Technique below. "
+            "Do not substitute a different model family merely because it appears in the search results; "
+            "the search results are supporting evidence, not permission to replace the branch. "
+            "It should be meaningfully different from generic memory-pool defaults when possible. "
+            "Use only the explicitly available third-party distributions listed by the user. If the "
+            "planned technique normally uses an unavailable convenience package, implement its core "
+            "mechanism with an available lower-level framework when feasible and state that choice. "
+            "Never declare or import an unavailable package. "
             "Provide: 1) Chosen Category, 2) a unique artifact_id (lowercase_underscores), "
             "3) a description, 4) the raw python code implementing it, 5) the interface entrypoint."
         )
+        dependency_text = ", ".join(
+            sorted(available_dependencies or set())
+        ) or "Python standard library only"
         build_prompt_user = f"""
 Search Results:
 {search_results}
@@ -558,6 +616,9 @@ Task Description:
 
 Planned Technique:
 {branch_plan}
+
+Available Third-Party Distributions:
+{dependency_text}
 
 Outline the new technique and return the raw source logic for our builder.
 """
@@ -592,6 +653,7 @@ Outline the new technique and return the raw source logic for our builder.
             "artifact_id": None,
             "category": "web_search_fallback",
             "plan": f"Bootstrap new technique from web search: {search_query}",
+            "search_query": search_query,
             "search_results": search_results,
             "raw_outline": new_technique_outline,
             "query_generation_error": query_error,

@@ -40,7 +40,9 @@
   "tabular_deep_learning": {
     "description": "Neural networks designed specifically for tabular data (MLPs, Attention architectures).",
     "l2_pointers": [
-      "gradient_reversal_domain_adaptation"
+      "gradient_reversal_domain_adaptation",
+      "tabular_token_transformer",
+      "tabnet_sparse_isotonic"
     ]
   },
   "blending_stacking": {
@@ -71,7 +73,20 @@
     "description": "Techniques that automatically construct feature interactions and train gradient boosting models on the augmented feature set.",
     "l2_pointers": [
       "interaction_enhanced_gb",
-      "interaction_feature_engineering"
+      "interaction_feature_engineering",
+      "power_interaction_hist_gbdt"
+    ]
+  },
+  "tabular_regression": {
+    "description": "Category for tabular_regression techniques.",
+    "l2_pointers": [
+      "screen_histgradientboosting_regressor"
+    ]
+  },
+  "clustering": {
+    "description": "Category for clustering techniques.",
+    "l2_pointers": [
+      "pca_ward_agglomerative_clustering"
     ]
   }
 }

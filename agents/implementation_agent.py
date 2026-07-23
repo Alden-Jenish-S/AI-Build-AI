@@ -5,26 +5,40 @@ import os
 import sys
 import json
 import math
-import signal
 import subprocess
 import shutil
 import time
 from pathlib import Path
 from typing import Dict, Any, Optional
+from packaging.requirements import Requirement
+from .initial_agent import infer_metric_from_description
 from .llm_utils import call_llm
 from .validation_guard import inspect_generated_code
 from evaluation_contract import FIDELITY_PROFILES, validate_evaluation_outputs
 from runtime_utils import (
+    absolute_path_without_symlink_resolution,
     accelerator_subprocess_env,
     expose_task_data,
     resolve_within,
+    run_supervised_process,
     validate_storage_identifier,
 )
 
 class ImplementationAgent:
-    def __init__(self, venv_python_path: str = "./.venv/bin/python", model_name: str = None):
+    def __init__(
+        self,
+        venv_python_path: str | None = None,
+        model_name: str = None,
+    ):
         import sys
-        resolved_path = str(Path(venv_python_path).resolve())
+        if venv_python_path is None:
+            self.venv_python = sys.executable
+            self.model_name = model_name
+            self.project_root = Path(__file__).resolve().parent.parent
+            return
+        resolved_path = str(
+            absolute_path_without_symlink_resolution(venv_python_path)
+        )
         # Check if the resolved venv python is fully functional
         use_fallback = True
         if Path(resolved_path).exists():
@@ -66,16 +80,21 @@ class ImplementationAgent:
         code: str,
         stderr: str,
         stdout: str,
-        timeout_kill: bool,
+        execution_stopped: bool,
         accelerator: str,
         fidelity_profile: dict,
     ) -> str:
         """Return deterministic, failure-specific constraints for the LLM debugger."""
         combined = (str(stderr) + "\n" + str(stdout)).lower()
         guidance = []
-        if timeout_kill or "timeout" in combined or "deadline" in combined:
+        if (
+            execution_stopped
+            or "stalled" in combined
+            or "timeout" in combined
+            or "deadline" in combined
+        ):
             guidance.append(
-                "Runtime repair: keep the required rows/folds, but reduce work inside each fold; "
+                "Execution recovery: keep the required rows/folds, but reduce work inside each fold; "
                 "cap epochs/iterations, add early stopping, avoid repeated final refits, and emit "
                 "progress at least once per epoch or trial. Do not increase training duration while debugging."
             )
@@ -97,6 +116,21 @@ class ImplementationAgent:
             guidance.append(
                 "Shape repair: derive the network input width after fold-local transformation, keep "
                 "binary logits one-dimensional, and assert prediction length before writing outputs."
+            )
+        if any(
+            marker in combined
+            for marker in (
+                "not in index",
+                "columns are missing",
+                "feature names",
+                "feature_names",
+            )
+        ):
+            guidance.append(
+                "Feature-parity repair: keep raw feature columns separate from engineered columns, "
+                "apply the same fitted transformation function to fold-train, fold-validation, full "
+                "evaluation, and test frames, then assert and align transformed test columns to the "
+                "transformed training columns. Never index raw test data with post-engineering columns."
             )
         if any(marker in combined for marker in ("no module named", "modulenotfounderror", "importerror")):
             guidance.append(
@@ -461,6 +495,55 @@ class ImplementationAgent:
                     families.add(".".join(parts[:2]))
         return families
 
+    @staticmethod
+    def _dependency_fallback_issues(
+        code: str, technique_record: dict
+    ) -> list[str]:
+        """Prevent an unavailable method from masquerading behind try/except."""
+        if technique_record.get("status") != "dependency_fallback":
+            return []
+        unavailable = technique_record.get("unavailable_artifact") or {}
+        artifact_id = str(unavailable.get("artifact_id") or "").strip()
+        import_roots = {
+            "scikit-learn": "sklearn",
+            "pytorch-tabnet": "pytorch_tabnet",
+            "pytorch-lightning": "pytorch_lightning",
+            "opencv-python": "cv2",
+            "imbalanced-learn": "imblearn",
+        }
+        blocked = {artifact_id} if artifact_id else set()
+        for dependency in unavailable.get("dependencies", []):
+            try:
+                package = Requirement(str(dependency)).name.lower()
+            except ValueError:
+                package = str(dependency).strip().lower()
+            blocked.add(
+                import_roots.get(package, package.replace("-", "_"))
+            )
+        blocked.discard("")
+        if not blocked:
+            return []
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            return []
+        imported = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(
+                    alias.name.split(".", 1)[0] for alias in node.names
+                )
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported.add(node.module.split(".", 1)[0])
+        violations = sorted(imported & blocked)
+        if not violations:
+            return []
+        return [
+            "dependency-fallback code must not import unavailable modules "
+            f"{violations}; implement the feasible branch directly instead of "
+            "silently catching the import and running another model"
+        ]
+
     @classmethod
     def _tuning_lock_issues(
         cls, code: str, parent_code: str, model_card: dict
@@ -728,11 +811,29 @@ Current copied artifact:
         allowed_suffixes = {
             ".py", ".json", ".yaml", ".yml", ".txt",
         }
+        unverified_artifact_files = set()
+        for card_path in parent_node_dir.glob("*.json"):
+            if card_path.name in excluded or card_path.is_symlink():
+                continue
+            try:
+                card = json.loads(card_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, TypeError):
+                continue
+            if (
+                isinstance(card, dict)
+                and card.get("artifact_id")
+                and card.get("code_path")
+                and card.get("verified") is not True
+            ):
+                unverified_artifact_files.update(
+                    {card_path.name, str(card["code_path"])}
+                )
         for source in parent_node_dir.iterdir():
             if (
                 not source.is_file()
                 or source.is_symlink()
                 or source.name in excluded
+                or source.name in unverified_artifact_files
                 or source.suffix.lower() not in allowed_suffixes
             ):
                 continue
@@ -749,6 +850,7 @@ Current copied artifact:
         technique_record: dict,
         task_dir: Path,
         timeout: Optional[float] = None,
+        stall_seconds: float = 1800.0,
         metric_direction: str = "maximize",
         base_algorithm_path: Optional[Path] = None,
         parent_node_dir: Optional[Path] = None,
@@ -758,10 +860,12 @@ Current copied artifact:
         accelerator: str = "cpu",
         available_accelerators: Optional[set[str]] = None,
         tuning_context: Optional[dict] = None,
-        max_debug_attempts: int = 2,
+        max_debug_attempts: int = 3,
+        metric_name: Optional[str] = None,
+        baseline_dir: Optional[Path] = None,
     ) -> Dict[str, Any]:
         """
-        1. Reads task skeletons from task_dir.
+        1. Reads immutable task inputs and run-owned baseline skeletons.
         2. Calls LLM to generate updated code wiring the artifact in.
         3. Writes it to node_dir / "algorithm.py".
         4. Runs it and parses result.json for the evaluation metric score.
@@ -769,10 +873,16 @@ Current copied artifact:
         Args:
             node_dir: Directory for this node's run outputs
             technique_record: Dict from TechniqueAgent with plan/model_card
-            task_dir: Task directory with initial code and data
-            timeout: Optional subprocess timeout in seconds. Normal search nodes
-                pass ``None`` and have no inactivity or wall-clock execution limit.
+            task_dir: Read-only task directory with description/config/data
+            baseline_dir: Run directory with generated starter code/report.
+                The task directory is used only as a legacy read fallback.
+            timeout: Optional hard runtime limit reserved for focused direct
+                callers. Normal workflow nodes always pass ``None``.
+            stall_seconds: Renewable progress-lease duration. Total runtime is
+                unlimited while output, artifacts, or process activity continue.
             metric_direction: "maximize" or "minimize" — used in the prompt
+            metric_name: Harness metric resolved by the manager. When omitted,
+                infer it from task configuration or description.
         """
         if timeout is not None and (
             not isinstance(timeout, (int, float))
@@ -782,6 +892,16 @@ Current copied artifact:
         ):
             raise ValueError(
                 f"timeout must be None or a positive finite number, got {timeout!r}"
+            )
+        if (
+            not isinstance(stall_seconds, (int, float))
+            or isinstance(stall_seconds, bool)
+            or not math.isfinite(float(stall_seconds))
+            or stall_seconds <= 0
+        ):
+            raise ValueError(
+                "stall_seconds must be a positive finite number, "
+                f"got {stall_seconds!r}"
             )
         if metric_direction not in {"maximize", "minimize"}:
             raise ValueError(
@@ -802,6 +922,10 @@ Current copied artifact:
             raise ValueError(
                 f"Selected accelerator {accelerator!r} is not exposed by this run"
             )
+        task_dir = Path(task_dir)
+        baseline_source = (
+            Path(baseline_dir) if baseline_dir is not None else task_dir
+        )
         node_dir.mkdir(parents=True, exist_ok=True)
         run_started = time.monotonic()
         execution_resource = {
@@ -809,7 +933,9 @@ Current copied artifact:
             "available_accelerators": sorted(exposed_accelerators),
             "environment_variable": "AIBUILDAI_ACCELERATOR",
             "fallback": "cpu",
-            "subprocess_timeout_seconds": timeout,
+            "execution_mode": "renewable_progress_lease",
+            "total_runtime_limit_seconds": timeout,
+            "progress_stall_seconds": float(stall_seconds),
         }
         with open(node_dir / "execution_resource.json", "w", encoding="utf-8") as f:
             json.dump(execution_resource, f, indent=2)
@@ -819,7 +945,7 @@ Current copied artifact:
         )
         
         # Copy dataloader to node_dir so imports work locally
-        src_loader = task_dir / "initial_dataloader.py"
+        src_loader = baseline_source / "initial_dataloader.py"
         dest_loader = node_dir / "initial_dataloader.py"
         if src_loader.exists():
             shutil.copy(src_loader, dest_loader)
@@ -864,21 +990,33 @@ Current copied artifact:
         # Descendants evolve the measured parent implementation. Only root-level
         # candidates start from the generated baseline.
         src_algo = Path(base_algorithm_path) if base_algorithm_path else (
-            task_dir / "initial_algorithm.py"
+            baseline_source / "initial_algorithm.py"
         )
         if not src_algo.is_file():
             raise FileNotFoundError(f"Base algorithm does not exist: {src_algo}")
         with open(src_algo, 'r', encoding='utf-8') as f:
             original_code = f.read()
             
-        # Load task config for metric info
-        config_file = task_dir / "task_config.json"
-        metric_name = "score"
-        if config_file.exists():
-            with open(config_file, 'r', encoding='utf-8') as f:
-                task_config = json.load(f)
-            metric_name = task_config.get("metric_name", "score")
-            metric_direction = task_config.get("metric_direction", metric_direction)
+        # Direct callers may omit the metric; tree-search callers pass the
+        # manager's already-resolved value so generation and validation agree.
+        if metric_name is None:
+            config_file = task_dir / "task_config.json"
+            metric_name = "score"
+            if config_file.exists():
+                with open(config_file, 'r', encoding='utf-8') as f:
+                    task_config = json.load(f)
+                metric_name = task_config.get("metric_name", "score")
+                metric_direction = task_config.get(
+                    "metric_direction", metric_direction
+                )
+            else:
+                description_file = task_dir / "task_description.md"
+                if description_file.exists():
+                    metric_name, metric_direction = (
+                        infer_metric_from_description(
+                            description_file.read_text(encoding="utf-8")
+                        )
+                    )
             
         # Never execute an artifact that failed verification.
         if model_card and model_card.get("verified") is not True:
@@ -888,7 +1026,7 @@ Current copied artifact:
             
         # Get dataset analysis report to pass to LLM
         dataset_snapshot = ""
-        report_file = task_dir / "dataset_analysis_report.txt"
+        report_file = baseline_source / "dataset_analysis_report.txt"
         try:
             if report_file.exists():
                 with open(report_file, 'r', encoding='utf-8') as f:
@@ -897,6 +1035,7 @@ Current copied artifact:
                 from .data_analyzer import run_dataset_analysis
                 print(f"ImplementationAgent: Checking/running dataset analysis fallback for {task_dir.name}...")
                 analysis_report = run_dataset_analysis(task_dir)
+                report_file = node_dir / "dataset_analysis_report.txt"
                 with open(report_file, 'w', encoding='utf-8') as f:
                     f.write(analysis_report)
                     
@@ -999,7 +1138,13 @@ Current copied artifact:
             "and train final test-prediction models on all X_eval rows. Save one OOF prediction per scheduled "
             "row to oof_predictions.csv with columns row_id,target,prediction. Do not create a separate split.\n"
             "Fit every imputer, encoder, scaler, feature selector, and target-dependent transform on training folds only. "
-            "Never use test-set statistics or target values in feature generation. Use stratification for classification.\n"
+            "Never use test-set statistics or target values in feature generation. Define feature engineering once and "
+            "apply it symmetrically to fold-train, fold-validation, full-evaluation, and test frames. Keep raw columns "
+            "separate from engineered columns; transform test data before aligning it to transformed training columns. "
+            "Use stratification for classification.\n"
+            "Emit and flush a concise progress line before and after every fold, "
+            "training stage, and tuning trial so the workflow can distinguish "
+            "healthy long-running work from a stalled process.\n"
             "When practical, save validation predictions to 'oof_predictions.csv' with columns row_id,target,prediction.\n"
             f"IMPORTANT: At the END of your script, write a JSON file 'result.json' in the current directory:\n"
             f'  import json; json.dump({{"score": <float>, "metric": "{metric_name}", "direction": "{metric_direction}", '
@@ -1047,6 +1192,9 @@ Current copied artifact:
 
         guard_issues = inspect_generated_code(clean_code)
         guard_issues.extend(self._resource_limit_issues(clean_code, fidelity_profile))
+        guard_issues.extend(
+            self._dependency_fallback_issues(clean_code, technique_record)
+        )
         if operator == "tune" and tuning_context:
             guard_issues.extend(
                 self._tuning_lock_issues(clean_code, original_code, model_card)
@@ -1082,6 +1230,11 @@ Code:
             remaining_issues.extend(
                 self._resource_limit_issues(clean_code, fidelity_profile)
             )
+            remaining_issues.extend(
+                self._dependency_fallback_issues(
+                    clean_code, technique_record
+                )
+            )
             if operator == "tune" and tuning_context:
                 remaining_issues.extend(
                     self._tuning_lock_issues(
@@ -1112,6 +1265,12 @@ Code:
         stderr = ""
         exit_code = 0
         timeout_kill = False
+        execution_stalled = False
+        hard_limit_reached = False
+        termination_reason = None
+        progress_events = 0
+        last_progress_source = "not_started"
+        last_progress_age_seconds = 0.0
         diagnostics = ""
         result_data: Dict[str, Any] = {}
         artifact_repair_attempted = False
@@ -1210,6 +1369,9 @@ Code:
                     "This helps trace execution logical errors correctly.\n"
                     "Ensure the output is valid Python code wrapped in a ```python block.\n"
                     "Fit preprocessing on training folds only; never derive preprocessing statistics from test data.\n"
+                    "Apply the same fitted feature transformation to training, validation, and test frames. "
+                    "Transform raw test data before reindexing it to engineered training columns, and assert exact "
+                    "post-transform feature parity before prediction.\n"
                     "Keep using evaluation_contract.prepare_evaluation_data and its supplied fold_ids exactly; "
                     "write complete OOF predictions for the scheduled rows.\n"
                     f"The selected accelerator is {accelerator}, exposed as AIBUILDAI_ACCELERATOR. Preserve "
@@ -1231,7 +1393,7 @@ Code:
                 ```
 
                 Subprocess Exit Code: {exit_code}
-                Subprocess Timeout: {timeout_kill}
+                Automatic execution stop: {termination_reason or "none"}
 
                 Traceback / Error Output (stderr):
                 ```
@@ -1277,6 +1439,11 @@ Code:
                 debug_guard_issues.extend(
                     self._resource_limit_issues(clean_code, fidelity_profile)
                 )
+                debug_guard_issues.extend(
+                    self._dependency_fallback_issues(
+                        clean_code, technique_record
+                    )
+                )
                 if operator == "tune" and tuning_context:
                     debug_guard_issues.extend(
                         self._tuning_lock_issues(
@@ -1291,6 +1458,9 @@ Code:
                     stdout = ""
                     exit_code = -2
                     timeout_kill = False
+                    execution_stalled = False
+                    hard_limit_reached = False
+                    termination_reason = "static_guard_rejected_revision"
                     attempt += 1
                     continue
 
@@ -1298,12 +1468,13 @@ Code:
                     f.write(clean_code.strip())
                 print(f"ImplementationAgent: Wrote revised glue code to {dest_code_file}")
 
-            # Execute with activity-based watchdog timeout
+            # Execute under a renewable progress lease. There is no total
+            # workflow runtime ceiling; focused direct callers may still supply
+            # ``timeout`` as an explicit test/integration limit.
             timeout_kill = False
-            stdout_lines = []
-            stderr_lines = []
-            
-            import fcntl
+            execution_stalled = False
+            hard_limit_reached = False
+            termination_reason = None
 
             # Do not accept stale outputs from an earlier run in the same node folder.
             result_json_path = node_dir / "result.json"
@@ -1333,121 +1504,35 @@ Code:
                     ),
                 }
             )
-            proc = subprocess.Popen(
+            execution = run_supervised_process(
                 cmd,
                 cwd=node_dir,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
                 env=child_env,
-                start_new_session=True,
+                stall_seconds=float(stall_seconds),
+                hard_limit_seconds=(
+                    float(timeout) if timeout is not None else None
+                ),
+                activity_root=node_dir,
+                stdout_stream=sys.stdout,
+                stderr_stream=sys.stderr,
+                label="ImplementationAgent",
             )
-
-            def terminate_process_group() -> None:
-                try:
-                    os.killpg(proc.pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    return
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    try:
-                        os.killpg(proc.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-            
-            # Make stdout/stderr non-blocking
-            for fd in (proc.stdout, proc.stderr):
-                fl = fcntl.fcntl(fd, fcntl.F_GETFL)
-                fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
-                
-            start_time = time.time()
-            last_output_time = time.time()
-            # Search nodes run without a wall-clock or inactivity limit. The
-            # optional timeout remains available only for explicit direct callers
-            # (for example, focused safety tests or external integrations).
-            hard_timeout = float(timeout) if timeout is not None else None
-            inactivity_timeout = (
-                min(1200.0, hard_timeout) if hard_timeout is not None else None
-            )
-            
-            while True:
-                ret = proc.poll()
-                
-                # Read non-blocking stdout bytes
-                try:
-                    out = proc.stdout.read()
-                    if out:
-                        decoded_out = out.decode('utf-8', errors='replace')
-                        stdout_lines.append(decoded_out)
-                        last_output_time = time.time()
-                        sys.stdout.write(decoded_out)
-                        sys.stdout.flush()
-                except IOError:
-                    pass
-                    
-                # Read non-blocking stderr bytes
-                try:
-                    err = proc.stderr.read()
-                    if err:
-                        decoded_err = err.decode('utf-8', errors='replace')
-                        stderr_lines.append(decoded_err)
-                        last_output_time = time.time()
-                        sys.stderr.write(decoded_err)
-                        sys.stderr.flush()
-                except IOError:
-                    pass
-                    
-                if ret is not None:
-                    # Flush remaining buffers
-                    try:
-                        out = proc.stdout.read()
-                        if out:
-                            decoded_out = out.decode('utf-8', errors='replace')
-                            stdout_lines.append(decoded_out)
-                    except IOError:
-                        pass
-                    try:
-                        err = proc.stderr.read()
-                        if err:
-                            decoded_err = err.decode('utf-8', errors='replace')
-                            stderr_lines.append(decoded_err)
-                    except IOError:
-                        pass
-                    exit_code = ret
-                    break
-                    
-                now = time.time()
-                elapsed = now - start_time
-                inactive_elapsed = now - last_output_time
-                
-                if (
-                    inactivity_timeout is not None
-                    and inactive_elapsed > inactivity_timeout
-                ):
-                    print(f"\nImplementationAgent: INACTIVITY TIMEOUT after {inactivity_timeout}s with no output. Killing process.")
-                    terminate_process_group()
-                    exit_code = -1
-                    timeout_kill = True
-                    break
-                    
-                if hard_timeout is not None and elapsed > hard_timeout:
-                    print(f"\nImplementationAgent: HARD TIMEOUT ceiling of {hard_timeout}s reached. Killing process.")
-                    terminate_process_group()
-                    exit_code = -1
-                    timeout_kill = True
-                    break
-                    
-                time.sleep(0.1)
-
-            stdout = "".join(stdout_lines)
-            stderr = "".join(stderr_lines)
-            if timeout_kill:
+            exit_code = execution.returncode
+            stdout = execution.stdout
+            stderr = execution.stderr
+            execution_stalled = execution.stalled
+            hard_limit_reached = execution.hard_limit_reached
+            termination_reason = execution.termination_reason
+            progress_events = execution.progress_events
+            last_progress_source = execution.last_progress_source
+            last_progress_age_seconds = execution.last_progress_age_seconds
+            timeout_kill = execution_stalled or hard_limit_reached
+            if hard_limit_reached:
                 stderr = (
                     stderr
-                    + f"\nExecution attempt exceeded the {hard_timeout:.1f}s runtime limit."
+                    + "\nExecution stopped at the explicit direct-call runtime "
+                    f"limit of {float(timeout):.1f}s."
                 ).strip()
-            proc.stdout.close()
-            proc.stderr.close()
                 
             # Preserve individual failed-attempt diagnostics. error.log is reserved
             # for the final failed state so recovered nodes are not mislabeled.
@@ -1455,7 +1540,10 @@ Code:
             if stderr.strip() or exit_code != 0 or timeout_kill:
                 attempt_log_path = node_dir / f"attempt_{attempt + 1}.log"
                 with open(attempt_log_path, 'w', encoding='utf-8') as f:
-                    f.write(f"Attempt={attempt + 1}\nexit_code={exit_code}\ntimeout_kill={timeout_kill}\n\n")
+                    f.write(
+                        f"Attempt={attempt + 1}\nexit_code={exit_code}\n"
+                        f"termination_reason={termination_reason}\n\n"
+                    )
                     f.write("=== STDERR ===\n")
                     f.write(stderr)
                     f.write("\n\n=== STDOUT ===\n")
@@ -1591,7 +1679,7 @@ Code:
             with open(attempt_log_path, "w", encoding="utf-8") as f:
                 f.write(
                     f"Attempt={attempt + 1}\nexit_code={exit_code}\n"
-                    f"timeout_kill={timeout_kill}\n\n"
+                    f"termination_reason={termination_reason}\n\n"
                 )
                 f.write("=== STDERR ===\n")
                 f.write(stderr)
@@ -1605,10 +1693,16 @@ Code:
             status = "failed"
             score = None
             score_source = "none"
-            if timeout_kill:
+            if execution_stalled:
                 print(
-                    f"ImplementationAgent: FAILED — timeout after {timeout}s "
-                    f"(exit_code={exit_code})"
+                    "ImplementationAgent: FAILED — execution stopped after the "
+                    "progress lease detected a stalled process "
+                    f"(exit_code={exit_code})."
+                )
+            elif hard_limit_reached:
+                print(
+                    "ImplementationAgent: FAILED — explicit direct-call runtime "
+                    f"limit reached (exit_code={exit_code})."
                 )
             else:
                 print(f"ImplementationAgent: FAILED — subprocess crashed (exit_code={exit_code}). "
@@ -1620,7 +1714,7 @@ Code:
         else:
             (node_dir / "error.log").unlink(missing_ok=True)
             print(f"ImplementationAgent: Execution completed — exit_code={exit_code}, score={score}, "
-                  f"source={score_source}, timeout_kill={timeout_kill}")
+                  f"source={score_source}, progress_events={progress_events}")
 
         if status == "failed":
             with open(node_dir / "error.log", "w", encoding="utf-8") as f:
@@ -1632,6 +1726,12 @@ Code:
             else None
         )
         execution_resource["reported_accelerator"] = actual_accelerator
+        execution_resource["last_execution"] = {
+            "termination_reason": termination_reason,
+            "progress_events": progress_events,
+            "last_progress_source": last_progress_source,
+            "last_progress_age_seconds": last_progress_age_seconds,
+        }
         with open(node_dir / "execution_resource.json", "w", encoding="utf-8") as f:
             json.dump(execution_resource, f, indent=2)
             f.write("\n")
@@ -1654,6 +1754,11 @@ Code:
             "score": score,
             "score_source": score_source,
             "exit_code": exit_code,
+            "execution_stalled": execution_stalled,
+            "hard_limit_reached": hard_limit_reached,
+            "termination_reason": termination_reason,
+            "progress_events": progress_events,
+            "last_progress_source": last_progress_source,
             "timeout_kill": timeout_kill,
             "stdout": stdout,
             "stderr": stderr,
@@ -1668,6 +1773,9 @@ Code:
             "selected_accelerator": accelerator,
             "tuning": tuning_summary,
             "artifact_repair": artifact_repair_summary,
+            "implementation_families": sorted(
+                self._model_family_imports(clean_code)
+            ),
             "elapsed_seconds": time.monotonic() - run_started,
             "validation": {
                 key: result_data.get(key)

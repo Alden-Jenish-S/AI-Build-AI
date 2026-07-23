@@ -1,0 +1,84 @@
+{
+  "artifact_id": "screen_histgradientboosting_regressor",
+  "category": "tabular_regression",
+  "description": "Screen\u2011fidelity regression pipeline that performs K\u2011fold target encoding, median imputation, quantile scaling, interaction feature creation and trains a HistGradientBoostingRegressor.",
+  "interface": {
+    "entrypoint": "run_screen_hist_gb(X_train, X_test, y_train=None, target_column='loss')",
+    "output_contract": {
+      "kind": "predictions",
+      "aligned_to": "X_test",
+      "value_type": "continuous"
+    }
+  },
+  "capabilities": {
+    "supported_operators": [
+      "refine",
+      "tune",
+      "diversify"
+    ],
+    "tunable_parameters": [
+      "max_depth",
+      "learning_rate",
+      "max_iter",
+      "max_bins"
+    ],
+    "gpu_accelerated": false,
+    "supported_accelerators": [
+      "cpu"
+    ],
+    "input_types": [
+      "numeric",
+      "categorical",
+      "missing"
+    ],
+    "target_types": [
+      "regression"
+    ]
+  },
+  "scope": "model_family",
+  "resource_profile": {
+    "accelerator": "cpu",
+    "min_ram_gb": 2,
+    "estimated_runtime_seconds": 60
+  },
+  "dependencies": [
+    "numpy",
+    "pandas",
+    "scikit-learn",
+    "category_encoders"
+  ],
+  "verified": true,
+  "verification_log": "Passed subprocess verification at 2026-07-19 20:15:46.\nOutput:\nFunction returned type: ndarray\nReturned tabular lengths: [30]\nSUCCESS\n\n<HOME>/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/.venv/lib/python3.11/site-packages/joblib/_multiprocessing_helpers.py:44: UserWarning: [Errno 1] Operation not permitted.  joblib will operate in serial mode\n  warnings.warn(\"%s.  joblib will operate in serial mode\" % (e,))\n<HOME>/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/.venv/lib/python3.11/site-packages/sklearn/experimental/enable_hist_gradient_boosting.py:18: UserWarning: Since version 1.0, it is not needed to import enable_hist_gradient_boosting anymore. HistGradientBoostingClassifier and HistGradientBoostingRegressor are now stable and can be normally imported from sklearn.ensemble.\n  warnings.warn(\n<HOME>/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/.venv/lib/python3.11/site-packages/sklearn/preprocessing/_data.py:2846: UserWarning: n_quantiles (1000) is greater than the total number of samples (32). n_quantiles is set to n_samples.\n  warnings.warn(\n<HOME>/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/.venv/lib/python3.11/site-packages/sklearn/preprocessing/_data.py:2846: UserWarning: n_quantiles (1000) is greater than the total number of samples (33). n_quantiles is set to n_samples.\n  warnings.warn(\n<HOME>/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/.venv/lib/python3.11/site-packages/sklearn/preprocessing/_data.py:2846: UserWarning: n_quantiles (1000) is greater than the total number of samples (65). n_quantiles is set to n_samples.\n  warnings.warn(",
+  "code_path": "screen_histgradientboosting_regressor.py",
+  "verification_level": "contract-mock-data",
+  "verification_isolation": "sandbox-exec",
+  "builder_verification_attempts": [
+    {
+      "attempt": 1,
+      "status": "verification_failed",
+      "diagnostics": "Verifying artifact: screen_histgradientboosting_regressor.json\nArtifact screen_histgradientboosting_regressor failed sandbox verification!\nLog:\nFAILURE:\n\n<HOME>/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/.venv/lib/python3.11/site-packages/joblib/_multiprocessing_helpers.py:44: UserWarning: [Errno 1] Operation not permitted.  joblib will operate in serial mode\n  warnings.warn(\"%s.  joblib will operate in serial mode\" % (e,))\n<HOME>/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/.venv/lib/python3.11/site-packages/sklearn/experimental/enable_hist_gradient_boosting.py:18: UserWarning: Since version 1.0, it is not needed to import enable_hist_gradient_boosting anymore. HistGradientBoostingClassifier and HistGradientBoostingRegressor are now stable and can be normally imported from sklearn.ensemble.\n  warnings.warn(\nTraceback (most recent call last):\n  File \"<TEMP_PATH>\", line 149, in <module>\n    result = run_screen_hist_gb(**kwargs)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"<WORKDIR>/screen_histgradientboosting_regressor.py\", line 237, in run_screen_hist_gb\n    model.fit(X, y)\n  File \"<WORKDIR>/screen_histgradientboosting_regressor.py\", line 111, in fit\n    X_enc = _target_encode_cv(X, y, cat_cols, n_splits=2, random_state=self.random_state)\n            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"<WORKDIR>/screen_histgradientboosting_regressor.py\", line 47, in _target_encode_cv\n    y_tr = y.iloc[train_idx]\n           ^^^^^^\nAttributeError: 'numpy.ndarray' object has no attribute 'iloc'\n\n\n"
+    },
+    {
+      "attempt": 2,
+      "status": "verification_failed",
+      "diagnostics": "Verifying artifact: screen_histgradientboosting_regressor.json\nArtifact screen_histgradientboosting_regressor failed sandbox verification!\nLog:\nFAILURE:\n\n<HOME>/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/.venv/lib/python3.11/site-packages/joblib/_multiprocessing_helpers.py:44: UserWarning: [Errno 1] Operation not permitted.  joblib will operate in serial mode\n  warnings.warn(\"%s.  joblib will operate in serial mode\" % (e,))\n<HOME>/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/.venv/lib/python3.11/site-packages/sklearn/experimental/enable_hist_gradient_boosting.py:18: UserWarning: Since version 1.0, it is not needed to import enable_hist_gradient_boosting anymore. HistGradientBoostingClassifier and HistGradientBoostingRegressor are now stable and can be normally imported from sklearn.ensemble.\n  warnings.warn(\n<HOME>/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/.venv/lib/python3.11/site-packages/sklearn/preprocessing/_data.py:2846: UserWarning: n_quantiles (1000) is greater than the total number of samples (32). n_quantiles is set to n_samples.\n  warnings.warn(\nTraceback (most recent call last):\n  File \"<TEMP_PATH>\", line 149, in <module>\n    result = run_screen_hist_gb(**kwargs)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"<WORKDIR>/screen_histgradientboosting_regressor.py\", line 228, in run_screen_hist_gb\n    model.fit(X, y)\n  File \"<WORKDIR>/screen_histgradientboosting_regressor.py\", line 166, in fit\n    self.fold_rmse_.append(mean_squared_error(y_val, preds, squared=False))\n                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"<HOME>/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/.venv/lib/python3.11/site-packages/sklearn/utils/_param_validation.py\", line 196, in wrapper\n    params = func_sig.bind(*args, **kwargs)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/opt/anaconda3/lib/python3.11/inspect.py\", line 3195, in bind\n    return self._bind(args, kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/opt/anaconda3/lib/python3.11/inspect.py\", line 3184, in _bind\n    raise TypeError(\nTypeError: got an unexpected keyword argument 'squared'\n\n\n"
+    },
+    {
+      "attempt": 3,
+      "status": "verified"
+    }
+  ],
+  "task_validations": [
+    {
+      "task_name": "playground-series",
+      "node_id": "node_15",
+      "score": 7.909017556937547,
+      "metric_direction": "minimize",
+      "status": "completed",
+      "reward": 0.0033626177756613,
+      "fidelity": "screen",
+      "elapsed_seconds": 71.59533099998953,
+      "improved_over_baseline": true
+    }
+  ]
+}

@@ -89,6 +89,72 @@
       "fidelity": "full",
       "elapsed_seconds": 36.80679274999784,
       "improved_over_baseline": true
+    },
+    {
+      "task_name": "playground-series",
+      "node_id": "node_2",
+      "score": 7.89474843575711,
+      "metric_direction": "minimize",
+      "status": "completed",
+      "reward": 7.945883217207051e-05,
+      "fidelity": "screen",
+      "elapsed_seconds": 32.34668474999489,
+      "improved_over_baseline": true
+    },
+    {
+      "task_name": "playground-series",
+      "node_id": "node_6",
+      "score": 7.887988868828205,
+      "metric_direction": "minimize",
+      "status": "completed",
+      "reward": 0.00108745177328256,
+      "fidelity": "screen",
+      "elapsed_seconds": 54.746288666996406,
+      "improved_over_baseline": true
+    },
+    {
+      "task_name": "playground-series",
+      "node_id": "node_10",
+      "score": 7.887988868828205,
+      "metric_direction": "minimize",
+      "status": "no_effect",
+      "reward": -0.1,
+      "fidelity": "screen",
+      "elapsed_seconds": 49.083201540997834,
+      "improved_over_baseline": true
+    },
+    {
+      "task_name": "playground-series",
+      "node_id": "node_3",
+      "score": 7.9056211122213975,
+      "metric_direction": "minimize",
+      "status": "completed",
+      "reward": -0.0008214346660707076,
+      "fidelity": "screen",
+      "elapsed_seconds": 28.79481358299381,
+      "improved_over_baseline": false
+    },
+    {
+      "task_name": "playground-series",
+      "node_id": "node_11",
+      "score": 7.864238446284728,
+      "metric_direction": "minimize",
+      "status": "completed",
+      "reward": 0.004037263018838068,
+      "fidelity": "medium",
+      "elapsed_seconds": 34.66316562501015,
+      "improved_over_baseline": true
+    },
+    {
+      "task_name": "playground-series",
+      "node_id": "node_18",
+      "score": 7.86289110160764,
+      "metric_direction": "minimize",
+      "status": "completed",
+      "reward": 0.00428634006889941,
+      "fidelity": "medium",
+      "elapsed_seconds": 336.3099362089997,
+      "improved_over_baseline": true
     }
   ],
   "verification_level": "contract-mock-data"

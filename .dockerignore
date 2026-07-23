@@ -1,0 +1,66 @@
+# Git
+.git
+.gitignore
+.gitattributes
+
+# Docker build files
+Dockerfile
+.dockerignore
+
+# Python cache and environments
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+ENV/
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+credentials/
+
+# Logs and generated outputs
+*.log
+logs/
+outputs/
+results/
+artifacts/
+runs/
+checkpoints/
+
+# Notebooks and local tooling
+.ipynb_checkpoints/
+.vscode/
+.idea/
+.DS_Store
+
+# Documentation & tests
+README*
+docs/
+tests/
+ARCHITECTURE*
+
+# Temporary files
+*.tmp
+*.swp
+*.swo
+.cache/
+tmp/
+
+
+*.bin
+*.onnx
+*.pt
+*.safetensors
+*.tar.gz
+node_modules/

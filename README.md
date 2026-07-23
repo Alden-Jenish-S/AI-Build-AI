@@ -9,10 +9,14 @@ This repository is a tabular-ML research prototype inspired by AIBuildAI-2. It e
 - **Experiment-based budgets:** only attempted implementation runs consume `--budget`; technique planning does not.
 - **Harness-owned evaluation:** deterministic row subsets and folds enforce `screen`, `medium`, and `full` fidelity. Full fidelity restores loader-held validation rows instead of silently training on only 80% of the data.
 - **Validation safeguards:** generated code is checked for leakage, and the harness recomputes fold scores and uncertainty from aligned OOF predictions.
+- **Schema-driven datasets:** task-owned files are inventoried before code generation. Conventional names are optional, explicit role overrides are supported, and a single unlabeled table is handled as an unsupervised clustering population rather than forced into a train/test contract.
+- **Read-only task inputs:** `tasks/<task>/` contains only descriptions, configuration, datasets, and optional submission templates. Analysis reports, generated code, predictions, logs, and evaluation summaries are written under `runs/<task>/`.
+- **Run-owned input views:** each execution gets a local `input/` directory with file-level links. This prevents generated cache/output files from landing in a task-owned `input/` directory, and the static execution guard rejects explicit writes to task-input paths.
 - **Empirical memory:** bounded pool retrieval ranks scope-compatible artifacts with lexical fit, prior reward, improvement rate, and a UCB-style exploration bonus.
+- **Durable web research:** every pool-miss discovery is recorded before artifact generation, including failed verification, while verified artifacts are committed to L2 and immediately refreshed into the current run's L1 index.
 - **Feasibility-aware execution:** declared accelerator, RAM, and allowlisted dependencies are checked before execution. Runtime estimates are informational. If an optional artifact cannot be installed, ordinary branches attempt a dependency-light equivalent; model-locked tuning nodes are safely skipped.
 - **GPU-preferred nodes:** CUDA is selected ahead of MPS and CPU when available, propagated into every node subprocess, and used by compatible pool artifacts with a safe CPU fallback.
-- **Reliable neural execution:** neural artifacts are verified against mixed-type data with missing values and use fold-local imputation/encoding, `float32` mini-batches, early stopping, device-safe prediction, and CPU retry paths.
+- **Reliable neural execution:** neural artifacts are verified against mixed-type data with missing values and use fold-local imputation/encoding, `float32` mini-batches, early stopping, device-safe prediction, and CPU retry paths. A selected DL artifact must itself generate the scored fold predictions; substituting a simpler proxy model for evaluation is rejected.
 - **Failure-focused repair:** each failed implementation can receive `max_debug_attempts` deterministic repairs after it exits; implementation nodes have no inactivity or wall-clock timeout, and failed attempts retain their own logs.
 - **Winner fine-tuning:** a qualifying node is tuned as a separate experiment while preserving its model/artifact, preprocessing, features, and folds. Trial counts and selected hyperparameters are validated against fidelity caps.
 - **Effect-aware execution:** descendants with byte-identical parent OOF and test predictions are marked `no_effect`, penalized, deduplicated on disk, and prevented from spawning more branches.
@@ -46,9 +50,15 @@ Each task may define `tasks/<task_name>/task_config.json`:
 
 ```json
 {
+  "task_type": "classification",
+  "train_file": "observations_labeled.csv",
+  "test_file": "observations_holdout.csv",
+  "sample_submission_file": "prediction_template.csv",
+  "target_column": "target",
   "metric_name": "roc_auc",
   "metric_direction": "maximize",
-  "subprocess_timeout": 300,
+  "baseline_fidelity": "screen",
+  "progress_stall_seconds": 1800,
   "max_debug_attempts": 2,
   "max_fine_tune_rounds": 2,
   "enable_multi_fidelity": true,
@@ -64,21 +74,40 @@ Each task may define `tasks/<task_name>/task_config.json`:
 }
 ```
 
+The file-role keys are optional. The analyzer scans supported tabular files in the
+task root or `input/`, inventories their schemas, and uses explicit configuration
+only when the layout is ambiguous. Basenames such as `train.csv` and `test.csv` are
+recognized as hints, not required contracts. For a single unlabeled clustering
+population, set `"task_type": "unsupervised_clustering"` and optionally
+`"data_file": "observations.csv"`. Task descriptions that clearly state an
+unsupervised problem are detected automatically.
+
+For unlabeled clustering tasks such as `tabular-playground-series-jul-2022`, hidden
+Adjusted Rand Index labels are unavailable to the local harness. Search is therefore
+ranked with deterministic, independently recomputed fold silhouette scores while the
+submission still contains integer cluster assignments for the external ARI scorer.
+The proxy is reported explicitly and is not presented as the competition score.
+
 `preferred_accelerator` accepts `auto`, `gpu`, `cuda`, `mps`, or `cpu`. `auto`/`gpu` choose
 CUDA first, then Apple MPS, then CPU. An optional `accelerators` list restricts
 the detected devices but never fabricates an unavailable device. Each node receives
 the selection through `AIBUILDAI_ACCELERATOR` and records it in
 `execution_resource.json`; successful node results also report the backend actually
-used. Accelerator availability is re-probed in the selected project interpreter after
+used. Child processes begin with `AIBUILDAI_ACTUAL_ACCELERATOR=cpu`; compatible
+models change it only after activating CUDA/MPS, so a requested but unusable GPU is
+never falsely reported. Accelerator availability is re-probed in the selected project interpreter after
 node dependencies are installed, so a newly installed PyTorch backend can expose
 CUDA/MPS before execution. CatBoost, XGBoost, LightGBM, and PyTorch pool artifacts
 enable their native backend when compatible and retry on CPU if the installed package
 lacks GPU support. `max_ram_gb` is a cap on detected memory, so the example is sized
 for a 32 GB worker without overstating smaller machines.
 
-`subprocess_timeout` applies to the generated comparison baseline only. Search-tree
-implementation nodes have no inactivity or wall-clock subprocess limit, allowing
-long-running GPU training to finish. All debug attempts still count as one
+`baseline_fidelity` defaults to `screen`, keeping the generated comparison baseline
+bounded to the same 25%/two-fold profile used by initial search experiments. Set it
+to `medium` or `full` only when the extra baseline cost is intentional.
+`progress_stall_seconds` is a renewable inactivity lease for baseline and search
+processes; observable output or run-file activity renews it, so healthy long-running
+training has no fixed wall-clock cutoff. All debug attempts still count as one
 implementation experiment.
 `max_debug_attempts` controls the number of repairs after the first run.
 `max_fine_tune_rounds` bounds successive winner-tuning experiments along a lineage.
@@ -120,8 +149,19 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
+# Optional verification on an NVIDIA TITAN Xp worker:
+python -c "import torch; arches=torch._C._cuda_getArchFlags().split(); print(torch.__version__, torch.version.cuda, arches); assert torch.version.cuda == '12.6'; assert 'sm_61' in arches"
+
 python eval/run_ablation.py playground-series-s6e2 --budget 6
 ```
+
+On Linux/Windows x86_64, `requirements.txt` installs the official
+`torch==2.8.0+cu126` wheel. The CUDA 12.6 build includes Pascal `sm_61`, while
+the CUDA 12.8 wheel does not. Other platforms keep the ordinary `torch==2.8.0`
+build. Dependency setup uses the same project-controlled CUDA 12.6 index and
+rejects a CUDA wheel whose compiled architecture list omits `sm_61`. The check
+reads the wheel's compiled flags directly, so it also works during a Docker build
+where no NVIDIA device is exposed.
 
 Rerunning the same condition moves the previous condition directory under
 `runs/<task>/archive/` before writing new node artifacts. Every selected artifact,
@@ -153,8 +193,9 @@ The command creates:
 - `search_trace.jsonl`: frontier scores, exploration constant, selections, skips, no-effect decisions, and completed rewards.
 - `ensemble_manifest.json`: selected same-fidelity ensemble members.
 - `submission.csv`: final schema-aligned predictions.
-- `eval/results.md`: score, normalized improvement, experiment count, fidelity, token, pool, and overcome metrics.
+- `runs/<task>/results.md`: score, normalized improvement, experiment count, fidelity, token, pool, and overcome metrics.
 - `runs/<task>/token_usage.json`: aggregate and per-call input/output token usage, prompt sizes, and latency.
+- `memory_pool/web_discoveries/<discovery_id>.json`: durable web-search methodology, source/query provenance, and build/verification status, including unsuccessful candidates.
 
 ## Optional offline harness evolution
 
@@ -164,7 +205,7 @@ After collecting completed runs across several tasks and seeds:
 python eval/evolve_harness.py \
   runs/task_a/complete_system \
   runs/task_b/complete_system \
-  --output eval/harness_candidates.json
+  --output runs/harness_candidates.json
 ```
 
 This produces review-gated candidate changes. It intentionally does not edit prompts or control flow automatically; candidates should be accepted only after held-out multi-task evaluation.

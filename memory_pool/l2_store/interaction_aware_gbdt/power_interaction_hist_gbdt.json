@@ -1,0 +1,70 @@
+{
+  "artifact_id": "power_interaction_hist_gbdt",
+  "category": "interaction_aware_gbdt",
+  "description": "Node 21's executed methodology packaged as a reusable regressor: median imputation, scaling, Yeo-Johnson power transforms, target-ranked pairwise numeric interactions, and histogram gradient boosting.",
+  "interface": {
+    "entrypoint": "train_and_predict(X_train, X_test, y_train=None, n_top=10, max_interactions=45, max_iter=300, learning_rate=0.05, max_depth=6, l2_regularization=0.0, random_state=42)",
+    "output_contract": {
+      "kind": "predictions",
+      "aligned_to": "X_test",
+      "value_type": "continuous"
+    }
+  },
+  "capabilities": {
+    "supported_operators": [
+      "refine",
+      "tune",
+      "diversify"
+    ],
+    "tunable_parameters": [
+      "n_top",
+      "max_interactions",
+      "max_iter",
+      "learning_rate",
+      "max_depth",
+      "l2_regularization"
+    ],
+    "gpu_accelerated": false,
+    "supported_accelerators": [
+      "cpu"
+    ],
+    "input_types": [
+      "numeric",
+      "categorical",
+      "missing"
+    ],
+    "target_types": [
+      "regression"
+    ]
+  },
+  "scope": "full_pipeline",
+  "resource_profile": {
+    "accelerator": "cpu",
+    "min_ram_gb": 1,
+    "estimated_runtime_seconds": 60
+  },
+  "dependencies": [
+    "numpy",
+    "pandas",
+    "scikit-learn"
+  ],
+  "verified": true,
+  "verification_log": "Passed subprocess verification at 2026-07-19 19:49:12.\nOutput:\nFunction returned type: ndarray\nReturned tabular lengths: [30]\nSUCCESS\n\n<HOME>/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/.venv/lib/python3.11/site-packages/joblib/externals/loky/backend/context.py:131: UserWarning: Could not find the number of physical cores for the following reason:\ninvalid literal for int() with base 10: ''\nReturning the number of logical cores instead. You can silence this warning by setting LOKY_MAX_CPU_COUNT to the number of cores you want to use.\n  warnings.warn(\n  File \"<HOME>/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/.venv/lib/python3.11/site-packages/joblib/externals/loky/backend/context.py\", line 249, in _count_physical_cores\n    cpu_count_physical = _count_physical_cores_darwin()\n                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"<HOME>/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/.venv/lib/python3.11/site-packages/joblib/externals/loky/backend/context.py\", line 318, in _count_physical_cores_darwin\n    return int(cpu_info)\n           ^^^^^^^^^^^^^",
+  "code_path": "power_interaction_hist_gbdt.py",
+  "verification_level": "contract-mock-data",
+  "verification_isolation": "resource-limited-subprocess",
+  "task_validations": [
+    {
+      "task_name": "playground-series",
+      "node_id": "node_21",
+      "score": 7.923023312380641,
+      "metric_direction": "minimize",
+      "status": "completed",
+      "reward": 0.0015988878422252943,
+      "fidelity": "screen",
+      "elapsed_seconds": 36.06193604199507,
+      "improved_over_baseline": true,
+      "provenance": "post_run_extraction_of_executed_methodology"
+    }
+  ]
+}

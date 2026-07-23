@@ -14,6 +14,7 @@ import pandas as pd
 from agents.aggregator_agent import AggregatorAgent
 from agents.data_analyzer import run_dataset_analysis
 from agents.implementation_agent import ImplementationAgent
+from agents.initial_agent import InitialAgent
 from agents.llm_utils import (
     _resolve_llm_config,
     call_llm,
@@ -32,10 +33,15 @@ from eval.run_ablation import (
 from memory_pool.query_tool import infer_artifact_scope, query_l1, query_l2
 from memory_pool.builder.l2_builder import L2Builder
 from runtime_utils import (
+    SupervisedProcessResult,
+    absolute_path_without_symlink_resolution,
     accelerator_subprocess_env,
+    detect_available_accelerators,
     expose_task_data,
+    run_supervised_process,
     sanitized_subprocess_env,
     select_preferred_accelerator,
+    task_data_files,
     validate_path_component,
     validate_storage_identifier,
 )
@@ -50,6 +56,51 @@ from eval.metrics import calculate_ablation_metrics
 
 
 class RuntimeSafetyTests(unittest.TestCase):
+    def test_progress_lease_allows_jobs_to_outlive_stall_window(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run_dir = Path(temp_dir)
+            script = (
+                "import pathlib,time\n"
+                "p=pathlib.Path('training_progress.txt')\n"
+                "for i in range(6):\n"
+                " p.write_text(str(i))\n"
+                " time.sleep(0.07)\n"
+            )
+            result = run_supervised_process(
+                [sys.executable, "-c", script],
+                cwd=run_dir,
+                stall_seconds=0.15,
+                activity_root=run_dir,
+                resource_sample_seconds=0.03,
+                terminate_grace_seconds=0.2,
+                label="ProgressLeaseTest",
+            )
+
+            self.assertEqual(result.returncode, 0)
+            self.assertFalse(result.stalled)
+            self.assertGreater(result.elapsed_seconds, 0.3)
+            self.assertGreater(result.progress_events, 0)
+
+    def test_progress_lease_automatically_recycles_stalled_job(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            started = time.monotonic()
+            result = run_supervised_process(
+                [sys.executable, "-c", "import time; time.sleep(10)"],
+                cwd=Path(temp_dir),
+                stall_seconds=0.15,
+                activity_root=Path(temp_dir),
+                resource_sample_seconds=0.03,
+                terminate_grace_seconds=0.2,
+                label="StallTest",
+            )
+            elapsed = time.monotonic() - started
+
+            self.assertTrue(result.stalled)
+            self.assertEqual(result.termination_reason, "progress_stalled")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("automatically recycling", result.stderr)
+            self.assertLess(elapsed, 3.0)
+
     def test_sensitive_environment_values_are_removed(self):
         clean = sanitized_subprocess_env(
             {
@@ -88,6 +139,21 @@ class RuntimeSafetyTests(unittest.TestCase):
         detect.assert_called_once_with("/selected/venv/python")
         self.assertEqual(manager.available_accelerators, {"cpu", "cuda"})
         self.assertEqual(manager.preferred_accelerator, "cuda")
+
+    def test_incompatible_torch_architecture_is_not_reported_as_cuda(self):
+        incompatible = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="incompatible:sm_61\n",
+            stderr="",
+        )
+        with patch(
+            "runtime_utils.subprocess.run", return_value=incompatible
+        ) as run, patch("runtime_utils.shutil.which", return_value="/bin/nvidia-smi"):
+            available = detect_available_accelerators(sys.executable)
+
+        self.assertEqual(available, {"cpu"})
+        run.assert_called_once()
 
     def test_accelerator_contract_is_passed_to_sanitized_child(self):
         env = accelerator_subprocess_env(
@@ -208,6 +274,14 @@ class RuntimeSafetyTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             query_l2("../outside", "artifact")
 
+    def test_virtualenv_executable_symlink_is_not_resolved_to_base_python(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            link = Path(temp_dir) / "venv-python"
+            link.symlink_to(sys.executable)
+            preserved = absolute_path_without_symlink_resolution(link)
+            self.assertEqual(preserved, link)
+            self.assertNotEqual(preserved, link.resolve())
+
     def test_direct_dependency_urls_and_pip_flags_are_rejected(self):
         self.assertEqual(_validate_requirement("pandas>=2.0"), "pandas>=2.0")
         for value in ("https://example.com/pkg.whl", "pkg @ https://example.com/pkg.whl", "--index-url"):
@@ -267,6 +341,45 @@ class RuntimeSafetyTests(unittest.TestCase):
         )
         verify.assert_called_once_with({"torch==2.8.0"})
 
+    def test_titan_xp_torch_pin_uses_official_cuda_126_index(self):
+        agent = SetupAgent.__new__(SetupAgent)
+        agent.venv_python = sys.executable
+        agent.log_file = None
+        stale = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="Name: torch\nVersion: 2.8.0+cu128\n",
+            stderr="",
+        )
+        installed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="installed", stderr=""
+        )
+        # Use an unconditional equivalent to isolate command construction from
+        # the host platform running this test.
+        dependency = "torch==2.8.0+cu126"
+        with patch(
+            "agents.setup_agent.subprocess.run",
+            side_effect=[stale, installed],
+        ) as run, patch.object(agent, "_verify_dependency_imports") as verify:
+            agent.install_dependencies(
+                [{"verified": True, "dependencies": [dependency]}]
+            )
+
+        self.assertEqual(
+            run.call_args_list[1].args[0],
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--no-cache-dir",
+                "--extra-index-url",
+                "https://download.pytorch.org/whl/cu126",
+                dependency,
+            ],
+        )
+        verify.assert_called_once_with({dependency})
+
     def test_satisfied_dependency_version_skips_install(self):
         agent = SetupAgent.__new__(SetupAgent)
         agent.venv_python = sys.executable
@@ -286,6 +399,46 @@ class RuntimeSafetyTests(unittest.TestCase):
 
         run.assert_called_once()
         verify.assert_called_once_with({"torch==2.8.0"})
+
+    def test_dependency_import_timeout_is_reported_as_validation_failure(self):
+        agent = SetupAgent.__new__(SetupAgent)
+        agent.venv_python = sys.executable
+        agent.log_file = None
+        timeout = subprocess.TimeoutExpired(["python", "-c", "import sklearn"], 120)
+        with patch("agents.setup_agent.subprocess.run", side_effect=timeout):
+            with self.assertRaisesRegex(
+                RuntimeError, "import validation timed out after 120 seconds"
+            ):
+                agent._verify_dependency_imports({"scikit-learn==1.7.2"})
+
+    def test_titan_xp_torch_import_check_requires_sm_61(self):
+        agent = SetupAgent.__new__(SetupAgent)
+        agent.venv_python = sys.executable
+        agent.log_file = None
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="2.8.0+cu126\n", stderr=""
+        )
+        with patch(
+            "agents.setup_agent.subprocess.run", return_value=completed
+        ) as run:
+            agent._verify_dependency_imports({"torch==2.8.0+cu126"})
+
+        verification_code = run.call_args.args[0][2]
+        self.assertIn("torch._C._cuda_getArchFlags()", verification_code)
+        self.assertIn("torch.version.cuda == '12.6'", verification_code)
+        self.assertIn("'sm_61' in arches", verification_code)
+
+    def test_docker_installs_dependencies_from_requirements(self):
+        dockerfile = (Path(__file__).parents[1] / "Dockerfile").read_text()
+
+        self.assertIn("COPY requirements.txt .", dockerfile)
+        self.assertIn("pip install --no-cache-dir -r requirements.txt", dockerfile)
+        self.assertNotIn("torch", dockerfile)
+        self.assertNotIn("_cuda_getArchFlags", dockerfile)
+        self.assertLess(
+            dockerfile.index("COPY . ."),
+            dockerfile.index("RUN chmod +x run_all_tasks.sh"),
+        )
 
     def test_builder_rejects_generated_path_traversal(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -357,6 +510,20 @@ class RuntimeSafetyTests(unittest.TestCase):
             self.assertEqual(artifact_id, "candidate_model")
             self.assertTrue((node_dir / "candidate_model.py").is_file())
             self.assertTrue((node_dir / "candidate_model.json").is_file())
+
+    def test_builder_rejects_artifact_filesystem_and_process_side_effects(self):
+        code = """
+import os
+import subprocess
+open('/tmp/null', 'w').close()
+os.devnull = '/tmp/null'
+def run(X_train, X_test):
+    return X_test
+"""
+        issues = L2Builder._artifact_code_issues(code)
+        self.assertTrue(any("'open'" in issue for issue in issues))
+        self.assertTrue(any("subprocess" in issue for issue in issues))
+        self.assertIn("must not monkey-patch os.devnull", issues)
 
     def test_verifier_can_run_directly_without_pythonpath(self):
         verifier = (
@@ -480,6 +647,188 @@ class RuntimeSafetyTests(unittest.TestCase):
                 "mixed-missing-contract-mock-data",
             )
 
+    def test_verifier_allows_standard_devnull_at_module_import(self):
+        verifier = (
+            Path(__file__).resolve().parents[1]
+            / "memory_pool"
+            / "builder"
+            / "sandbox_verifier.py"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            artifact_dir = Path(temp_dir)
+            (artifact_dir / "devnull_model.py").write_text(
+                "import os\n"
+                "with open(os.devnull, 'w') as sink:\n"
+                "    sink.write('')\n"
+                "def run(X_train, X_test):\n"
+                "    return X_test['num1'].rank(pct=True).to_numpy()\n"
+            )
+            card_file = artifact_dir / "devnull_model.json"
+            card_file.write_text(
+                json.dumps(
+                    {
+                        "artifact_id": "devnull_model",
+                        "category": "custom_models",
+                        "interface": {
+                            "entrypoint": "run(X_train, X_test)",
+                            "output_contract": {
+                                "kind": "predictions",
+                                "aligned_to": "X_test",
+                                "value_type": "continuous",
+                            },
+                        },
+                        "dependencies": [],
+                        "verified": False,
+                        "code_path": "devnull_model.py",
+                    }
+                )
+            )
+            result = subprocess.run(
+                [sys.executable, str(verifier), str(card_file)],
+                cwd=artifact_dir,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            self.assertEqual(
+                result.returncode, 0, result.stdout + result.stderr
+            )
+
+    def test_verifier_uses_declared_modality_and_file_contracts(self):
+        verifier = (
+            Path(__file__).resolve().parents[1]
+            / "memory_pool"
+            / "builder"
+            / "sandbox_verifier.py"
+        )
+        cases = [
+            {
+                "artifact_id": "text_model",
+                "modality": "text",
+                "input_contract": {
+                    "modality": "text",
+                    "container": "list",
+                    "parameter_roles": {
+                        "train_texts": "train",
+                        "test_texts": "test",
+                        "labels": "target",
+                    },
+                },
+                "entrypoint": "run(train_texts, test_texts, labels)",
+                "aligned_to": "test_texts",
+                "dependencies": [],
+                "code": (
+                    "def run(train_texts, test_texts, labels):\n"
+                    "    assert isinstance(train_texts[0], str)\n"
+                    "    assert len(labels) == len(train_texts)\n"
+                    "    return [len(text) / 100 for text in test_texts]\n"
+                ),
+            },
+            {
+                "artifact_id": "image_model",
+                "modality": "image",
+                "input_contract": {
+                    "modality": "image",
+                    "container": "numpy",
+                    "sample_shape": [8, 8, 3],
+                    "parameter_roles": {
+                        "train_images": "train",
+                        "test_images": "test",
+                        "labels": "target",
+                    },
+                },
+                "entrypoint": "run(train_images, test_images, labels)",
+                "aligned_to": "test_images",
+                "dependencies": ["numpy"],
+                "code": (
+                    "import numpy as np\n"
+                    "def run(train_images, test_images, labels):\n"
+                    "    assert train_images.ndim == 4\n"
+                    "    assert train_images.shape[1:] == (8, 8, 3)\n"
+                    "    return np.asarray(test_images).mean(axis=(1, 2, 3))\n"
+                ),
+            },
+            {
+                "artifact_id": "text_file_model",
+                "modality": "text",
+                "input_contract": {
+                    "modality": "text",
+                    "container": "paths",
+                    "file_extension": ".txt",
+                    "parameter_roles": {
+                        "train_files": "train",
+                        "test_files": "test",
+                        "labels": "target",
+                    },
+                },
+                "entrypoint": "run(train_files, test_files, labels)",
+                "aligned_to": "test_files",
+                "dependencies": [],
+                "code": (
+                    "from pathlib import Path\n"
+                    "def run(train_files, test_files, labels):\n"
+                    "    assert all(Path(path).suffix == '.txt' for path in train_files)\n"
+                    "    return [len(Path(path).read_text()) / 100 for path in test_files]\n"
+                ),
+            },
+        ]
+        for case in cases:
+            with self.subTest(case=case["artifact_id"]):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    artifact_dir = Path(temp_dir)
+                    artifact_id = case["artifact_id"]
+                    (artifact_dir / f"{artifact_id}.py").write_text(
+                        case["code"]
+                    )
+                    card_file = artifact_dir / f"{artifact_id}.json"
+                    card_file.write_text(
+                        json.dumps(
+                            {
+                                "artifact_id": artifact_id,
+                                "category": "custom_models",
+                                "interface": {
+                                    "entrypoint": case["entrypoint"],
+                                    "input_contract": case["input_contract"],
+                                    "output_contract": {
+                                        "kind": "predictions",
+                                        "aligned_to": case["aligned_to"],
+                                        "value_type": "continuous",
+                                    },
+                                },
+                                "capabilities": {
+                                    "input_types": [case["modality"]],
+                                    "target_types": [
+                                        "binary_classification"
+                                    ],
+                                },
+                                "dependencies": case["dependencies"],
+                                "verified": False,
+                                "code_path": f"{artifact_id}.py",
+                            }
+                        )
+                    )
+                    result = subprocess.run(
+                        [sys.executable, str(verifier), str(card_file)],
+                        cwd=artifact_dir,
+                        capture_output=True,
+                        text=True,
+                        timeout=15,
+                    )
+                    self.assertEqual(
+                        result.returncode,
+                        0,
+                        result.stdout + result.stderr,
+                    )
+                    verified = json.loads(card_file.read_text())
+                    self.assertEqual(
+                        verified["verification_level"],
+                        f"{case['modality']}-contract-synthetic-data",
+                    )
+                    self.assertEqual(
+                        verified["verification_contract_source"],
+                        "declared",
+                    )
+
     def test_prediction_contract_rejects_constant_artifact(self):
         verifier = (
             Path(__file__).resolve().parents[1]
@@ -580,7 +929,7 @@ class RuntimeSafetyTests(unittest.TestCase):
             )
             self.assertFalse((run_dir / "input" / "submission.csv").exists())
 
-    def test_task_input_directory_is_linked_without_copying(self):
+    def test_task_input_files_are_linked_into_run_owned_directory(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             task_dir = root / "task"
@@ -592,8 +941,168 @@ class RuntimeSafetyTests(unittest.TestCase):
             expose_task_data(task_dir, run_dir)
 
             run_input = run_dir / "input"
-            self.assertTrue(run_input.is_symlink())
-            self.assertEqual(run_input.resolve(), source_input.resolve())
+            self.assertTrue(run_input.is_dir())
+            self.assertFalse(run_input.is_symlink())
+            linked_train = run_input / "train.csv"
+            self.assertTrue(linked_train.is_symlink())
+            self.assertEqual(
+                linked_train.resolve(), (source_input / "train.csv").resolve()
+            )
+            (run_input / "generated_cache.json").write_text("{}")
+            self.assertFalse((source_input / "generated_cache.json").exists())
+
+    def test_generated_task_artifacts_are_never_discovered_as_input(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            task_dir = Path(temp_dir)
+            (task_dir / "train.csv").write_text("feature,target\n1,0\n")
+            (task_dir / "sample_submission.csv").write_text("id,target\n1,0\n")
+            (task_dir / "submission.csv").write_text("id,target\n1,1\n")
+            (task_dir / "dataset_analysis_report.txt").write_text("generated")
+
+            discovered = {path.name for path in task_data_files(task_dir)}
+
+            self.assertEqual(
+                discovered, {"train.csv", "sample_submission.csv"}
+            )
+
+    def test_initial_generation_writes_only_to_run_directory(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            task_dir = root / "tasks" / "example"
+            baseline_dir = root / "runs" / "example" / "baseline"
+            task_dir.mkdir(parents=True)
+            (task_dir / "task_description.md").write_text(
+                "Binary classification scored by accuracy."
+            )
+            (task_dir / "train.csv").write_text(
+                "feature,target\n1,0\n2,1\n"
+            )
+            before = {
+                path.name: path.read_bytes()
+                for path in task_dir.iterdir()
+                if path.is_file()
+            }
+            generated_loader = "class MyDataLoader:\n    pass\n"
+            generated_algorithm = "print('baseline')\n"
+
+            with patch(
+                "agents.initial_agent.call_llm",
+                side_effect=[generated_loader, generated_algorithm],
+            ):
+                InitialAgent().generate_initial_code(
+                    task_dir, baseline_dir, temperature=0.0
+                )
+
+            after = {
+                path.name: path.read_bytes()
+                for path in task_dir.iterdir()
+                if path.is_file()
+            }
+            self.assertEqual(after, before)
+            self.assertEqual(
+                (baseline_dir / "initial_dataloader.py").read_text(),
+                generated_loader.strip(),
+            )
+            self.assertEqual(
+                (baseline_dir / "initial_algorithm.py").read_text(),
+                generated_algorithm.strip(),
+            )
+            self.assertTrue(
+                (baseline_dir / "dataset_analysis_report.txt").is_file()
+            )
+
+    def test_initial_generation_rejects_output_inside_task(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            task_dir = Path(temp_dir) / "tasks" / "example"
+            task_dir.mkdir(parents=True)
+            with self.assertRaisesRegex(ValueError, "read-only task directory"):
+                InitialAgent().generate_initial_code(
+                    task_dir, task_dir / "generated"
+                )
+
+    def test_unsupervised_baseline_prompt_uses_discovered_data_role(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            task_dir = root / "tasks" / "clustering"
+            baseline_dir = root / "runs" / "clustering" / "baseline"
+            task_dir.mkdir(parents=True)
+            (task_dir / "task_description.md").write_text(
+                "Completely unsupervised clustering scored by Adjusted Rand Index."
+            )
+            pd.DataFrame(
+                {"id": range(8), "feature": range(8)}
+            ).to_csv(task_dir / "data.csv", index=False)
+            pd.DataFrame(
+                {"Id": range(8), "Predicted": [0] * 8}
+            ).to_csv(task_dir / "sample_submission.csv", index=False)
+            prompts = []
+
+            def fake_llm(system_prompt, user_prompt, **kwargs):
+                prompts.append(system_prompt)
+                return (
+                    "class MyDataLoader:\n    pass\n"
+                    if len(prompts) == 1
+                    else "print('baseline')\n"
+                )
+
+            with patch("agents.initial_agent.call_llm", side_effect=fake_llm):
+                InitialAgent().generate_initial_code(
+                    task_dir,
+                    baseline_dir,
+                    temperature=0.0,
+                    fidelity="screen",
+                )
+
+            self.assertIn("./input/data.csv", prompts[0])
+            self.assertIn("UNSUPERVISED CLUSTERING", prompts[0])
+            self.assertIn("evaluate_clustering_predictions", prompts[1])
+            self.assertIn(
+                "prepare_evaluation_data(train_data, 'screen')", prompts[1]
+            )
+            self.assertNotIn(
+                "prepare_evaluation_data(train_data, 'full')", prompts[1]
+            )
+
+    def test_active_interpreter_is_default_when_no_venv_is_requested(self):
+        self.assertEqual(SetupAgent().venv_python, sys.executable)
+        self.assertEqual(
+            ImplementationAgent().venv_python, sys.executable
+        )
+
+    def test_final_submission_is_written_only_inside_run(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            task_dir = root / "tasks" / "example"
+            run_root = root / "runs" / "example" / "complete_system"
+            submission_dir = run_root / "node_1" / "submission"
+            task_dir.mkdir(parents=True)
+            submission_dir.mkdir(parents=True)
+            pd.DataFrame(
+                {"id": [2, 1], "prediction": [0.2, 0.8]}
+            ).to_csv(task_dir / "sample_submission.csv", index=False)
+            pd.DataFrame(
+                {"id": [1, 2], "prediction": [0.7, 0.3]}
+            ).to_csv(submission_dir / "submission.csv", index=False)
+
+            node = NodeState(
+                "node_1", "root", "implementation", fidelity="full"
+            )
+            node.result = {"score": 0.9, "status": "completed"}
+            manager = ManagerAgent.__new__(ManagerAgent)
+            manager.task_dir = task_dir
+            manager.run_root = run_root
+            manager.all_nodes = {"node_1": node}
+            manager.metric_direction = "maximize"
+            manager.metric_name = "accuracy"
+            manager.ensemble_top_k = 1
+            manager.ensemble_strategy = "average"
+            manager.aggregator_agent = AggregatorAgent()
+
+            self.assertTrue(manager.generate_final_submission("node_1"))
+            self.assertFalse((task_dir / "submission.csv").exists())
+            final = pd.read_csv(run_root / "submission.csv")
+            self.assertEqual(final["id"].tolist(), [2, 1])
+            self.assertEqual(final["prediction"].tolist(), [0.3, 0.7])
 
     def test_task_data_link_failure_never_falls_back_to_copy(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -631,7 +1140,7 @@ class RuntimeSafetyTests(unittest.TestCase):
                 {"input_tokens": 570, "output_tokens": 120, "total_tokens": 690},
             )
 
-    def test_failed_baseline_invokes_bounded_debugging_then_retries(self):
+    def test_stalled_baseline_invokes_bounded_debugging_then_retries(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             task_dir = root / "task"
@@ -644,9 +1153,10 @@ class RuntimeSafetyTests(unittest.TestCase):
 
             class ManagerStub:
                 venv_path = sys.executable
-                subprocess_timeout = 3
+                progress_stall_seconds = 3
                 metric_direction = "maximize"
                 metric_name = "roc_auc"
+                baseline_fidelity = "screen"
                 model_name = None
 
             manager = ManagerStub()
@@ -656,31 +1166,70 @@ class RuntimeSafetyTests(unittest.TestCase):
             def fake_run(*args, **kwargs):
                 nonlocal executions
                 executions += 1
-                if executions == 1:
-                    return subprocess.CompletedProcess(
-                        args[0], 1, stdout="", stderr="loader lifecycle error"
+                stalled = executions == 1
+                returncode = -15 if stalled else 0
+                stderr = "baseline made no observable progress" if stalled else ""
+                if not stalled:
+                    (baseline_dir / "result.json").write_text(
+                        '{"score": 0.75, "direction": "maximize"}'
                     )
-                (baseline_dir / "result.json").write_text(
-                    '{"score": 0.75, "direction": "maximize"}'
+                    (baseline_dir / "submission").mkdir(exist_ok=True)
+                    (baseline_dir / "submission" / "submission.csv").write_text(
+                        "id,prediction\n1,0.5\n"
+                    )
+                    (baseline_dir / "evaluation_manifest.json").write_text("{}")
+                    (baseline_dir / "oof_predictions.csv").write_text(
+                        "row_id,target,prediction\n1,0,0.1\n"
+                    )
+                return SupervisedProcessResult(
+                    args=tuple(str(item) for item in args[0]),
+                    returncode=returncode,
+                    stdout="",
+                    stderr=stderr,
+                    elapsed_seconds=0.1,
+                    stalled=stalled,
+                    hard_limit_reached=False,
+                    termination_reason=(
+                        "progress_stalled" if stalled else None
+                    ),
+                    progress_events=0 if stalled else 1,
+                    last_progress_source=(
+                        "process_started" if stalled else "process_output"
+                    ),
+                    last_progress_age_seconds=0.0,
                 )
-                (baseline_dir / "submission").mkdir(exist_ok=True)
-                (baseline_dir / "submission" / "submission.csv").write_text(
-                    "id,prediction\n1,0.5\n"
-                )
-                return subprocess.CompletedProcess(args[0], 0, stdout="", stderr="")
 
             with (
-                patch("eval.run_ablation.subprocess.run", side_effect=fake_run),
+                patch(
+                    "eval.run_ablation.run_supervised_process",
+                    side_effect=fake_run,
+                ),
                 patch(
                     "eval.run_ablation.InitialAgent.repair_initial_algorithm"
                 ) as repair,
+                patch(
+                    "eval.run_ablation.validate_evaluation_outputs",
+                    return_value={"cv_mean": 0.75},
+                ) as validate,
             ):
                 score = _run_baseline(manager, baseline_dir, max_debug_attempts=1)
 
             self.assertEqual(score, 0.75)
             self.assertEqual(executions, 2)
             repair.assert_called_once()
+            validate.assert_called_once_with(
+                baseline_dir, "screen", "roc_auc"
+            )
             self.assertTrue((baseline_dir / "baseline_debug.log").is_file())
+            stalled_report = json.loads(
+                (
+                    baseline_dir / "execution_supervision_attempt_1.json"
+                ).read_text()
+            )
+            self.assertTrue(stalled_report["stalled"])
+            self.assertIsNone(
+                stalled_report["total_runtime_limit_seconds"]
+            )
 
     def test_continuous_target_is_not_reported_as_rare_classes(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -703,6 +1252,38 @@ class RuntimeSafetyTests(unittest.TestCase):
             self.assertIn("Inferred Target Column: 'sale_price'", report)
             self.assertIn("Inferred task type: regression", report)
             self.assertNotIn("CRITICAL INCONSISTENCY", report)
+
+    def test_explicit_regression_overrides_low_integer_cardinality(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            task_dir = Path(temp_dir)
+            (task_dir / "task_description.md").write_text(
+                "Predict integer loss. Evaluation is root mean squared error."
+            )
+            pd.DataFrame(
+                {
+                    "id": range(100),
+                    "feature": range(100, 200),
+                    "loss": [value % 5 for value in range(100)],
+                }
+            ).to_csv(task_dir / "train.csv", index=False)
+            pd.DataFrame(
+                {"id": range(100, 120), "feature": range(200, 220)}
+            ).to_csv(task_dir / "test.csv", index=False)
+
+            report = run_dataset_analysis(task_dir)
+            self.assertIn("Inferred task type: regression", report)
+            self.assertNotIn("Class Counts", report)
+
+            train_data = {
+                "X": pd.DataFrame({"feature": range(100)}),
+                "y": [value % 5 for value in range(100)],
+                "task_type": "regression",
+            }
+            _, _, _, _, metadata = prepare_evaluation_data(
+                train_data, "screen", output_dir=Path(temp_dir) / "evaluation"
+            )
+            self.assertFalse(metadata["classification"])
+            self.assertEqual(metadata["cv_folds"], 2)
 
     def test_pending_nodes_are_persisted_with_explicit_state(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -831,6 +1412,19 @@ X_test = X_test.fillna(X_test.mean())
         self.assertTrue(any("fit" in issue for issue in issues))
         self.assertTrue(any("test-set mean" in issue for issue in issues))
 
+    def test_validation_guard_rejects_task_input_writes(self):
+        code = """
+from pathlib import Path
+import pandas as pd
+Path('input/cache.json').write_text('{}')
+pd.DataFrame({'x': [1]}).to_csv('./input/generated.csv', index=False)
+with open('/workspace/tasks/example/result.txt', 'w') as stream:
+    stream.write('bad')
+"""
+        issues = inspect_generated_code(code)
+        self.assertEqual(len(issues), 3)
+        self.assertTrue(all("must not write" in issue for issue in issues))
+
 
 class SchedulerTests(unittest.TestCase):
     def test_ucb_decay_starts_after_forced_warmup(self):
@@ -845,6 +1439,35 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(ManagerAgent._initial_fanout_for_budget(6), 2)
         self.assertEqual(ManagerAgent._initial_fanout_for_budget(60), 3)
 
+    def test_failed_root_can_promote_a_pre_generated_backup(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = ManagerAgent.__new__(ManagerAgent)
+            manager.run_root = Path(temp_dir)
+            manager.node_counter = 0
+            manager.enable_multi_fidelity = True
+            manager.initial_fanout = 1
+            manager.experiments_executed = 1
+            manager.scheduler = UCB1Scheduler(total_budget=3)
+            manager.all_nodes = {
+                "root": NodeState(
+                    "root", None, "technique", executed=True
+                )
+            }
+            manager._backup_initial_approaches = [
+                {"name": "backup_a", "plan": "Try robust trees."},
+                {"name": "backup_b", "plan": "Try linear features."},
+            ]
+
+            promoted = manager._promote_backup_approach("root")
+
+            self.assertEqual(promoted, "node_1")
+            self.assertTrue(
+                manager.all_nodes[promoted].config["replacement_branch"]
+            )
+            self.assertEqual(manager.all_nodes["root"].children_ids, ["node_1"])
+            self.assertEqual(len(manager._backup_initial_approaches), 1)
+            self.assertEqual(manager.scheduler.warmup_budget, 2)
+
     def test_cv_uncertainty_reduces_scheduling_reward(self):
         manager = ManagerAgent.__new__(ManagerAgent)
         manager.baseline_score = 0.95
@@ -858,7 +1481,6 @@ class SchedulerTests(unittest.TestCase):
         manager = ManagerAgent.__new__(ManagerAgent)
         manager.available_accelerators = {"cpu"}
         manager.available_ram_gb = 16.0
-        manager.subprocess_timeout = 300
         reason = manager._feasibility_reason(
             {
                 "resource_profile": {
@@ -874,7 +1496,6 @@ class SchedulerTests(unittest.TestCase):
         manager = ManagerAgent.__new__(ManagerAgent)
         manager.available_accelerators = {"cpu"}
         manager.available_ram_gb = 16.0
-        manager.subprocess_timeout = 1
         reason = manager._feasibility_reason(
             {
                 "resource_profile": {
@@ -1001,6 +1622,45 @@ class SchedulerTests(unittest.TestCase):
             ),
         )
 
+    def test_diversify_can_exclude_the_parent_artifact_from_retrieval(self):
+        agent = TechniqueAgent()
+        l1_index = {
+            "gbdt_ensembling": {
+                "description": "Tree ensemble model families."
+            }
+        }
+        catboost = {
+            "artifact_id": "catboost_10fold_ensemble",
+            "category": "gbdt_ensembling",
+            "description": "CatBoost ensemble",
+            "interface": {},
+            "capabilities": {},
+            "verified": True,
+            "scope": "model_family",
+            "validation_summary": {"runs": 10},
+        }
+        fallback = {"status": "pool_miss", "artifact_id": "new_model"}
+        with patch(
+            "agents.technique_agent.query",
+            return_value={"artifacts": [catboost]},
+        ), patch(
+            "agents.technique_agent.call_llm",
+            return_value="gbdt_ensembling",
+        ), patch.object(
+            agent, "_bootstrap_from_web", return_value=fallback
+        ) as bootstrap:
+            result = agent.run(
+                "tabular regression",
+                "diversify away from the parent",
+                {},
+                l1_index,
+                allowed_scopes={"model_family"},
+                excluded_artifact_ids={"catboost_10fold_ensemble"},
+            )
+
+        self.assertEqual(result, fallback)
+        bootstrap.assert_called_once()
+
     def test_follow_up_slots_are_created_without_eager_llm_generation(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             manager = ManagerAgent.__new__(ManagerAgent)
@@ -1051,6 +1711,20 @@ class SchedulerTests(unittest.TestCase):
             self.assertEqual(len(children), 3)
             self.assertTrue(all(child.config["lazy_proposal"] for child in children))
             self.assertTrue(all(not child.config["materialized"] for child in children))
+            diversify = next(
+                child for child in children if child.operator == "diversify"
+            )
+            self.assertEqual(
+                diversify.config["excluded_artifact_ids"], ["locked_model"]
+            )
+            self.assertGreater(
+                diversify.config["priority"],
+                next(
+                    child.config["priority"]
+                    for child in children
+                    if child.operator == "refine"
+                ),
+            )
             tune = next(child for child in children if child.operator == "tune")
             self.assertEqual(tune.fidelity, "screen")
             self.assertTrue(tune.config["priority_locked"])
@@ -1376,8 +2050,176 @@ class AggregatorTests(unittest.TestCase):
             self.assertLess(result.loc[0, "prediction"], 0.5)
             self.assertGreater(result.loc[1, "prediction"], 0.5)
 
+    def test_regression_rank_average_is_replaced_by_oof_safe_raw_blend(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            targets = [10.0, 20.0, 30.0, 40.0]
+            for node_id, predictions in (
+                ("one", [11.0, 19.0, 31.0, 39.0]),
+                ("two", [13.0, 18.0, 29.0, 42.0]),
+            ):
+                submission_dir = root / node_id / "submission"
+                submission_dir.mkdir(parents=True)
+                pd.DataFrame(
+                    {"id": [1, 2], "prediction": predictions[:2]}
+                ).to_csv(submission_dir / "submission.csv", index=False)
+                pd.DataFrame(
+                    {
+                        "row_id": range(4),
+                        "target": targets,
+                        "prediction": predictions,
+                    }
+                ).to_csv(root / node_id / "oof_predictions.csv", index=False)
+            agent = AggregatorAgent()
+            selected = agent.aggregate_ranked_candidates(
+                root,
+                [
+                    {"node_id": "one", "score": 1.0},
+                    {"node_id": "two", "score": 2.0},
+                ],
+                root / "ensemble.csv",
+                maximize=False,
+                top_k=2,
+                strategy="rank_average",
+                metric_name="rmse",
+                correlation_limit=1.1,
+            )
+            self.assertEqual(selected, ["one", "two"])
+            self.assertEqual(agent.last_ensemble_manifest["strategy"], "average")
+            self.assertLessEqual(
+                agent.last_ensemble_manifest["ensemble_oof_score"],
+                agent.last_ensemble_manifest["best_single_oof_score"] + 1e-12,
+            )
+            self.assertGreater(
+                pd.read_csv(root / "ensemble.csv")["prediction"].min(), 1.0
+            )
+
+    def test_missing_oof_uses_best_single_instead_of_blind_average(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            for node_id, predictions in (
+                ("best", [2.0, 3.0]),
+                ("other", [20.0, 30.0]),
+            ):
+                submission_dir = root / node_id / "submission"
+                submission_dir.mkdir(parents=True)
+                pd.DataFrame(
+                    {"id": [1, 2], "prediction": predictions}
+                ).to_csv(submission_dir / "submission.csv", index=False)
+            agent = AggregatorAgent()
+            selected = agent.aggregate_ranked_candidates(
+                root,
+                [
+                    {"node_id": "best", "score": 1.0},
+                    {"node_id": "other", "score": 2.0},
+                ],
+                root / "ensemble.csv",
+                maximize=False,
+                top_k=2,
+                metric_name="rmse",
+                correlation_limit=1.1,
+            )
+            self.assertEqual(selected, ["best"])
+            self.assertTrue(agent.last_ensemble_manifest["guardrail_applied"])
+            self.assertEqual(
+                pd.read_csv(root / "ensemble.csv")["prediction"].tolist(),
+                [2.0, 3.0],
+            )
+
 
 class ImplementationExecutionTests(unittest.TestCase):
+    def test_dependency_fallback_cannot_silently_import_failed_model(self):
+        record = {
+            "status": "dependency_fallback",
+            "unavailable_artifact": {
+                "artifact_id": "tabnet_sparse",
+                "dependencies": ["pytorch-tabnet"],
+            },
+        }
+        code = """
+try:
+    from pytorch_tabnet.tab_model import TabNetRegressor
+except Exception:
+    from sklearn.linear_model import LinearRegression
+"""
+        issues = ImplementationAgent._dependency_fallback_issues(code, record)
+        self.assertTrue(issues)
+        self.assertIn("pytorch_tabnet", issues[0])
+
+    def test_unverified_parent_artifact_is_not_inherited(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            parent = Path(temp_dir) / "parent"
+            child = Path(temp_dir) / "child"
+            parent.mkdir()
+            child.mkdir()
+            (parent / "candidate.py").write_text("def run(): return 1\n")
+            (parent / "candidate.json").write_text(
+                json.dumps(
+                    {
+                        "artifact_id": "candidate",
+                        "code_path": "candidate.py",
+                        "verified": False,
+                    }
+                )
+            )
+            (parent / "notes.txt").write_text("keep")
+            agent = ImplementationAgent.__new__(ImplementationAgent)
+            inherited = agent._inherit_parent_workspace(parent, child)
+            self.assertEqual(inherited, ["notes.txt"])
+            self.assertFalse((child / "candidate.py").exists())
+            self.assertFalse((child / "candidate.json").exists())
+
+    def test_missing_engineered_columns_get_feature_parity_repair_guidance(self):
+        guidance = ImplementationAgent._debug_repair_guidance(
+            "",
+            'KeyError: "[\'num_sum\', \'num_mean\'] not in index"',
+            "",
+            False,
+            "cpu",
+            FIDELITY_PROFILES["screen"],
+        )
+        self.assertIn("Feature-parity repair", guidance)
+        self.assertIn("Never index raw test data", guidance)
+
+    def test_implementation_infers_rmse_when_task_config_is_absent(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            task_dir = root / "task"
+            node_dir = root / "node"
+            task_dir.mkdir()
+            (task_dir / "initial_algorithm.py").write_text("print('baseline')\n")
+            (task_dir / "task_description.md").write_text(
+                "Submissions are scored on the root mean squared error.\n"
+            )
+            generated = """
+import json
+from pathlib import Path
+Path('submission').mkdir(exist_ok=True)
+Path('submission/submission.csv').write_text('id,prediction\\n1,0.5\\n')
+json.dump({'score': 0.7, 'metric': 'rmse', 'direction': 'minimize',
+           'fidelity': 'full'}, open('result.json', 'w'))
+"""
+            prompts = []
+
+            def fake_llm(system, user, **kwargs):
+                prompts.append(system)
+                return generated
+
+            agent = ImplementationAgent(venv_python_path=sys.executable)
+            with patch("agents.implementation_agent.call_llm", side_effect=fake_llm):
+                result = agent.run(
+                    node_dir,
+                    {},
+                    task_dir,
+                    timeout=3,
+                    max_debug_attempts=0,
+                )
+
+            self.assertEqual(result["status"], "completed")
+            result_json = json.loads((node_dir / "result.json").read_text())
+            self.assertEqual(result_json["metric"], "rmse")
+            self.assertIn('"metric": "rmse"', prompts[0])
+
     def test_descendant_uses_parent_code_and_inherits_support_files(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -1496,7 +2338,11 @@ json.dump({'score': 0.71, 'direction': 'maximize', 'fidelity': 'full'}, open('re
             self.assertFalse(result["timeout_kill"])
             self.assertGreaterEqual(elapsed, 0.2)
             resource = json.loads((node_dir / "execution_resource.json").read_text())
-            self.assertIsNone(resource["subprocess_timeout_seconds"])
+            self.assertEqual(
+                resource["execution_mode"], "renewable_progress_lease"
+            )
+            self.assertIsNone(resource["total_runtime_limit_seconds"])
+            self.assertEqual(resource["progress_stall_seconds"], 1800.0)
 
     def test_debug_repair_gets_a_fresh_execution_timeout(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1529,6 +2375,39 @@ json.dump({'score': 0.71, 'direction': 'maximize', 'fidelity': 'full'}, open('re
             self.assertAlmostEqual(result["score"], 0.71)
             self.assertTrue((node_dir / "attempt_1.log").is_file())
             self.assertFalse(result["timeout_kill"])
+
+    def test_stalled_training_is_automatically_repaired_and_retried(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            task_dir = root / "task"
+            node_dir = root / "node"
+            task_dir.mkdir()
+            (task_dir / "initial_algorithm.py").write_text("print('baseline')\n")
+            stalled_code = "import time\ntime.sleep(10)"
+            repaired_code = """
+import json
+from pathlib import Path
+Path('submission').mkdir(exist_ok=True)
+Path('submission/submission.csv').write_text('id,prediction\\n1,0.5\\n')
+json.dump({'score': 0.73, 'direction': 'maximize', 'fidelity': 'full'}, open('result.json', 'w'))
+"""
+            agent = ImplementationAgent(venv_python_path=sys.executable)
+            with patch(
+                "agents.implementation_agent.call_llm",
+                side_effect=[stalled_code, repaired_code],
+            ):
+                result = agent.run(
+                    node_dir,
+                    {},
+                    task_dir,
+                    stall_seconds=0.15,
+                    max_debug_attempts=1,
+                )
+
+            self.assertEqual(result["status"], "completed")
+            self.assertAlmostEqual(result["score"], 0.73)
+            attempt_log = (node_dir / "attempt_1.log").read_text()
+            self.assertIn("termination_reason=progress_stalled", attempt_log)
 
     def test_invalid_tuning_metadata_cannot_fall_back_to_printed_score(self):
         with tempfile.TemporaryDirectory() as temp_dir:

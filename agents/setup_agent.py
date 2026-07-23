@@ -7,7 +7,12 @@ from typing import List
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 from packaging.version import InvalidVersion, Version
-from runtime_utils import sanitized_subprocess_env
+from runtime_utils import (
+    absolute_path_without_symlink_resolution,
+    sanitized_subprocess_env,
+)
+
+_PYTORCH_CUDA_126_INDEX = "https://download.pytorch.org/whl/cu126"
 
 
 def _validate_requirement(requirement: object) -> str:
@@ -25,9 +30,16 @@ def _validate_requirement(requirement: object) -> str:
     return requirement
 
 class SetupAgent:
-    def __init__(self, venv_python_path: str = "./.venv/bin/python"):
+    def __init__(self, venv_python_path: str | None = None):
         import sys
-        resolved_path = str(Path(venv_python_path).resolve())
+        if venv_python_path is None:
+            self.venv_python = sys.executable
+            self.pip_path = str(Path(self.venv_python).parent / "pip")
+            self.log_file = None
+            return
+        resolved_path = str(
+            absolute_path_without_symlink_resolution(venv_python_path)
+        )
         # Check if the resolved venv python is fully functional
         use_fallback = True
         if Path(resolved_path).exists():
@@ -85,6 +97,7 @@ class SetupAgent:
         self._log(f"SetupAgent: Selected interpreter: {self.venv_python}")
         self._log(f"SetupAgent: Checking/Installing dependencies: {list(dependencies)}")
         
+        active_dependencies = set()
         to_install = []
         for dep in dependencies:
             requirement = Requirement(dep)
@@ -93,6 +106,7 @@ class SetupAgent:
                     f"SetupAgent: Skipping inactive environment marker for {dep!r}."
                 )
                 continue
+            active_dependencies.add(dep)
             pkg_name = requirement.name
 
             # `pip show` alone only establishes presence. Parse its Version field
@@ -141,7 +155,7 @@ class SetupAgent:
                 to_install.append(dep)
 
         if not to_install:
-            self._verify_dependency_imports(dependencies)
+            self._verify_dependency_imports(active_dependencies)
             self._log("SetupAgent: All dependencies are installed and importable.")
             return
 
@@ -163,7 +177,14 @@ class SetupAgent:
             "pip",
             "install",
             "--no-cache-dir",
-        ] + to_install
+        ]
+        if any(
+            canonicalize_name(Requirement(dep).name) == "torch"
+            and "+cu126" in dep.lower()
+            for dep in to_install
+        ):
+            cmd.extend(["--extra-index-url", _PYTORCH_CUDA_126_INDEX])
+        cmd.extend(to_install)
         
         try:
             res = subprocess.run(
@@ -174,9 +195,6 @@ class SetupAgent:
                 timeout=1800,
                 env=sanitized_subprocess_env(),
             )
-            self._log("SetupAgent: Package installation successful!")
-            self._log(res.stdout)
-            self._verify_dependency_imports(dependencies)
         except subprocess.CalledProcessError as e:
             self._log("SetupAgent ERROR: Failed to install dependencies.")
             self._log(e.stderr)
@@ -184,6 +202,9 @@ class SetupAgent:
         except subprocess.TimeoutExpired as e:
             self._log("SetupAgent ERROR: Dependency installation timed out after 1800s.")
             raise e
+        self._log("SetupAgent: Package installation successful!")
+        self._log(res.stdout)
+        self._verify_dependency_imports(active_dependencies)
 
     def _verify_dependency_imports(self, dependencies) -> None:
         """Detect installed-but-broken dependency environments before execution."""
@@ -199,20 +220,41 @@ class SetupAgent:
         for dependency in sorted(dependencies):
             package = Requirement(dependency).name
             module = import_names.get(package.lower(), package.replace("-", "_"))
-            result = subprocess.run(
-                [
-                    self.venv_python,
-                    "-c",
-                    (
-                        f"import {module}; import importlib.metadata as metadata; "
-                        f"print(metadata.version({package!r}))"
-                    ),
-                ],
-                capture_output=True,
-                text=True,
-                timeout=30,
-                env=sanitized_subprocess_env(),
-            )
+            cuda_arch_check = ""
+            if (
+                canonicalize_name(package) == "torch"
+                and "+cu126" in dependency.lower()
+            ):
+                cuda_arch_check = (
+                    "; assert torch.version.cuda == '12.6', "
+                    "f'Expected a CUDA 12.6 PyTorch wheel, got CUDA "
+                    "{torch.version.cuda!r}'"
+                    "; flags=torch._C._cuda_getArchFlags()"
+                    "; arches=set(flags.split())"
+                    "; assert 'sm_61' in arches, "
+                    "f'PyTorch wheel lacks required TITAN Xp architecture sm_61: "
+                    "{sorted(arches)}'"
+                )
+            try:
+                result = subprocess.run(
+                    [
+                        self.venv_python,
+                        "-c",
+                        (
+                            f"import {module}; import importlib.metadata as metadata; "
+                            f"print(metadata.version({package!r})){cuda_arch_check}"
+                        ),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                    env=sanitized_subprocess_env(),
+                )
+            except subprocess.TimeoutExpired:
+                failures.append(
+                    f"{package}: import validation timed out after 120 seconds"
+                )
+                continue
             if result.returncode != 0:
                 failures.append(f"{package}: {result.stderr[-1200:]}")
             else:
@@ -259,8 +301,15 @@ class SetupAgent:
             line = raw_line.strip()
             if not line or line.startswith("#"):
                 continue
+            if line.startswith(("-", "--")):
+                # Project-controlled pip source options are consumed by ordinary
+                # `pip install -r`; generated model cards still cannot provide
+                # options because `_validate_requirement` rejects them.
+                continue
             validated = _validate_requirement(line)
             parsed = Requirement(validated)
+            if parsed.marker is not None and not parsed.marker.evaluate():
+                continue
             allowlist[canonicalize_name(parsed.name)] = validated
 
         approved = set()

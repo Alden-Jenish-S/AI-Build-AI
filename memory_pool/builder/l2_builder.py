@@ -1,12 +1,19 @@
+import ast
 import os
 import json
 import sys
 import subprocess
 from pathlib import Path
 from typing import Dict, Any
+from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
 from agents.llm_utils import call_llm
 from agents.setup_agent import SetupAgent
-from runtime_utils import accelerator_subprocess_env, validate_storage_identifier
+from runtime_utils import (
+    absolute_path_without_symlink_resolution,
+    accelerator_subprocess_env,
+    validate_storage_identifier,
+)
 
 class L2Builder:
     def __init__(
@@ -26,10 +33,15 @@ class L2Builder:
             raise ValueError("preferred_accelerator must be cpu, cuda, or mps")
 
         import sys
-        candidate_path = Path(venv_path or "./.venv/bin/python")
+        if venv_path is None:
+            self.venv_python = sys.executable
+            return
+        candidate_path = Path(venv_path)
         if not candidate_path.is_absolute():
             candidate_path = project_root / candidate_path
-        resolved_path = str(candidate_path.resolve())
+        resolved_path = str(
+            absolute_path_without_symlink_resolution(candidate_path)
+        )
         # Check if the resolved venv python is fully functional
         use_fallback = True
         if Path(resolved_path).exists():
@@ -46,6 +58,75 @@ class L2Builder:
         else:
             self.venv_python = resolved_path
 
+    @staticmethod
+    def _artifact_code_issues(code: str) -> list[str]:
+        """Reject generated artifact code with external or import-time side effects."""
+        try:
+            tree = ast.parse(code)
+        except SyntaxError as exc:
+            return [f"syntax error: {exc}"]
+
+        issues = []
+        forbidden_import_roots = {
+            "httpx",
+            "requests",
+            "socket",
+            "subprocess",
+            "urllib",
+        }
+        forbidden_calls = {
+            "eval",
+            "exec",
+            "open",
+            "os.popen",
+            "os.system",
+            "pathlib.Path.touch",
+            "pathlib.Path.write_bytes",
+            "pathlib.Path.write_text",
+            "shutil.rmtree",
+        }
+
+        def qualified_name(node: ast.AST) -> str:
+            parts = []
+            current = node
+            while isinstance(current, ast.Attribute):
+                parts.append(current.attr)
+                current = current.value
+            if isinstance(current, ast.Name):
+                parts.append(current.id)
+            return ".".join(reversed(parts))
+
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                names = (
+                    [alias.name for alias in node.names]
+                    if isinstance(node, ast.Import)
+                    else [node.module or ""]
+                )
+                for name in names:
+                    if name.split(".", 1)[0] in forbidden_import_roots:
+                        issues.append(
+                            f"forbidden external-side-effect import {name!r}"
+                        )
+            elif isinstance(node, ast.Call):
+                name = qualified_name(node.func)
+                if (
+                    name in forbidden_calls
+                    or name.endswith(".write_text")
+                    or name.endswith(".write_bytes")
+                    or name.endswith(".touch")
+                ):
+                    issues.append(f"forbidden side-effect call {name!r}")
+            elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+                targets = (
+                    node.targets if isinstance(node, ast.Assign) else [node.target]
+                )
+                if any(
+                    qualified_name(target) == "os.devnull" for target in targets
+                ):
+                    issues.append("must not monkey-patch os.devnull")
+        return sorted(set(issues))
+
     def build_from_source(self, source_name: str, source_content: str, commit: bool = True, target_dir: Path = None) -> tuple:
         """
         Takes raw source content, asks LLM to classify it, extract model card + code,
@@ -56,10 +137,26 @@ class L2Builder:
             l1_index = json.load(f)
             
         l1_list_str = "\n".join([f"- {cat}: {details['description']}" for cat, details in l1_index.items()])
+        requirements_file = self.project_root / "requirements.txt"
+        allowed_dependencies = []
+        if requirements_file.is_file():
+            for raw_line in requirements_file.read_text(
+                encoding="utf-8"
+            ).splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                try:
+                    allowed_dependencies.append(Requirement(line).name)
+                except ValueError:
+                    continue
+        dependency_allowlist = ", ".join(
+            sorted(set(allowed_dependencies))
+        ) or "Python standard library only"
         
         system_prompt = (
             "You are the L2 Artifact Builder. Your goal is to convert a raw source snippet "
-            "into a single, clean, self-contained tabular ML utility function (.py file) and its metadata "
+            "into a single, clean, self-contained reusable ML utility function (.py file) and its metadata "
             "Model Card (.json file) matching the required schema.\n"
             "Output must be a valid JSON dictionary containing keys:\n"
             "1. 'category': one of the existing L1 categories, or a new category name if none fit (with lowercase_underscores).\n"
@@ -70,10 +167,11 @@ class L2Builder:
             "     \"category\": \"<category_name>\",\n"
             "     \"description\": \"<brief description of what this code does>\",\n"
             "     \"interface\": {\n"
-            "       \"entrypoint\": \"<entrypoint_function_name>(X_train, X_test, y_train=None, ...)\",\n"
-            "       \"output_contract\": {\"kind\": \"predictions|transformed_features\", \"aligned_to\": \"X_test\", \"value_type\": \"probability|label|continuous|features\"}\n"
+            "       \"entrypoint\": \"<entrypoint_function_name>(<modality-appropriate parameters>, ...)\",\n"
+            "       \"input_contract\": {\"modality\": \"tabular|text|image|audio|timeseries|video|graph|multimodal|array\", \"container\": \"dataframe|numpy|list|tensor|paths|file|directory\", \"parameter_roles\": {\"<entrypoint_parameter>\": \"train|test|train.text|test.text|train.image|test.image|target|predictions|numeric_columns|categorical_columns|feature_columns|target_column\"}, \"sample_shape\": [<optional per-sample dimensions>], \"file_extension\": \"<optional .csv|.jsonl|.txt|.npy|.wav|.png>\"},\n"
+            "       \"output_contract\": {\"kind\": \"predictions|transformed_features|embeddings|labels|logits|masks|splits|model\", \"aligned_to\": \"<entrypoint parameter or train/test role>\", \"value_type\": \"probability|label|continuous|features\"}\n"
             "     },\n"
-            "     \"capabilities\": {\"supported_operators\": [\"refine\", \"tune\", \"diversify\"], \"tunable_parameters\": [\"parameter_name\"], \"gpu_accelerated\": <true|false>, \"supported_accelerators\": [\"cpu\", \"cuda\", \"mps\"], \"input_types\": [\"numeric\", \"categorical\", \"missing\"], \"target_types\": [\"binary_classification|multiclass_classification|regression\"]},\n"
+            "     \"capabilities\": {\"supported_operators\": [\"refine\", \"tune\", \"diversify\"], \"tunable_parameters\": [\"parameter_name\"], \"gpu_accelerated\": <true|false>, \"supported_accelerators\": [\"cpu\", \"cuda\", \"mps\"], \"input_types\": [\"modality-specific input traits\"], \"target_types\": [\"binary_classification|multiclass_classification|multilabel_classification|regression\"]},\n"
             "     \"scope\": \"<component|model_family|full_pipeline>\",\n"
             "     \"resource_profile\": {\"accelerator\": \"<cpu|gpu|cuda|mps|any>\", \"min_ram_gb\": <number>, \"estimated_runtime_seconds\": <number>},\n"
             "     \"dependencies\": [\"numpy\", \"pandas\", ...],\n"
@@ -82,11 +180,18 @@ class L2Builder:
             "   }\n"
             "4. 'code': the self-contained importable python code containing the entrypoint function.\n\n"
             "CRITICAL CODE CONSTRAINTS:\n"
-            "- The entrypoint function and all helper functions MUST be fully compatible with standard tabular inputs (Pandas DataFrames for X_train/X_test, and NumPy arrays or Pandas Series for y_train).\n"
-            "- Do NOT assume inputs are PyTorch/TensorFlow tensors. If the technique requires neural networks, convert Pandas DataFrame/NumPy inputs to tensors inside the entrypoint function (e.g., using torch.tensor(X_train.values) or similar) and convert the outputs back to NumPy arrays or Pandas DataFrames/Series.\n"
+            "- Preserve the source technique's real data modality. The interface.input_contract MUST accurately declare the synthetic container, sample shape/file type when relevant, and the role of every required data parameter. Do not force text, image, audio, temporal, graph, or multimodal methods into Pandas DataFrames.\n"
+            "- Use framework tensors only when input_contract.container declares tensor; otherwise convert the declared public input container inside the entrypoint and return ordinary arrays/tables/sequences matching output_contract.\n"
             "- Ensure that any optional parameter has a default value (e.g. y_train=None).\n"
-            "- The function must execute successfully and return predictions or transformed features without throwing type/attribute errors (such as calling tensor methods directly on DataFrame inputs).\n"
-            "- Neural artifacts must use training-fit mixed-type preprocessing, float32 mini-batches, early stopping, batched CPU-detached output, and the AIBUILDAI_MAX_EPOCHS/AIBUILDAI_EARLY_STOPPING_PATIENCE ceilings. Handle singleton final batches and all-missing training columns safely.\n"
+            "- The function must execute successfully against the declared modality and return a value satisfying output_contract. Prediction-like outputs must use samples on axis zero and align with the declared train/test parameter.\n"
+            "- Artifact modules are pure importable utilities: they may read only file/path parameters explicitly declared by input_contract, and must never write files, discover unrelated local files, access the network, launch subprocesses, mutate os.devnull, or perform import-time side effects.\n"
+            "- Third-party imports and Model Card dependencies MUST be limited to "
+            f"these project-allowlisted distributions: {dependency_allowlist}. "
+            "Do not import or declare any other package. If the source mentions an "
+            "unavailable convenience library, implement the mechanism with an "
+            "allowlisted lower-level framework instead of silently changing the "
+            "methodology.\n"
+            "- Neural artifacts must use modality-appropriate training-fit preprocessing, float32 mini-batches where applicable, early stopping, batched CPU-detached output, and the AIBUILDAI_MAX_EPOCHS/AIBUILDAI_EARLY_STOPPING_PATIENCE ceilings. Handle singleton final batches and modality-specific missing/corrupt samples safely.\n"
             f"- The target runtime prefers {self.preferred_accelerator}, exposed through the "
             "AIBUILDAI_ACCELERATOR environment variable. For compatible models, read that variable, "
             "enable the framework-native accelerator, and retry safely on CPU if the installed package "
@@ -101,24 +206,83 @@ class L2Builder:
         Existing L1 Categories:
         {l1_list_str}
         
-        Analyze this raw source. Extract ONE modular, reusable tabular ML technique/model/preprocessing method.
+        Analyze this raw source. Extract ONE modular, reusable ML technique/model/preprocessing method while preserving its actual data modality.
         Format the response strictly as a JSON object.
         """
-        response_str = call_llm(system_prompt, user_prompt, model=self.model_name)
-        
-        # Clean response string to parse JSON
-        try:
-            if "```json" in response_str:
-                json_str = response_str.split("```json")[1].split("```")[0]
-            elif "```" in response_str:
-                json_str = response_str.split("```")[1].split("```")[0]
+        def parse_response(response: str) -> dict:
+            if "```json" in response:
+                json_str = response.split("```json")[1].split("```")[0]
+            elif "```" in response:
+                json_str = response.split("```")[1].split("```")[0]
             else:
-                json_str = response_str
-            data = json.loads(json_str.strip())
+                json_str = response
+            parsed = json.loads(json_str.strip())
+            if not isinstance(parsed, dict):
+                raise ValueError("builder response must be a JSON object")
+            return parsed
+
+        response_str = call_llm(system_prompt, user_prompt, model=self.model_name)
+        try:
+            data = parse_response(response_str)
         except Exception as e:
             print(f"L2Builder ERROR: Failed to parse LLM response as JSON: {e}")
             print(f"Raw response: {response_str}")
             return False, None, None, None
+
+        allowed_names = {
+            canonicalize_name(name) for name in allowed_dependencies
+        }
+        # Dependency mismatch used to terminate before either verification or
+        # repair. Give the builder two focused opportunities to regenerate the
+        # complete artifact against the explicit project allowlist.
+        for dependency_retry in range(2):
+            candidate_card = data.get("model_card")
+            declared = (
+                candidate_card.get("dependencies", [])
+                if isinstance(candidate_card, dict)
+                else []
+            )
+            if not isinstance(declared, list):
+                unavailable = ["<dependencies must be a list>"]
+            else:
+                unavailable = []
+                for dependency in declared:
+                    try:
+                        dependency_name = canonicalize_name(
+                            Requirement(str(dependency)).name
+                        )
+                    except ValueError:
+                        unavailable.append(str(dependency))
+                        continue
+                    if dependency_name not in allowed_names:
+                        unavailable.append(str(dependency))
+            if not unavailable:
+                break
+            repair_prompt = (
+                user_prompt
+                + "\n\nThe previous artifact was rejected before verification "
+                + "because it declared unavailable dependencies: "
+                + repr(unavailable)
+                + ". Regenerate the COMPLETE JSON artifact using only the "
+                + "allowlisted distributions. Preserve the planned methodology "
+                + "and use an allowlisted lower-level implementation where needed."
+                + "\n\nPrevious invalid response:\n"
+                + response_str[-16000:]
+            )
+            try:
+                response_str = call_llm(
+                    system_prompt,
+                    repair_prompt,
+                    model=self.model_name,
+                    temperature=0.0,
+                )
+                data = parse_response(response_str)
+            except Exception as exc:
+                print(
+                    "L2Builder WARNING: Dependency-constrained regeneration "
+                    f"failed: {exc}"
+                )
+                break
  
         category = data.get("category")
         model_card = data.get("model_card")
@@ -139,6 +303,59 @@ class L2Builder:
         if not isinstance(code, str) or not code.strip():
             print("L2Builder ERROR: Generated code must be a non-empty string.")
             return False, None, None, None
+        interface = model_card.get("interface")
+        if (
+            not isinstance(interface, dict)
+            or not isinstance(interface.get("entrypoint"), str)
+            or not interface["entrypoint"].strip()
+        ):
+            print(
+                "L2Builder ERROR: Model card must declare interface.entrypoint."
+            )
+            return False, None, None, None
+        input_contract = interface.get("input_contract")
+        if input_contract is not None:
+            supported_modalities = {
+                "array",
+                "audio",
+                "graph",
+                "image",
+                "multimodal",
+                "tabular",
+                "text",
+                "timeseries",
+                "video",
+            }
+            supported_containers = {
+                "array",
+                "dataframe",
+                "dict",
+                "directory",
+                "file",
+                "file_paths",
+                "files",
+                "list",
+                "ndarray",
+                "numpy",
+                "paths",
+                "tensor",
+                "torch",
+            }
+            if (
+                not isinstance(input_contract, dict)
+                or input_contract.get("modality")
+                not in supported_modalities
+                or input_contract.get("container")
+                not in supported_containers
+                or not isinstance(
+                    input_contract.get("parameter_roles"), dict
+                )
+            ):
+                print(
+                    "L2Builder ERROR: interface.input_contract must declare "
+                    "a supported modality, container, and parameter_roles object."
+                )
+                return False, None, None, None
         if model_card.get("scope") not in {
             "component", "model_family", "full_pipeline"
         }:
@@ -215,67 +432,151 @@ class L2Builder:
                 return False, None, None, None
             return False, category, artifact_id, model_card
 
-        # Run sandbox verification with one focused repair pass. Most generated
-        # failures in practice are small interface/type defects that are cheaper to
-        # repair from the traceback than to discard and regenerate from scratch.
+        # Run sandbox verification with two focused repair passes. Generated
+        # failures are commonly small interface, missing-value, or sandbox defects;
+        # preserve the methodology and repair those before falling back.
         cmd = [self.venv_python, str(self.verifier_path), str(card_file)]
         verification_output = ""
-        for verification_attempt in range(2):
-            try:
-                res = subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    text=True,
-                    check=True,
-                    timeout=35,
-                    env=accelerator_subprocess_env(self.preferred_accelerator),
-                )
-                print(f"L2Builder: Sandbox verification passed for {artifact_id}!")
-                try:
-                    with open(card_file, 'r', encoding='utf-8') as f:
-                        model_card = json.load(f)
-                except Exception:
-                    pass
-                if commit and artifact_id not in l1_index[category]["l2_pointers"]:
-                    l1_index[category]["l2_pointers"].append(artifact_id)
-                    with open(self.l1_path, 'w', encoding='utf-8') as f:
-                        json.dump(l1_index, f, indent=2)
-                return True, category, artifact_id, model_card
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        verification_attempts = []
+        for verification_attempt in range(3):
+            code_issues = self._artifact_code_issues(
+                code_file.read_text(encoding="utf-8")
+            )
+            if code_issues:
                 verification_output = (
-                    str(getattr(exc, "stdout", "") or "")
-                    + "\n"
-                    + str(getattr(exc, "stderr", "") or "")
-                )[-8000:]
-                print(f"L2Builder ERROR: Sandbox verification failed for {artifact_id}.")
-                if verification_output.strip():
-                    print(verification_output)
-                if verification_attempt == 0:
+                    "Static artifact safety rejection:\n- "
+                    + "\n- ".join(code_issues)
+                )
+                verification_attempts.append(
+                    {
+                        "attempt": verification_attempt + 1,
+                        "status": "static_rejection",
+                        "diagnostics": verification_output[-4000:],
+                    }
+                )
+                print(
+                    f"L2Builder ERROR: Generated artifact {artifact_id} "
+                    "failed static safety validation."
+                )
+                print(verification_output)
+            else:
+                try:
+                    subprocess.run(
+                        cmd,
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                        timeout=90,
+                        env=accelerator_subprocess_env(
+                            self.preferred_accelerator
+                        ),
+                    )
+                except (
+                    subprocess.CalledProcessError,
+                    subprocess.TimeoutExpired,
+                ) as exc:
+                    verification_output = (
+                        str(getattr(exc, "stdout", "") or "")
+                        + "\n"
+                        + str(getattr(exc, "stderr", "") or "")
+                    )[-8000:]
+                    verification_attempts.append(
+                        {
+                            "attempt": verification_attempt + 1,
+                            "status": "verification_failed",
+                            "diagnostics": verification_output[-4000:],
+                        }
+                    )
+                    print(
+                        f"L2Builder ERROR: Sandbox verification failed for "
+                        f"{artifact_id}."
+                    )
+                    if verification_output.strip():
+                        print(verification_output)
+                else:
+                    verification_attempts.append(
+                        {
+                            "attempt": verification_attempt + 1,
+                            "status": "verified",
+                        }
+                    )
+                    print(
+                        f"L2Builder: Sandbox verification passed for "
+                        f"{artifact_id}!"
+                    )
                     try:
-                        repair_response = call_llm(
-                            "You repair a generated reusable Python artifact. Return only the complete "
-                            "corrected Python module in one code block. Preserve the declared entrypoint "
-                            "and methodology; fix the concrete traceback and ensure returned predictions "
-                            "align with X_test. Preserve use of AIBUILDAI_ACCELERATOR for supported models "
-                            "and retain a safe CPU fallback.",
-                            f"Entrypoint: {model_card.get('interface', {}).get('entrypoint')}\n"
-                            f"Verification failure:\n{verification_output}\n\n"
-                            f"Current module:\n```python\n{code_file.read_text(encoding='utf-8')}\n```",
-                            model=self.model_name,
-                            temperature=0.0,
-                        )
-                        if "```python" in repair_response:
-                            repaired = repair_response.split("```python", 1)[1].split("```", 1)[0]
-                        elif "```" in repair_response:
-                            repaired = repair_response.split("```", 1)[1].split("```", 1)[0]
-                        else:
-                            repaired = repair_response
-                        compile(repaired, str(code_file), "exec")
-                        code_file.write_text(repaired.strip() + "\n", encoding="utf-8")
-                        continue
-                    except Exception as repair_error:
-                        print(f"L2Builder ERROR: Artifact repair failed: {repair_error}")
-                        break
+                        with open(card_file, 'r', encoding='utf-8') as f:
+                            model_card = json.load(f)
+                    except Exception:
+                        pass
+                    model_card["builder_verification_attempts"] = (
+                        verification_attempts
+                    )
+                    with open(card_file, "w", encoding="utf-8") as f:
+                        json.dump(model_card, f, indent=2)
+                    if (
+                        commit
+                        and artifact_id
+                        not in l1_index[category]["l2_pointers"]
+                    ):
+                        l1_index[category]["l2_pointers"].append(artifact_id)
+                        with open(self.l1_path, 'w', encoding='utf-8') as f:
+                            json.dump(l1_index, f, indent=2)
+                    return True, category, artifact_id, model_card
+
+            if verification_attempt < 2:
+                try:
+                    repair_response = call_llm(
+                        "You repair a generated reusable Python artifact. Return only the complete "
+                        "corrected Python module in one code block. Preserve the exact declared "
+                        "entrypoint and methodology; fix the concrete failure and ensure returned "
+                        "outputs satisfy interface.output_contract and align with its declared "
+                        "input parameter. Preserve interface.input_contract exactly; do not convert "
+                        "a non-tabular modality into Pandas merely to satisfy verification. The "
+                        "module must be a pure utility: it may read only declared input-path "
+                        "parameters and must never write files, discover unrelated local files, "
+                        "access the network, launch subprocesses, patch os.devnull, or perform "
+                        "import-time side effects. Handle modality-appropriate missing/corrupt "
+                        "samples. Preserve AIBUILDAI_ACCELERATOR support and a safe CPU fallback.",
+                        f"Repair pass: {verification_attempt + 1} of 2\n"
+                        f"Entrypoint: {model_card.get('interface', {}).get('entrypoint')}\n"
+                        f"Input contract: {json.dumps(model_card.get('interface', {}).get('input_contract', {}))}\n"
+                        f"Output contract: {json.dumps(model_card.get('interface', {}).get('output_contract', {}))}\n"
+                        f"Verification failure:\n{verification_output}\n\n"
+                        f"Current module:\n```python\n"
+                        f"{code_file.read_text(encoding='utf-8')}\n```",
+                        model=self.model_name,
+                        temperature=0.0,
+                    )
+                    if "```python" in repair_response:
+                        repaired = repair_response.split(
+                            "```python", 1
+                        )[1].split("```", 1)[0]
+                    elif "```" in repair_response:
+                        repaired = repair_response.split(
+                            "```", 1
+                        )[1].split("```", 1)[0]
+                    else:
+                        repaired = repair_response
+                    compile(repaired, str(code_file), "exec")
+                    code_file.write_text(
+                        repaired.strip() + "\n", encoding="utf-8"
+                    )
+                except Exception as repair_error:
+                    verification_output = (
+                        f"Artifact repair generation failed: {repair_error}"
+                    )
+                    verification_attempts.append(
+                        {
+                            "attempt": verification_attempt + 1,
+                            "status": "repair_generation_failed",
+                            "diagnostics": verification_output[-4000:],
+                        }
+                    )
+                    print(
+                        f"L2Builder ERROR: Artifact repair failed: "
+                        f"{repair_error}"
+                    )
 
         if commit:
             code_file.unlink(missing_ok=True)
@@ -286,6 +587,9 @@ class L2Builder:
                 model_card = json.load(f)
         except Exception:
             pass
+        model_card["builder_verification_attempts"] = verification_attempts
+        with open(card_file, "w", encoding="utf-8") as f:
+            json.dump(model_card, f, indent=2)
         return False, category, artifact_id, model_card
 
     def commit_artifact(self, category: str, artifact_id: str, local_code_file: Path, local_card_file: Path) -> bool:

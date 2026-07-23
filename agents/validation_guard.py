@@ -24,6 +24,36 @@ def _contains_test_reference(node: ast.AST) -> bool:
     )
 
 
+def _literal_path(node: ast.AST) -> str:
+    """Best-effort extraction for literal paths used by generated code."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in {"Path", "PurePath"}
+        and node.args
+    ):
+        return _literal_path(node.args[0])
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+        left = _literal_path(node.left).rstrip("/")
+        right = _literal_path(node.right).lstrip("/")
+        if left and right:
+            return f"{left}/{right}"
+    return ""
+
+
+def _targets_task_input(path: str) -> bool:
+    normalized = str(path).replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return (
+        normalized == "input"
+        or normalized.startswith("input/")
+        or "/tasks/" in normalized
+    )
+
+
 def inspect_generated_code(code: str) -> List[str]:
     """Return high-confidence leakage defects that should be repaired before execution."""
     try:
@@ -61,6 +91,53 @@ def inspect_generated_code(code: str) -> List[str]:
         if method in STAT_METHODS and _root_name(node.func.value) in TEST_NAMES:
             issues.append(
                 f"line {node.lineno}: test-set {method} statistic is used; derive it from training data"
+            )
+    output_methods = {
+        "dump",
+        "save",
+        "savetxt",
+        "to_csv",
+        "to_feather",
+        "to_json",
+        "to_parquet",
+        "touch",
+        "write_bytes",
+        "write_text",
+    }
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        output_path = ""
+        if isinstance(node.func, ast.Name) and node.func.id == "open":
+            mode = (
+                _literal_path(node.args[1])
+                if len(node.args) > 1
+                else next(
+                    (
+                        _literal_path(keyword.value)
+                        for keyword in node.keywords
+                        if keyword.arg == "mode"
+                    ),
+                    "r",
+                )
+            )
+            if any(flag in mode for flag in ("w", "a", "x", "+")) and node.args:
+                output_path = _literal_path(node.args[0])
+        elif (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr.lower() in output_methods
+        ):
+            receiver_path = _literal_path(node.func.value)
+            output_path = (
+                receiver_path
+                if receiver_path
+                else (_literal_path(node.args[0]) if node.args else "")
+            )
+        if output_path and _targets_task_input(output_path):
+            issues.append(
+                f"line {node.lineno}: generated code must not write to read-only "
+                f"task input path {output_path!r}; write run artifacts in the "
+                "current working directory"
             )
     # Preserve order while removing duplicate messages.
     return list(dict.fromkeys(issues))

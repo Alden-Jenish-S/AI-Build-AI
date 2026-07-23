@@ -71,15 +71,19 @@ def main() -> None:
     parser.add_argument(
         "--output",
         type=Path,
-        default=PROJECT_ROOT / "eval" / "harness_candidates.json",
+        default=PROJECT_ROOT / "runs" / "harness_candidates.json",
     )
     parser.add_argument("--model", default=None)
     args = parser.parse_args()
     summary = collect_trace_summary([path.resolve() for path in args.run_dirs])
     candidates = propose_harness_candidates(summary, model=args.model)
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(candidates, indent=2), encoding="utf-8")
-    print(f"Wrote {len(candidates)} review-gated candidates to {args.output}")
+    output = args.output.resolve()
+    runs_root = (PROJECT_ROOT / "runs").resolve()
+    if output != runs_root and runs_root not in output.parents:
+        parser.error("--output must be inside the project's runs/ directory")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(candidates, indent=2), encoding="utf-8")
+    print(f"Wrote {len(candidates)} review-gated candidates to {output}")
 
 
 if __name__ == "__main__":

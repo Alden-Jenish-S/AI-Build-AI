@@ -1,0 +1,73 @@
+{
+  "artifact_id": "pca_ward_agglomerative_clustering",
+  "category": "clustering",
+  "description": "Unsupervised pipeline that one\u2011hot encodes categoricals, scales, reduces dimensionality with PCA, selects the number of clusters via silhouette score, fits Ward hierarchical clustering on the combined train+test embeddings, relabels clusters by size, and writes a Kaggle\u2011style submission file.",
+  "interface": {
+    "entrypoint": "run_pca_ward_clustering(train_csv, test_csv, submission_csv, id_column='Id')",
+    "output_contract": {
+      "kind": "predictions",
+      "aligned_to": "test_csv",
+      "value_type": "label"
+    }
+  },
+  "capabilities": {
+    "supported_operators": [
+      "refine",
+      "tune",
+      "diversify"
+    ],
+    "tunable_parameters": [
+      "k_range"
+    ],
+    "gpu_accelerated": false,
+    "supported_accelerators": [
+      "cpu"
+    ],
+    "input_types": [
+      "numeric",
+      "categorical",
+      "missing"
+    ],
+    "target_types": [
+      "unsupervised_clustering"
+    ]
+  },
+  "scope": "full_pipeline",
+  "resource_profile": {
+    "accelerator": "cpu",
+    "min_ram_gb": 2,
+    "estimated_runtime_seconds": 30
+  },
+  "dependencies": [
+    "numpy",
+    "pandas",
+    "scikit-learn",
+    "scipy"
+  ],
+  "verified": true,
+  "verification_log": "Passed subprocess verification at 2026-07-20 10:09:39.\nOutput:\nFunction returned type: DataFrame\nReturned tabular lengths: [30]\nSUCCESS\n\n<HOME>/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/.venv/lib/python3.11/site-packages/joblib/_multiprocessing_helpers.py:44: UserWarning: [Errno 1] Operation not permitted.  joblib will operate in serial mode\n  warnings.warn(\"%s.  joblib will operate in serial mode\" % (e,))",
+  "code_path": "pca_ward_agglomerative_clustering.py",
+  "verification_level": "contract-mock-data",
+  "verification_isolation": "sandbox-exec",
+  "builder_verification_attempts": [
+    {
+      "attempt": 1,
+      "status": "verification_failed",
+      "diagnostics": "Verifying artifact: pca_ward_agglomerative_clustering.json\nArtifact pca_ward_agglomerative_clustering failed sandbox verification!\nLog:\nFAILURE:\n\n<HOME>/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/.venv/lib/python3.11/site-packages/joblib/_multiprocessing_helpers.py:44: UserWarning: [Errno 1] Operation not permitted.  joblib will operate in serial mode\n  warnings.warn(\"%s.  joblib will operate in serial mode\" % (e,))\nTraceback (most recent call last):\n  File \"<WORKDIR>/tmp1mp_u_du.py\", line 151, in <module>\n    result = run_pca_ward_clustering(**kwargs)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"<WORKDIR>/pca_ward_agglomerative_clustering.py\", line 177, in run_pca_ward_clustering\n    pipeline.run_and_save(\n  File \"<WORKDIR>/pca_ward_agglomerative_clustering.py\", line 148, in run_and_save\n    train_df = pd.read_csv(train_path)\n               ^^^^^^^^^^^^^^^^^^^^^^^\n  File \"<HOME>/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/.venv/lib/python3.11/site-packages/pandas/io/parsers/readers.py\", line 1026, in read_csv\n    return _read(filepath_or_buffer, kwds)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"<HOME>/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/.venv/lib/python3.11/site-packages/pandas/io/parsers/readers.py\", line 620, in _read\n    parser = TextFileReader(filepath_or_buffer, **kwds)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"<HOME>/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/.venv/lib/python3.11/site-packages/pandas/io/parsers/readers.py\", line 1620, in __init__\n    self._engine = self._make_engine(f, self.engine)\n                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"<HOME>/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/.venv/lib/python3.11/site-packages/pandas/io/parsers/readers.py\", line 1880, in _make_engine\n    self.handles = get_handle(\n                   ^^^^^^^^^^^\n  File \"<HOME>/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/.venv/lib/python3.11/site-packages/pandas/io/common.py\", line 719, in get_handle\n    if _is_binary_mode(path_or_buf, mode) and \"b\" not in mode:\n       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"<HOME>/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/.venv/lib/python3.11/site-packages/pandas/io/common.py\", line 1181, in _is_binary_mode\n    return isinstance(handle, _get_binary_io_classes()) or \"b\" in getattr(\n                                                           ^^^^^^^^^^^^^^^\nTypeError: argument of type 'method' is not iterable\n\n\n"
+    },
+    {
+      "attempt": 2,
+      "status": "verification_failed",
+      "diagnostics": "Verifying artifact: pca_ward_agglomerative_clustering.json\nArtifact pca_ward_agglomerative_clustering failed sandbox verification!\nLog:\nFAILURE:\n\n<HOME>/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/.venv/lib/python3.11/site-packages/joblib/_multiprocessing_helpers.py:44: UserWarning: [Errno 1] Operation not permitted.  joblib will operate in serial mode\n  warnings.warn(\"%s.  joblib will operate in serial mode\" % (e,))\nTraceback (most recent call last):\n  File \"<WORKDIR>/tmp21hp13lj.py\", line 151, in <module>\n    result = run_pca_ward_clustering(**kwargs)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"<WORKDIR>/pca_ward_agglomerative_clustering.py\", line 234, in run_pca_ward_clustering\n    return pipeline.run_and_save(\n           ^^^^^^^^^^^^^^^^^^^^^^\n  File \"<WORKDIR>/pca_ward_agglomerative_clustering.py\", line 194, in run_and_save\n    {\nTypeError: unhashable type: 'list'\n\n\n"
+    },
+    {
+      "attempt": 3,
+      "status": "verified"
+    }
+  ],
+  "provenance": {
+    "source_type": "web_search",
+    "discovery_id": "691bde5651c1d01d2b239787",
+    "task_name": "tabular-playground-series-jul-2022"
+  }
+}

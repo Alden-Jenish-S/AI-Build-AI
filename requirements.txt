@@ -12,13 +12,19 @@ matplotlib==3.10.7
 # Model families used by verified memory-pool artifacts
 catboost==1.2.5
 category_encoders==2.8.1
-lightgbm==4.3.0
+lightgbm==4.6.0
 xgboost==1.7.6
-torch==2.8.0
+# PyTorch's CUDA 12.8 wheel omits Pascal. TITAN Xp is sm_61, so NVIDIA
+# x86_64 workers must use the official CUDA 12.6 build, which includes sm_61.
+--extra-index-url https://download.pytorch.org/whl/cu126
+torch==2.8.0+cu126 ; (platform_system == "Linux" and platform_machine == "x86_64") or (platform_system == "Windows" and platform_machine == "AMD64")
+torch==2.8.0 ; (platform_system != "Linux" or platform_machine != "x86_64") and (platform_system != "Windows" or platform_machine != "AMD64")
+pytorch-tabnet==4.1.0
 
 # Useful tabular-search extensions for generated techniques
 imbalanced-learn==0.14.0
 optuna==4.5.0
+ngboost==0.5.11
 
 # Tests
 pytest==8.4.2

@@ -1,0 +1,85 @@
+{
+  "artifact_id": "tabnet_sparse_isotonic",
+  "category": "tabular_deep_learning",
+  "description": "Leakage-safe TabNet regression with sparse feature selection, fold-local mixed-type preprocessing, K-fold ensembling, and OOF isotonic calibration.",
+  "interface": {
+    "entrypoint": "train_and_predict(X_train, X_test, y_train=None, cat_features=None, numeric_features=None, n_folds=3, n_d=8, n_a=8, n_steps=3, gamma=1.5, lambda_sparse=0.0001, learning_rate=0.02, weight_decay=0.00001, batch_size=256, random_state=42)",
+    "output_contract": {
+      "kind": "predictions",
+      "aligned_to": "X_test",
+      "value_type": "continuous"
+    }
+  },
+  "capabilities": {
+    "supported_operators": [
+      "refine",
+      "tune",
+      "diversify"
+    ],
+    "tunable_parameters": [
+      "n_d",
+      "n_a",
+      "n_steps",
+      "gamma",
+      "lambda_sparse",
+      "learning_rate",
+      "weight_decay",
+      "batch_size"
+    ],
+    "gpu_accelerated": true,
+    "supported_accelerators": [
+      "cpu",
+      "cuda"
+    ],
+    "input_types": [
+      "numeric",
+      "categorical",
+      "missing"
+    ],
+    "target_types": [
+      "regression"
+    ]
+  },
+  "scope": "full_pipeline",
+  "resource_profile": {
+    "accelerator": "cpu",
+    "min_ram_gb": 4,
+    "estimated_runtime_seconds": 300
+  },
+  "dependencies": [
+    "numpy",
+    "pandas",
+    "scikit-learn",
+    "torch",
+    "pytorch-tabnet"
+  ],
+  "verified": true,
+  "verification_log": "Passed subprocess verification at 2026-07-19 19:49:13.\nOutput:\nStop training because you reached max_epochs = 2 with best_epoch = 1 and best_validation_rmse = 0.6933\n\nEarly stopping occurred at epoch 1 with best_epoch = 0 and best_validation_rmse = 0.67304\n\nEarly stopping occurred at epoch 1 with best_epoch = 0 and best_validation_rmse = 1.26392\nFunction returned type: Series\nReturned tabular lengths: [30]\nSUCCESS\n\n<HOME>/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/.venv/lib/python3.11/site-packages/pytorch_tabnet/callbacks.py:172: UserWarning: Best weights from best epoch are automatically used!\n  warnings.warn(wrn_msg)\n<HOME>/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/.venv/lib/python3.11/site-packages/pytorch_tabnet/callbacks.py:172: UserWarning: Best weights from best epoch are automatically used!\n  warnings.warn(wrn_msg)\n<HOME>/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/.venv/lib/python3.11/site-packages/pytorch_tabnet/callbacks.py:172: UserWarning: Best weights from best epoch are automatically used!\n  warnings.warn(wrn_msg)",
+  "code_path": "tabnet_sparse_isotonic.py",
+  "verification_level": "mixed-missing-contract-mock-data",
+  "verification_isolation": "resource-limited-subprocess",
+  "task_validations": [
+    {
+      "task_name": "playground-series",
+      "node_id": "node_4",
+      "score": 7.909017556937547,
+      "metric_direction": "minimize",
+      "status": "completed",
+      "reward": 0.0033626177756613,
+      "fidelity": "screen",
+      "elapsed_seconds": 65.23470604099566,
+      "improved_over_baseline": true
+    },
+    {
+      "task_name": "playground-series",
+      "node_id": "node_12",
+      "score": 7.909017556937547,
+      "metric_direction": "minimize",
+      "status": "completed",
+      "reward": 0.0033626177756613,
+      "fidelity": "screen",
+      "elapsed_seconds": 411.40998425,
+      "improved_over_baseline": true
+    }
+  ]
+}
