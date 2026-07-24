@@ -165,8 +165,13 @@ class ImplementationAgent:
     ) -> str:
         if operator != "tune" or not tuning_context:
             return ""
+        suggested = tuning_context.get("suggested_initial_parameters", [])
+        reused = tuning_context.get("reused_trials", [])
+        duplicate_hashes = tuning_context.get(
+            "avoid_duplicate_parameter_hashes", []
+        )
         return (
-            "This is a baseline-triggered fine-tuning run, not an architecture rewrite. Preserve the "
+            "This is an evidence-triggered fine-tuning run, not an architecture rewrite. Preserve the "
             "parent preprocessing, feature set, model family, folds, and output schema. Search only "
             "meaningful existing hyperparameters, reuse the parent settings as a control trial, and use "
             f"at most {fidelity_profile['max_tuning_trials']} deterministic/pruned trials. For neural "
@@ -176,7 +181,14 @@ class ImplementationAgent:
             "that cap. For boosted trees, tune depth/leaves, learning rate, regularization, sampling, "
             f"and iterations up to {fidelity_profile['max_estimator_iterations']}. Optimize only the "
             "harness-provided validation folds—never the test set. result.json must include a non-empty "
-            "`hyperparameters` object and integer `tuning_trials`.\n"
+            "`hyperparameters` object and integer `tuning_trials`. Treat compatible historical trials "
+            "as prior evidence: evaluate the suggested configurations first when they fit the current "
+            "bounds, do not repeat an identical parameter configuration, and retain broad exploration "
+            "when transferred configurations underperform. Never compare raw scores across different "
+            "tasks; the supplied history is ranked by normalized improvement and compatibility.\n"
+            f"Suggested initial configurations: {json.dumps(suggested, default=str)}\n"
+            f"Compatible reused trials: {json.dumps(reused, default=str)}\n"
+            f"Known parameter hashes to avoid duplicating: {json.dumps(duplicate_hashes)}\n"
             f"Fine-tuning trigger context: {json.dumps(tuning_context, default=str)}\n"
         )
 

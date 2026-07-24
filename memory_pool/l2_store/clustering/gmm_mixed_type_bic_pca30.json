@@ -1,0 +1,67 @@
+{
+  "artifact_id": "gmm_mixed_type_bic_pca30",
+  "category": "clustering",
+  "description": "Unsupervised clustering for mixed-type tabular data using RobustScaler + OneHotEncoder preprocessing, PCA to 30 components, and GaussianMixture with full covariance. Model selection via BIC across n_components=5..20 to automatically determine the number of clusters. Outputs cluster labels relabeled to consecutive integers.",
+  "interface": {
+    "entrypoint": "gmm_mixed_type_bic_pca30(X, n_components_range=(5, 20), pca_components=30, random_state=42)",
+    "input_contract": {
+      "modality": "tabular",
+      "container": "dataframe",
+      "parameter_roles": {
+        "X": "train"
+      },
+      "sample_shape": [
+        "n_features"
+      ],
+      "file_extension": ".csv"
+    },
+    "output_contract": {
+      "kind": "predictions",
+      "aligned_to": "X",
+      "value_type": "label"
+    }
+  },
+  "capabilities": {
+    "supported_operators": [
+      "refine",
+      "tune",
+      "diversify"
+    ],
+    "tunable_parameters": [
+      "n_components_range",
+      "pca_components",
+      "random_state"
+    ],
+    "gpu_accelerated": false,
+    "supported_accelerators": [
+      "cpu"
+    ],
+    "input_types": [
+      "mixed_type_tabular"
+    ],
+    "target_types": []
+  },
+  "scope": "component",
+  "resource_profile": {
+    "accelerator": "cpu",
+    "min_ram_gb": 1,
+    "estimated_runtime_seconds": 30
+  },
+  "dependencies": [
+    "numpy",
+    "pandas",
+    "scikit-learn"
+  ],
+  "verified": true,
+  "verification_log": "Passed subprocess verification at 2026-07-24 12:40:34.\nOutput:\nFunction returned type: ndarray\nObserved output shapes: [(65,)]\nVERIFICATION_MODALITY=tabular\nVERIFICATION_CONTRACT=declared\nSUCCESS\n\n<HOME>/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/.venv/lib/python3.11/site-packages/joblib/_multiprocessing_helpers.py:44: UserWarning: [Errno 1] Operation not permitted.  joblib will operate in serial mode\n  warnings.warn(\"%s.  joblib will operate in serial mode\" % (e,))",
+  "code_path": "gmm_mixed_type_bic_pca30.py",
+  "verification_level": "tabular-contract-synthetic-data",
+  "verification_contract_source": "declared",
+  "verification_isolation": "sandbox-exec",
+  "builder_verification_attempts": [
+    {
+      "attempt": 1,
+      "status": "verified"
+    }
+  ]
+}

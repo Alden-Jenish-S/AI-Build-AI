@@ -20,6 +20,17 @@ from .aggregator_agent import AggregatorAgent
 from .setup_agent import SetupAgent
 from memory_pool.builder.l2_builder import L2Builder
 from memory_pool.query_tool import normalize_resource_profile
+from search import (
+    ArtifactRecord,
+    DiversityController,
+    EvidenceService,
+    InformationGainStrategy,
+    PromotionController,
+    ProvenanceGraph,
+    PruningPolicy,
+    TuningCoordinator,
+    TuningKnowledgeBase,
+)
 from runtime_utils import (
     absolute_path_without_symlink_resolution,
     detect_available_accelerators,
@@ -123,6 +134,20 @@ class ManagerAgent:
         self.technique_agent = TechniqueAgent(model_name=self.model_name)
         self.implementation_agent = ImplementationAgent(venv_python_path=self.venv_path, model_name=self.model_name)
         self.aggregator_agent = AggregatorAgent()
+        self.evidence_service = EvidenceService()
+        self.pruning_policy = PruningPolicy()
+        self.promotion_controller = PromotionController()
+        self.information_gain_strategy = InformationGainStrategy()
+        self.diversity_controller = DiversityController()
+        self.provenance_graph = ProvenanceGraph(
+            self.run_root / "provenance_graph.json"
+        )
+        self.tuning_coordinator = TuningCoordinator(
+            TuningKnowledgeBase(
+                self.project_root / "memory_pool" / "tuning_history.jsonl"
+            )
+        )
+        self._scheduled_merge_pairs: set[tuple[str, str]] = set()
         
         # State tracker
         self.all_nodes: Dict[str, NodeState] = {}
@@ -364,6 +389,32 @@ class ManagerAgent:
         self.run_root.mkdir(parents=True, exist_ok=True)
         print(f"ManagerAgent: Archived previous run at {archived_run}")
 
+    def _ensure_search_services(self) -> None:
+        """Provide policy services for normal construction and focused unit tests."""
+        if not hasattr(self, "evidence_service"):
+            self.evidence_service = EvidenceService()
+        if not hasattr(self, "pruning_policy"):
+            self.pruning_policy = PruningPolicy()
+        if not hasattr(self, "promotion_controller"):
+            self.promotion_controller = PromotionController()
+        if not hasattr(self, "information_gain_strategy"):
+            self.information_gain_strategy = InformationGainStrategy()
+        if not hasattr(self, "diversity_controller"):
+            self.diversity_controller = DiversityController()
+        if not hasattr(self, "provenance_graph"):
+            self.provenance_graph = ProvenanceGraph(
+                Path(self.run_root) / "provenance_graph.json"
+            )
+        if not hasattr(self, "tuning_coordinator"):
+            project_root = getattr(self, "project_root", Path(self.run_root))
+            self.tuning_coordinator = TuningCoordinator(
+                TuningKnowledgeBase(
+                    Path(project_root) / "memory_pool" / "tuning_history.jsonl"
+                )
+            )
+        if not hasattr(self, "_scheduled_merge_pairs"):
+            self._scheduled_merge_pairs = set()
+
     def get_new_node_id(self) -> str:
         self.node_counter += 1
         return f"node_{self.node_counter}"
@@ -382,6 +433,12 @@ class ManagerAgent:
                 "validation": node.result.get("validation", {}),
                 "oof_path": node.result.get("oof_path"),
                 "tuning": node.result.get("tuning"),
+                "merge": node.result.get("merge"),
+                "statistical_evidence": node.result.get(
+                    "statistical_evidence"
+                ),
+                "pruning_decision": node.result.get("pruning_decision"),
+                "promotion_decision": node.result.get("promotion_decision"),
                 "artifact_repair": node.result.get("artifact_repair"),
                 "artifact_variant": node.result.get("artifact_variant"),
                 "no_effect_reason": node.result.get("no_effect_reason"),
@@ -589,6 +646,9 @@ class ManagerAgent:
             ),
             "experiments_executed": getattr(self, "experiments_executed", 0),
             "max_fine_tune_rounds": getattr(self, "max_fine_tune_rounds", 2),
+            "provenance_graph": "provenance_graph.json",
+            "execution_graph": "single_parent_tree",
+            "merge_operator": "merge_ensemble",
             "resource_capacity": {
                 "accelerators": sorted(
                     getattr(self, "available_accelerators", {"cpu"})
@@ -679,7 +739,7 @@ class ManagerAgent:
     def _operator_compatibility_reason(
         model_card: dict | None, operator: str | None
     ) -> str | None:
-        if not model_card or not operator or operator == "initial":
+        if not model_card or not operator or operator in {"initial", "promote"}:
             return None
         capabilities = model_card.get("capabilities")
         if not isinstance(capabilities, dict):
@@ -698,6 +758,8 @@ class ManagerAgent:
         Note: initialize_task() must be called by the caller before this method.
         """
         self._prepare_run_root()
+        self._ensure_search_services()
+        self._scheduled_merge_pairs.clear()
         print(f"\n==========================================")
         print(f"ManagerAgent: Starting Tree Search for {self.task_name}")
         print(f"==========================================")
@@ -924,6 +986,223 @@ class ManagerAgent:
             fidelity, "full"
         )
 
+    def _baseline_result_record(self) -> dict | None:
+        """Load fold-level baseline evidence when the harness persisted it."""
+        if self.baseline_score is None:
+            return None
+        record: dict[str, Any] = {"score": float(self.baseline_score)}
+        baseline_dir = getattr(
+            self, "baseline_dir", Path(self.run_root) / "baseline"
+        )
+        result_path = Path(baseline_dir) / "result.json"
+        if not result_path.is_file():
+            return record
+        try:
+            payload = json.loads(result_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return record
+        validation = {
+            key: payload.get(key)
+            for key in (
+                "cv_mean",
+                "cv_std",
+                "folds",
+                "fold_scores",
+                "fidelity",
+                "fold_assignment_sha256",
+            )
+            if payload.get(key) is not None
+        }
+        if validation:
+            record["validation"] = validation
+        return record
+
+    def _evidence_for_result(
+        self, node: NodeState, reference: dict | None = None
+    ):
+        self._ensure_search_services()
+        candidate = node.result or {}
+        if candidate.get("score") is None:
+            return None
+        reference = reference or self._baseline_result_record()
+        if not reference or reference.get("score") is None:
+            return None
+        try:
+            return self.evidence_service.compare(
+                candidate,
+                reference,
+                direction=self.metric_direction,
+            )
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _model_family_for_node(node: NodeState) -> str:
+        config = node.config or {}
+        record = config.get("technique_record") or {}
+        card = record.get("model_card") or (
+            record.get("candidate_artifact") or {}
+        ).get("model_card") or {}
+        return str(
+            card.get("artifact_id")
+            or record.get("artifact_id")
+            or next(iter((node.result or {}).get("implementation_families", [])), "")
+            or "unknown_model_family"
+        )
+
+    def _record_tuning_history(self, node: NodeState) -> None:
+        """Persist a completed tuning result for same-task and global reuse."""
+        if node.operator != "tune" or not node.result:
+            return
+        tuning = node.result.get("tuning") or {}
+        parameters = tuning.get("hyperparameters")
+        if not isinstance(parameters, dict) or not parameters:
+            return
+        self._ensure_search_services()
+        context = (node.config or {}).get("tuning_context") or {}
+        validation = node.result.get("validation") or {}
+        score = node.result.get("score")
+        if score is None:
+            return
+        self.tuning_coordinator.record(
+            trial_id=node.node_id,
+            task_name=self.task_name,
+            model_family=context.get("model_family")
+            or self._model_family_for_node(node),
+            search_space_version=context.get("search_space_version")
+            or self.tuning_coordinator.search_space_version(
+                context.get("tunable_parameters", [])
+            ),
+            parameters=parameters,
+            score=float(score),
+            normalized_improvement=self._score_to_reward(float(score), 0.0),
+            metric_name=getattr(self, "metric_name", "score"),
+            metric_direction=self.metric_direction,
+            fidelity=node.fidelity,
+            dataset_fingerprint=validation.get("fold_assignment_sha256"),
+            uncertainty=validation.get("cv_std"),
+            elapsed_seconds=node.result.get("elapsed_seconds"),
+            trial_count=tuning.get("tuning_trials") or 1,
+        )
+
+    def _record_node_provenance(self, node: NodeState) -> None:
+        """Record artifact dependencies without adding scheduler parents."""
+        if not node.result or node.result.get("status") != "completed":
+            return
+        self._ensure_search_services()
+        config = node.config or {}
+        validation = node.result.get("validation") or {}
+        input_artifacts = list(config.get("input_artifact_ids") or [])
+        base_node_id = config.get("base_node_id")
+        if not input_artifacts and base_node_id:
+            input_artifacts = [f"{base_node_id}:predictions"]
+        parameters = (
+            (node.result.get("tuning") or {}).get("hyperparameters")
+            or config.get("parameters")
+        )
+        parameter_hash = (
+            hashlib.sha256(
+                json.dumps(
+                    parameters, sort_keys=True, default=str
+                ).encode("utf-8")
+            ).hexdigest()
+            if parameters
+            else None
+        )
+        relation = (
+            "ensembled_from"
+            if node.operator == "merge_ensemble"
+            else ("tuned_from" if node.operator == "tune" else "derived_from")
+        )
+        self.provenance_graph.record(
+            ArtifactRecord(
+                artifact_id=f"{node.node_id}:predictions",
+                artifact_type="prediction_bundle",
+                produced_by_node_id=node.node_id,
+                dataset_fingerprint=validation.get(
+                    "fold_assignment_sha256"
+                ),
+                code_hash=(
+                    self._sha256_file(Path(node.code)) if node.code else None
+                ),
+                parameter_hash=parameter_hash,
+                metadata={
+                    "operator": node.operator,
+                    "fidelity": node.fidelity,
+                    "score": node.result.get("score"),
+                    "oof_path": node.result.get("oof_path"),
+                },
+            ),
+            sources=[
+                (artifact_id, relation) for artifact_id in input_artifacts
+            ],
+        )
+
+    def _spawn_merge_ensemble_slot(
+        self, node: NodeState, node_id: str, evidence
+    ) -> None:
+        """Create one manager-owned, OOF-backed ensemble action."""
+        if (
+            evidence is None
+            or self.experiments_executed + 1 >= self.total_budget
+            or getattr(self, "task_type", None) == "unsupervised_clustering"
+        ):
+            return
+        self._ensure_search_services()
+        assessment = self.diversity_controller.best_partner(
+            node_id=node_id,
+            node_fidelity=node.fidelity,
+            all_nodes=self.all_nodes,
+            run_root=Path(self.run_root),
+            metric_name=getattr(self, "metric_name", "score"),
+            evidence=evidence,
+            excluded_pairs=self._scheduled_merge_pairs,
+            strategy=getattr(self, "ensemble_strategy", "auto"),
+        )
+        if assessment is None or assessment.utility <= 0.0:
+            return
+        partner_id = assessment.partner_node_id
+        pair = tuple(sorted((node_id, partner_id)))
+        self._scheduled_merge_pairs.add(pair)
+        merge_id = self.get_new_node_id()
+        input_node_ids = [node_id, partner_id]
+        child = NodeState(
+            node_id=merge_id,
+            parent_id=node_id,
+            node_type="implementation",
+            plan="Ensemble two measured node models using the best OOF-backed strategy.",
+            operator="merge_ensemble",
+            fidelity=node.fidelity,
+            config={
+                "priority": assessment.utility,
+                "input_node_ids": input_node_ids,
+                "input_artifact_ids": [
+                    f"{source_id}:predictions"
+                    for source_id in input_node_ids
+                ],
+                "diversity_assessment": assessment.to_dict(),
+                "requested_strategy": getattr(
+                    self, "ensemble_strategy", "auto"
+                ),
+                "planned_strategy": assessment.strategy,
+                "planned_weights": list(assessment.weights),
+                "manager_owned_merge": True,
+                "raw_code_fusion": False,
+            },
+        )
+        self.all_nodes[merge_id] = child
+        node.children_ids.append(merge_id)
+        self._persist_node(merge_id)
+        self._trace_search(
+            {
+                "event": "merge_ensemble_scheduled",
+                "node_id": merge_id,
+                "execution_parent_id": node_id,
+                "input_node_ids": input_node_ids,
+                "assessment": assessment.to_dict(),
+            }
+        )
+
     def _record_artifact_validation(
         self,
         tech_record: dict,
@@ -1010,13 +1289,31 @@ class ManagerAgent:
         return fallback
 
     def _spawn_follow_up_nodes(self, node: NodeState, node_id: str) -> None:
-        """Create cheap virtual operator slots; materialize only the selected slot."""
+        """Create policy-approved virtual actions outside the scheduler."""
         if self.experiments_executed + 1 >= self.total_budget or not node.code:
             return
+        self._ensure_search_services()
         result = node.result or {}
         score = result.get("score")
         validation = result.get("validation") or {}
-        cv_std = validation.get("cv_std", 0.0)
+        evidence = self._evidence_for_result(node)
+        if evidence is not None:
+            result["statistical_evidence"] = evidence.to_dict()
+            pruning = self.pruning_policy.decide(evidence)
+            result["pruning_decision"] = pruning.to_dict()
+            if pruning.prune:
+                self._trace_search(
+                    {
+                        "event": "statistical_prune",
+                        "node_id": node_id,
+                        "evidence": evidence.to_dict(),
+                        "decision": pruning.to_dict(),
+                    }
+                )
+                self._persist_node(node_id)
+                self._persist_tree_state()
+                return
+
         repaired_artifact = result.get("artifact_repair") or {}
         artifact_variant = (
             repaired_artifact
@@ -1041,31 +1338,45 @@ class ManagerAgent:
             else []
         )
         fine_tune_depth = int((node.config or {}).get("fine_tune_depth", 0) or 0)
-        tune_eligible = self._beats_baseline(score, cv_std) and fine_tune_depth < getattr(
-            self, "max_fine_tune_rounds", 2
+        tuning_evidence = evidence
+        if node.operator == "tune":
+            previous_node = self.all_nodes.get(
+                (node.config or {}).get("base_node_id")
+            )
+            if previous_node and previous_node.result:
+                tuning_evidence = self._evidence_for_result(
+                    node, previous_node.result
+                )
+        tune_eligible = (
+            tuning_evidence is not None
+            and tuning_evidence.probability_material_improvement
+            >= self.promotion_controller.boundary
+            and fine_tune_depth
+            < getattr(self, "max_fine_tune_rounds", 2)
         )
         if tunable_parameters_declared and not tunable_parameters:
             tune_eligible = False
-        if tune_eligible and node.operator == "tune":
-            previous_node = self.all_nodes.get((node.config or {}).get("base_node_id"))
-            previous_score = (previous_node.result or {}).get("score") if previous_node else None
-            previous_validation = (
-                (previous_node.result or {}).get("validation") or {}
-                if previous_node
-                else {}
-            )
-            previous_conservative_score = (
-                self._conservative_score(
-                    previous_score, previous_validation.get("cv_std", 0.0)
-                )
-                if previous_score is not None
-                else None
-            )
-            tune_eligible = previous_score is not None and self._improves_on_score(
-                score, previous_conservative_score, cv_std
-            )
 
-        operator_priorities = {"refine": 0.02, "diversify": 0.06}
+        base_utility = (
+            self.information_gain_strategy.utility(evidence)
+            if evidence is not None
+            else 0.0
+        )
+        operator_priorities = {
+            "refine": base_utility,
+            "diversify": base_utility,
+        }
+        promotion = (
+            self.promotion_controller.decide(
+                evidence, current_fidelity=node.fidelity
+            )
+            if evidence is not None and self.enable_multi_fidelity
+            else None
+        )
+        if promotion is not None:
+            result["promotion_decision"] = promotion.to_dict()
+            if promotion.promote:
+                operator_priorities["promote"] = promotion.utility
         parent_technique_record = (node.config or {}).get(
             "technique_record"
         ) or {}
@@ -1073,22 +1384,35 @@ class ManagerAgent:
             parent_technique_record.get("model_card") or {}
         ).get("artifact_id")
         if tune_eligible:
-            # A measured winner earns a high-priority, model-locked fine-tuning slot.
-            operator_priorities["tune"] = 0.09
+            operator_priorities["tune"] = self.information_gain_strategy.utility(
+                tuning_evidence
+            )
         for operator, priority in operator_priorities.items():
             child_fidelity = (
-                self._next_fidelity(node.fidelity)
-                if self.enable_multi_fidelity and operator == "refine"
+                promotion.target_fidelity
+                if operator == "promote" and promotion is not None
                 else node.fidelity
             )
             is_fine_tune = operator == "tune"
+            is_promotion = operator == "promote"
             tuning_context = None
             if is_fine_tune:
+                model_family = self._model_family_for_node(node)
+                history_context = self.tuning_coordinator.build_context(
+                    task_name=self.task_name,
+                    model_family=model_family,
+                    tunable_parameters=tunable_parameters,
+                    metric_name=getattr(self, "metric_name", "score"),
+                    metric_direction=self.metric_direction,
+                    dataset_fingerprint=validation.get(
+                        "fold_assignment_sha256"
+                    ),
+                )
                 tuning_context = {
-                    "trigger": "conservative_score_beats_baseline",
+                    "trigger": "posterior_material_improvement",
                     "parent_node_id": node_id,
                     "parent_score": score,
-                    "parent_cv_std": cv_std,
+                    "parent_cv_std": validation.get("cv_std", 0.0),
                     "baseline_score": self.baseline_score,
                     "metric_direction": self.metric_direction,
                     "comparison_fidelity": node.fidelity,
@@ -1096,6 +1420,16 @@ class ManagerAgent:
                     "artifact_variant": artifact_variant,
                     "tunable_parameters_declared": tunable_parameters_declared,
                     "tunable_parameters": tunable_parameters,
+                    "model_family": model_family,
+                    "dataset_fingerprint": validation.get(
+                        "fold_assignment_sha256"
+                    ),
+                    "statistical_evidence": (
+                        tuning_evidence.to_dict()
+                        if tuning_evidence is not None
+                        else None
+                    ),
+                    **history_context,
                 }
             new_id = self.get_new_node_id()
             child = NodeState(
@@ -1109,18 +1443,25 @@ class ManagerAgent:
                     "base_node_id": node_id,
                     "base_code_path": node.code,
                     "priority": priority,
-                    "priority_locked": is_fine_tune,
+                    "priority_locked": is_fine_tune or is_promotion,
                     "lazy_proposal": True,
                     "materialized": False,
                     "fine_tune_triggered": is_fine_tune,
+                    "preserve_parent_technique": is_promotion,
                     "fine_tune_depth": (
                         fine_tune_depth + 1 if is_fine_tune else fine_tune_depth
                     ),
                     "tuning_context": tuning_context,
+                    "policy_evidence": (
+                        evidence.to_dict() if evidence is not None else None
+                    ),
+                    "promotion_decision": (
+                        promotion.to_dict() if is_promotion else None
+                    ),
                     "artifact_variant": artifact_variant,
                     "locked_technique_record": (
                         copy.deepcopy((node.config or {}).get("technique_record"))
-                        if is_fine_tune
+                        if is_fine_tune or is_promotion
                         else None
                     ),
                     "allowed_scopes": (
@@ -1133,6 +1474,7 @@ class ManagerAgent:
                         if operator == "diversify" and parent_artifact_id
                         else []
                     ),
+                    "raw_code_fusion": False,
                 },
             )
             self.all_nodes[new_id] = child
@@ -1151,8 +1493,23 @@ class ManagerAgent:
                         "parent_score": score,
                         "baseline_score": self.baseline_score,
                         "fine_tune_round": fine_tune_depth + 1,
+                        "reused_trial_count": len(
+                            (tuning_context or {}).get("reused_trials", [])
+                        ),
                     }
                 )
+            elif is_promotion:
+                self._trace_search(
+                    {
+                        "event": "promotion_scheduled",
+                        "node_id": new_id,
+                        "parent_node_id": node_id,
+                        "from_fidelity": node.fidelity,
+                        "to_fidelity": child_fidelity,
+                        "decision": promotion.to_dict(),
+                    }
+                )
+        self._spawn_merge_ensemble_slot(node, node_id, evidence)
         self._persist_node(node_id)
         self._persist_tree_state()
 
@@ -1171,6 +1528,17 @@ class ManagerAgent:
                 + json.dumps(context, default=str)
             )
             config["proposal_name"] = "baseline_winner_fine_tune"
+            config["materialized"] = True
+            node.config = config
+            self._persist_node(node.node_id)
+            return
+        if config.get("preserve_parent_technique"):
+            node.plan = (
+                "Promote the measured parent unchanged to the scheduled fidelity. "
+                "Preserve its model family, preprocessing, features, and output "
+                "contract; modify only evaluation-fidelity resource settings."
+            )
+            config["proposal_name"] = "evidence_guided_promotion"
             config["materialized"] = True
             node.config = config
             self._persist_node(node.node_id)
@@ -1218,25 +1586,140 @@ class ManagerAgent:
         node.config = config
         self._persist_node(node.node_id)
 
+    def _execute_ensemble_node(
+        self, node: NodeState, selected_id: str
+    ) -> bool:
+        """Have ManagerAgent ensemble two measured node prediction artifacts."""
+        self._ensure_search_services()
+        node_dir = Path(self.run_root) / selected_id
+        source_node_ids = list(
+            (node.config or {}).get("input_node_ids") or []
+        )
+        res = self.aggregator_agent.merge_nodes(
+            Path(self.run_root),
+            source_node_ids,
+            node_dir,
+            metric_name=getattr(self, "metric_name", "score"),
+            strategy=(node.config or {}).get("requested_strategy", "auto"),
+        )
+        if res is None:
+            node.executed = True
+            node.result = {
+                "score": None,
+                "status": "skipped_no_effect",
+                "reward": None,
+                "diagnostics": (
+                    "No OOF-backed multi-model ensemble improved on the "
+                    "strongest source node."
+                ),
+            }
+            self._trace_search(
+                {
+                    "event": "merge_ensemble_skipped",
+                    "node_id": selected_id,
+                    "input_node_ids": source_node_ids,
+                    "reason": "no_effective_multi_model_plan",
+                }
+            )
+            self._persist_node(selected_id)
+            self._persist_tree_state()
+            return False
+        score = float(res["score"])
+        validation = res.get("validation") or {}
+        validation["fidelity"] = node.fidelity
+        if source_node_ids:
+            source_validation = (
+                self.all_nodes[source_node_ids[0]].result or {}
+            ).get("validation") or {}
+            for key in (
+                "fold_assignment_sha256",
+                "row_count",
+                "source_row_count",
+            ):
+                if source_validation.get(key) is not None:
+                    validation[key] = source_validation[key]
+        cv_std = validation.get("cv_std", 0.0)
+        raw_reward = self._score_to_reward(score, 0.0)
+        reward = self._score_to_reward(score, cv_std)
+        node.code = res.get("code_path")
+        node.result = {
+            "score": score,
+            "status": "completed",
+            "reward": reward,
+            "raw_reward": raw_reward,
+            "uncertainty_penalty": raw_reward - reward,
+            "diagnostics": res.get("diagnostics"),
+            "elapsed_seconds": res.get("elapsed_seconds"),
+            "validation": validation,
+            "oof_path": res.get("oof_path"),
+            "merge": res.get("merge"),
+        }
+        node.executed = True
+        self.global_memory.record_implementation(
+            selected_id,
+            {
+                "node_id": selected_id,
+                "operator": "merge_ensemble",
+                "fidelity": node.fidelity,
+                "input_node_ids": source_node_ids,
+                "validation": validation,
+                "reward": reward,
+            },
+            score,
+            "completed",
+        )
+        self.scheduler.backpropagate(selected_id, reward, self.all_nodes)
+        self._record_node_provenance(node)
+        self._trace_search(
+            {
+                "event": "merge_ensemble_completed",
+                "node_id": selected_id,
+                "input_node_ids": source_node_ids,
+                "score": score,
+                "reward": reward,
+                "fidelity": node.fidelity,
+            }
+        )
+        self._persist_node(selected_id)
+        self._persist_tree_state()
+        print(
+            f"ManagerAgent: Ensemble Node {selected_id} completed. "
+            f"Score: {score:.5f} (Reward: {reward:.5f})"
+        )
+        return True
+
     def _execute_node(self, node, selected_id, root_id, l1_index, l1_path):
         """Executes a single node (technique or implementation). Extracted for try/except isolation."""
+        if (
+            node.node_type == "implementation"
+            and node.operator == "merge_ensemble"
+        ):
+            return self._execute_ensemble_node(node, selected_id)
         if node.node_type == "technique":
             print(f"ManagerAgent: Running Technique Agent on {selected_id}...")
 
             self._materialize_lazy_proposal(node)
 
-            if (node.config or {}).get("fine_tune_triggered"):
-                # Fine-tuning is locked to the measured parent artifact/model
-                # family; querying the pool here could silently replace it.
+            if (node.config or {}).get("fine_tune_triggered") or (
+                node.config or {}
+            ).get("preserve_parent_technique"):
+                # Tuning and promotion are locked to the measured parent model;
+                # querying the pool here could silently replace the comparison.
                 tech_record = copy.deepcopy(
                     (node.config or {}).get("locked_technique_record") or {}
                 )
                 tech_record["plan"] = node.plan
-                tech_record["fine_tune"] = True
-                tech_record["tuning_context"] = (node.config or {}).get(
-                    "tuning_context"
-                )
-                tech_record.setdefault("status", "self_contained_fine_tune")
+                if (node.config or {}).get("fine_tune_triggered"):
+                    tech_record["fine_tune"] = True
+                    tech_record["tuning_context"] = (node.config or {}).get(
+                        "tuning_context"
+                    )
+                    tech_record.setdefault("status", "self_contained_fine_tune")
+                else:
+                    tech_record["promotion"] = True
+                    tech_record.setdefault(
+                        "status", "self_contained_promotion"
+                    )
             else:
                 # Pool additions from earlier nodes in this same run must be visible.
                 with open(l1_path, 'r', encoding='utf-8') as f:
@@ -1331,8 +1814,15 @@ class ManagerAgent:
                     "fine_tune_triggered": planning_config.get(
                         "fine_tune_triggered", False
                     ),
+                    "preserve_parent_technique": planning_config.get(
+                        "preserve_parent_technique", False
+                    ),
                     "fine_tune_depth": planning_config.get("fine_tune_depth", 0),
                     "tuning_context": planning_config.get("tuning_context"),
+                    "policy_evidence": planning_config.get("policy_evidence"),
+                    "promotion_decision": planning_config.get(
+                        "promotion_decision"
+                    ),
                     "artifact_variant": planning_config.get("artifact_variant"),
                 },
             )
@@ -1493,11 +1983,13 @@ class ManagerAgent:
                             [candidate_card], requirements_file
                         )
             except Exception as exc:
-                if node.operator == "tune" or (node.config or {}).get(
-                    "fine_tune_triggered"
-                ):
-                    # A tuning node is model-locked; replacing its artifact would
-                    # invalidate the comparison, so it remains a free setup skip.
+                if node.operator in {"tune", "promote"} or (
+                    node.config or {}
+                ).get("fine_tune_triggered") or (
+                    node.config or {}
+                ).get("preserve_parent_technique"):
+                    # Tuning and promotion are model-locked; replacing the
+                    # artifact would invalidate the comparison.
                     node.executed = True
                     node.result = {
                         "score": None,
@@ -1515,7 +2007,7 @@ class ManagerAgent:
                     self._persist_node(selected_id)
                     self._persist_tree_state()
                     print(
-                        f"ManagerAgent: Skipping locked tuning node {selected_id}; "
+                        f"ManagerAgent: Skipping locked {node.operator} node {selected_id}; "
                         f"dependency setup failed: {exc}"
                     )
                     return False
@@ -1759,6 +2251,8 @@ class ManagerAgent:
             
             # Normalize reward for UCB1 backpropagation.
             self.scheduler.backpropagate(selected_id, reward, self.all_nodes)
+            self._record_tuning_history(node)
+            self._record_node_provenance(node)
             self._trace_search(
                 {
                     "event": "experiment_completed",

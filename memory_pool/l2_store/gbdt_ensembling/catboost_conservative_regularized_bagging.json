@@ -1,0 +1,91 @@
+{
+  "artifact_id": "catboost_conservative_regularized_bagging",
+  "category": "gbdt_ensembling",
+  "description": "Provides a CatBoost classifier with conservative hyperparameters (low learning rate 0.03, high iterations 2000, L2 regularization l2_leaf_reg=10, Bayesian bootstrap bagging_temperature=1.0) for improved generalization on tabular data.",
+  "interface": {
+    "entrypoint": "create_refined_catboost(cat_features=None, **param_overrides)",
+    "input_contract": {
+      "modality": "tabular",
+      "container": "list",
+      "parameter_roles": {
+        "cat_features": "categorical_columns"
+      },
+      "sample_shape": [],
+      "file_extension": null
+    },
+    "output_contract": {
+      "kind": "model",
+      "aligned_to": "categorical_columns",
+      "value_type": "model"
+    }
+  },
+  "capabilities": {
+    "supported_operators": [
+      "refine",
+      "tune",
+      "diversify"
+    ],
+    "tunable_parameters": [
+      "n_iterations",
+      "learning_rate",
+      "l2_leaf_reg",
+      "bagging_temperature",
+      "random_seed",
+      "depth",
+      "subsample",
+      "colsample_bylevel",
+      "random_strength",
+      "one_hot_max_size",
+      "early_stopping_rounds",
+      "od_wait"
+    ],
+    "gpu_accelerated": false,
+    "supported_accelerators": [
+      "cpu"
+    ],
+    "input_types": [
+      "tabular",
+      "categorical",
+      "numerical"
+    ],
+    "target_types": [
+      "binary_classification",
+      "multiclass_classification"
+    ]
+  },
+  "scope": "component",
+  "resource_profile": {
+    "accelerator": "cpu",
+    "min_ram_gb": 1,
+    "estimated_runtime_seconds": 60
+  },
+  "dependencies": [
+    "catboost",
+    "numpy"
+  ],
+  "verified": true,
+  "verification_log": "Passed subprocess verification at 2026-07-24 13:25:07.\nOutput:\nFunction returned type: RefinedCatBoostModel\nObserved output shapes: []\nVERIFICATION_MODALITY=tabular\nVERIFICATION_CONTRACT=declared\nSUCCESS",
+  "code_path": "catboost_conservative_regularized_bagging.py",
+  "verification_level": "tabular-contract-synthetic-data",
+  "verification_contract_source": "declared",
+  "verification_isolation": "sandbox-exec",
+  "builder_verification_attempts": [
+    {
+      "attempt": 1,
+      "status": "verified"
+    }
+  ],
+  "task_validations": [
+    {
+      "task_name": "playground-series-s6e2",
+      "node_id": "node_7",
+      "score": null,
+      "metric_direction": "maximize",
+      "status": "failed",
+      "reward": -1.0,
+      "fidelity": "screen",
+      "elapsed_seconds": 417.57310275000054,
+      "improved_over_baseline": null
+    }
+  ]
+}

@@ -4,7 +4,8 @@
     "l2_pointers": [
       "catboost_10fold_ensemble",
       "lightgbm_5fold_ensemble",
-      "xgboost_5fold_ensemble"
+      "xgboost_5fold_ensemble",
+      "catboost_conservative_regularized_bagging"
     ]
   },
   "feature_engineering_tabular": {
@@ -86,7 +87,8 @@
   "clustering": {
     "description": "Category for clustering techniques.",
     "l2_pointers": [
-      "pca_ward_agglomerative_clustering"
+      "pca_ward_agglomerative_clustering",
+      "gmm_mixed_type_bic_pca30"
     ]
   }
 }

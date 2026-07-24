@@ -1,3 +1,7 @@
+import json
+import shutil
+import time
+
 import pandas as pd
 import numpy as np
 from pathlib import Path
@@ -379,6 +383,151 @@ class AggregatorAgent:
             run_root, node_ids, metric_name, strategy=strategy
         )
         return plan["weights"] if plan else None
+
+    def merge_nodes(
+        self,
+        run_root: Path,
+        node_ids: List[str],
+        destination_dir: Path,
+        *,
+        metric_name: str,
+        strategy: str = "auto",
+    ) -> Optional[Dict]:
+        """Materialize an effective OOF-backed ensemble of measured nodes.
+
+        This is the typed merge primitive used by ManagerAgent. It combines the
+        models' prediction artifacts; it never combines or regenerates their code.
+        """
+        started = time.monotonic()
+        if len(node_ids) < 2 or len(set(node_ids)) != len(node_ids):
+            return None
+        applied_strategy = self._resolve_strategy(strategy, metric_name)
+        plan = self._oof_plan(
+            run_root,
+            node_ids,
+            metric_name,
+            strategy=applied_strategy,
+        )
+        if plan is None:
+            return None
+        weights = np.asarray(plan["weights"], dtype=float)
+        # A one-hot plan is not a merge. The OOF guardrail deliberately returns
+        # one when ensembling cannot beat the strongest constituent.
+        if np.count_nonzero(weights > 1e-8) < 2:
+            return None
+
+        frames = []
+        for node_id in node_ids:
+            frame = pd.read_csv(run_root / node_id / "oof_predictions.csv")
+            frames.append(frame.set_index("row_id").sort_index())
+        reference = frames[0]
+        if any(not frame.index.equals(reference.index) for frame in frames[1:]):
+            return None
+        targets = reference["target"].to_numpy(dtype=float)
+        prediction_matrix = np.stack(
+            [frame["prediction"].to_numpy(dtype=float) for frame in frames]
+        )
+        if applied_strategy == "rank_average":
+            prediction_matrix = self._rank_predictions(prediction_matrix)
+        merged_prediction = weights @ prediction_matrix
+        ensemble_objective = self._validation_metric(
+            targets, merged_prediction, metric_name
+        )
+        best_single_objective = max(
+            self._validation_metric(targets, prediction, metric_name)
+            for prediction in prediction_matrix
+        )
+        if ensemble_objective <= best_single_objective + 1e-12:
+            return None
+
+        if "fold_id" in reference.columns:
+            fold_ids = reference["fold_id"].to_numpy(dtype=int)
+        else:
+            assignments = (
+                pd.read_csv(run_root / node_ids[0] / "fold_assignments.csv")
+                .set_index("row_id")
+                .reindex(reference.index)
+            )
+            if assignments["fold_id"].isna().any():
+                return None
+            fold_ids = assignments["fold_id"].to_numpy(dtype=int)
+        for frame in frames[1:]:
+            if "fold_id" in frame.columns and not np.array_equal(
+                frame["fold_id"].to_numpy(dtype=int), fold_ids
+            ):
+                return None
+
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(
+            {
+                "row_id": reference.index.to_numpy(),
+                "target": targets,
+                "prediction": merged_prediction,
+                "fold_id": fold_ids,
+            }
+        ).to_csv(destination_dir / "oof_predictions.csv", index=False)
+        pd.DataFrame(
+            {"row_id": reference.index.to_numpy(), "fold_id": fold_ids}
+        ).to_csv(destination_dir / "fold_assignments.csv", index=False)
+
+        submission_path = destination_dir / "submission" / "submission.csv"
+        if not self.aggregate_submissions(
+            run_root,
+            node_ids,
+            submission_path,
+            weights=weights.tolist(),
+            strategy=applied_strategy,
+        ):
+            return None
+        source_manifest = run_root / node_ids[0] / "evaluation_manifest.json"
+        if source_manifest.is_file():
+            shutil.copy2(
+                source_manifest, destination_dir / "evaluation_manifest.json"
+            )
+
+        fold_scores = [
+            self._metric_value(
+                targets[fold_ids == fold_id],
+                merged_prediction[fold_ids == fold_id],
+                metric_name,
+            )
+            for fold_id in sorted(np.unique(fold_ids))
+        ]
+        score = float(np.mean(fold_scores))
+        merge_manifest = {
+            "operator": "merge_ensemble",
+            "manager_owned": True,
+            "source_node_ids": node_ids,
+            "requested_strategy": strategy,
+            "strategy": applied_strategy,
+            "weights": weights.tolist(),
+            "oof_scores": plan["oof_scores"],
+            "ensemble_oof_score": plan["ensemble_oof_score"],
+            "best_single_node_id": plan["best_single_node_id"],
+            "best_single_oof_score": plan["best_single_oof_score"],
+            "raw_code_fusion": False,
+        }
+        (destination_dir / "merge_manifest.json").write_text(
+            json.dumps(merge_manifest, indent=2) + "\n", encoding="utf-8"
+        )
+        return {
+            "status": "completed",
+            "score": score,
+            "validation": {
+                "cv_mean": score,
+                "cv_std": float(np.std(fold_scores)),
+                "folds": len(fold_scores),
+                "fold_scores": [float(value) for value in fold_scores],
+            },
+            "oof_path": str(destination_dir / "oof_predictions.csv"),
+            "code_path": str(destination_dir / "merge_manifest.json"),
+            "diagnostics": (
+                "ManagerAgent ensembled measured node predictions using "
+                f"{applied_strategy} with OOF-selected weights."
+            ),
+            "elapsed_seconds": time.monotonic() - started,
+            "merge": merge_manifest,
+        }
 
     def aggregate_ranked_candidates(
         self,

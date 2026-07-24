@@ -1427,12 +1427,12 @@ with open('/workspace/tasks/example/result.txt', 'w') as stream:
 
 
 class SchedulerTests(unittest.TestCase):
-    def test_ucb_decay_starts_after_forced_warmup(self):
+    def test_standard_ucb_constant_is_not_hand_decayed(self):
         scheduler = UCB1Scheduler(total_budget=6)
         scheduler.set_warmup_budget(2)
         self.assertEqual(scheduler.get_exploration_constant(0), scheduler.c_0)
         self.assertEqual(scheduler.get_exploration_constant(2), scheduler.c_0)
-        self.assertEqual(scheduler.get_exploration_constant(6), scheduler.c_min)
+        self.assertEqual(scheduler.get_exploration_constant(6), scheduler.c_0)
 
     def test_initial_fanout_scales_with_budget(self):
         self.assertEqual(ManagerAgent._initial_fanout_for_budget(1), 1)
@@ -1708,7 +1708,7 @@ class SchedulerTests(unittest.TestCase):
 
             eager_generation.assert_not_called()
             children = [manager.all_nodes[node_id] for node_id in parent.children_ids]
-            self.assertEqual(len(children), 3)
+            self.assertEqual(len(children), 4)
             self.assertTrue(all(child.config["lazy_proposal"] for child in children))
             self.assertTrue(all(not child.config["materialized"] for child in children))
             diversify = next(
@@ -1717,7 +1717,7 @@ class SchedulerTests(unittest.TestCase):
             self.assertEqual(
                 diversify.config["excluded_artifact_ids"], ["locked_model"]
             )
-            self.assertGreater(
+            self.assertEqual(
                 diversify.config["priority"],
                 next(
                     child.config["priority"]
@@ -1736,6 +1736,12 @@ class SchedulerTests(unittest.TestCase):
                 tune.config["locked_technique_record"]["model_card"]["artifact_id"],
                 "locked_model",
             )
+            promotion = next(
+                child for child in children if child.operator == "promote"
+            )
+            self.assertEqual(promotion.fidelity, "medium")
+            self.assertTrue(promotion.config["preserve_parent_technique"])
+            self.assertEqual(promotion.parent_id, "node_1")
 
     def test_fine_tuning_is_metric_aware_uncertainty_gated_and_depth_bounded(self):
         cases = (
