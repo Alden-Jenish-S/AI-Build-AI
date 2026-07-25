@@ -11,8 +11,12 @@ import time
 from pathlib import Path
 from typing import Dict, Any, Optional
 from packaging.requirements import Requirement
+from core.runtime_contracts import ModelBundle, SplitPlan
+from evaluation.prediction_io import write_prediction_bundle
 from .initial_agent import infer_metric_from_description
 from .llm_utils import call_llm
+from .prompt_context import modality_prompt_context
+from .task_analyzer import TaskAnalyzer
 from .validation_guard import inspect_generated_code
 from evaluation_contract import FIDELITY_PROFILES, validate_evaluation_outputs
 from runtime_utils import (
@@ -73,6 +77,156 @@ class ImplementationAgent:
                 "epochs",
             )
         )
+
+    @staticmethod
+    def _materialize_output_contracts(
+        node_dir: Path,
+        task_spec,
+        result_data: dict,
+        algorithm_path: Path,
+    ) -> dict[str, object]:
+        """Create typed prediction/model bundles from validated legacy files."""
+        import pandas as pd
+
+        artifacts: dict[str, object] = {}
+        evaluation_path = node_dir / "evaluation_manifest.json"
+        oof_path = node_dir / "oof_predictions.csv"
+        task_fingerprint = hashlib.sha256(
+            json.dumps(
+                task_spec.to_dict(), sort_keys=True, default=str
+            ).encode("utf-8")
+        ).hexdigest()
+        if evaluation_path.is_file():
+            evaluation = json.loads(
+                evaluation_path.read_text(encoding="utf-8")
+            )
+            task_fingerprint = str(
+                evaluation.get("task_fingerprint")
+                or evaluation.get("dataset_fingerprint")
+                or task_fingerprint
+            )
+        else:
+            evaluation = {}
+        if oof_path.is_file():
+            frame = pd.read_csv(oof_path)
+            required = {"row_id", "prediction"}
+            if required.issubset(frame.columns):
+                if "fold_id" in frame.columns:
+                    fold_ids = frame["fold_id"].to_numpy(dtype=int)
+                else:
+                    assignments_path = node_dir / "fold_assignments.csv"
+                    assignments = pd.read_csv(assignments_path).set_index(
+                        assignments_path.is_file()
+                        and pd.read_csv(
+                            assignments_path, nrows=0
+                        ).columns[0]
+                        or "row_id"
+                    )
+                    fold_ids = (
+                        assignments.reindex(frame["row_id"])["fold_id"]
+                        .to_numpy(dtype=int)
+                    )
+                sample_ids = tuple(str(item) for item in frame["row_id"])
+                split_plan = SplitPlan(
+                    assignments={
+                        sample_id: int(fold)
+                        for sample_id, fold in zip(sample_ids, fold_ids)
+                    },
+                    strategy=str(
+                        evaluation.get("split_strategy")
+                        or "legacy_harness"
+                    ),
+                    seed=int(evaluation.get("seed", 42)),
+                    leakage_unit=str(
+                        evaluation.get("leakage_unit") or "row_id"
+                    ),
+                    split_fingerprint=str(
+                        evaluation.get("split_fingerprint")
+                        or evaluation.get("fold_assignment_sha256")
+                        or ""
+                    ),
+                )
+                prediction_bundle = write_prediction_bundle(
+                    node_dir,
+                    task_fingerprint=task_fingerprint,
+                    split_plan=split_plan,
+                    output_type=task_spec.output.type,
+                    sample_ids=sample_ids,
+                    predictions=frame["prediction"].to_numpy(dtype=float),
+                    targets=(
+                        frame["target"].to_numpy()
+                        if "target" in frame.columns
+                        else None
+                    ),
+                    fold_ids=fold_ids,
+                    class_names=task_spec.output.class_names,
+                    metadata={
+                        "modality": task_spec.modality,
+                        "problem_type": task_spec.problem_type,
+                        "metric": task_spec.primary_metric,
+                    },
+                )
+                artifacts["prediction_bundle"] = str(
+                    node_dir / "predictions" / "manifest.json"
+                )
+                artifacts["compatibility_key"] = (
+                    prediction_bundle.compatibility_key
+                )
+
+        checkpoint_suffixes = {
+            ".bin",
+            ".cbm",
+            ".joblib",
+            ".onnx",
+            ".pkl",
+            ".pt",
+            ".pth",
+            ".safetensors",
+        }
+        checkpoints = tuple(
+            path.relative_to(node_dir).as_posix()
+            for path in sorted(node_dir.rglob("*"))
+            if path.is_file()
+            and path.suffix.lower() in checkpoint_suffixes
+            and "input" not in path.relative_to(node_dir).parts
+        )
+        model_dir = node_dir / "model"
+        model_dir.mkdir(parents=True, exist_ok=True)
+        model_bundle = ModelBundle(
+            model_family=(
+                next(
+                    iter(
+                        ImplementationAgent._model_family_imports(
+                            algorithm_path.read_text(encoding="utf-8")
+                        )
+                    ),
+                    "generated_pipeline",
+                )
+            ),
+            task_fingerprint=task_fingerprint,
+            output_type=task_spec.output.type,
+            checkpoint_paths=checkpoints,
+            entrypoint=f"{algorithm_path.name}:__main__",
+            dependencies=(),
+            metadata={
+                "modality": task_spec.modality,
+                "problem_type": task_spec.problem_type,
+                "generated_script": True,
+            },
+        )
+        model_manifest = model_dir / "manifest.json"
+        model_manifest.write_text(
+            json.dumps(model_bundle.to_dict(), indent=2, sort_keys=True)
+            + "\n",
+            encoding="utf-8",
+        )
+        artifacts["model_bundle"] = str(model_manifest)
+        result_data.update(artifacts)
+        (node_dir / "result.json").write_text(
+            json.dumps(result_data, indent=2, default=str) + "\n",
+            encoding="utf-8",
+        )
+        return artifacts
 
     @classmethod
     def _debug_repair_guidance(
@@ -689,7 +843,7 @@ class ImplementationAgent:
 
         try:
             response = call_llm(
-                "You repair a node-local tabular-ML artifact after a concrete runtime failure. "
+                "You repair a node-local machine learning artifact after a concrete runtime failure. "
                 "Return the complete corrected artifact in one ```python block. Preserve its public "
                 "entrypoint and model family, add no dependencies, and make only causal reliability "
                 "changes. For neural code, handle mixed/missing inputs with training-fit preprocessing, "
@@ -935,6 +1089,8 @@ Current copied artifact:
                 f"Selected accelerator {accelerator!r} is not exposed by this run"
             )
         task_dir = Path(task_dir)
+        task_spec = TaskAnalyzer().resolve(task_dir)
+        modality_context = modality_prompt_context(task_spec, fidelity)
         baseline_source = (
             Path(baseline_dir) if baseline_dir is not None else task_dir
         )
@@ -964,6 +1120,23 @@ Current copied artifact:
         contract_source = self.project_root / "evaluation_contract.py"
         if contract_source.is_file():
             shutil.copy2(contract_source, node_dir / "evaluation_contract.py")
+        for package_name in ("core", "evaluation"):
+            package_source = self.project_root / package_name
+            if package_source.is_dir():
+                shutil.copytree(
+                    package_source,
+                    node_dir / package_name,
+                    dirs_exist_ok=True,
+                    ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+                )
+        for contract_name in (
+            "resolved_task_spec.json",
+            "dataset_index_manifest.json",
+            "dataset_index.jsonl",
+        ):
+            contract_file = baseline_source / contract_name
+            if contract_file.is_file():
+                shutil.copy2(contract_file, node_dir / contract_name)
             
         # Copy the memory pool technique python file to node_dir so it can be imported (Fixes ModuleNotFoundError)
         model_card = technique_record.get("model_card", {})
@@ -1054,6 +1227,8 @@ Current copied artifact:
             dataset_snapshot = (
                 "=== Dataset Analysis & Schema Report ===\n"
                 f"{analysis_report}\n"
+                "=== Canonical Task Contract ===\n"
+                f"{json.dumps(task_spec.to_dict(), indent=2)}\n"
                 "========================================\n"
             )
         except Exception as e:
@@ -1135,6 +1310,7 @@ Current copied artifact:
             f"Evaluation fidelity: {fidelity} ({json.dumps(fidelity_profile)}). These limits are mandatory.\n"
             f"{fine_tuning_instruction}"
             f"{deep_learning_instruction}"
+            f"Modality correctness contract:\n{modality_context}\n"
             f"Execution accelerator: {accelerator}; available={sorted(exposed_accelerators)}. "
             "The subprocess also exposes this value as AIBUILDAI_ACCELERATOR. When the selected accelerator is "
             "CUDA or MPS, use the framework-native GPU/device option for every compatible training component "
@@ -1144,11 +1320,20 @@ Current copied artifact:
             "over a CPU-only one. Do not send small preprocessing or unsupported scikit-learn estimators to a GPU. "
             "After training, report os.environ.get('AIBUILDAI_ACTUAL_ACCELERATOR', selected_device) in "
             "result.json; GPU-aware pool artifacts update this variable when they fall back.\n"
+            "CRITICAL DATA LOADING CONTRACT:\n"
+            "1. You must ALWAYS load the dataset first using the custom loader:\n"
+            "   from initial_dataloader import MyDataLoader\n"
+            "   loader = MyDataLoader()\n"
+            "   train_data, test_data = loader()\n"
+            "2. Pass the loaded 'train_data' dictionary directly to 'prepare_evaluation_data':\n"
+            "   X_eval, y_eval, row_ids, fold_ids, evaluation_meta = prepare_evaluation_data(train_data, '<fidelity>')\n"
+            "3. Do NOT attempt to read raw CSV files directly (like 'train.csv') or pass placeholder dictionaries (like {'X': None, 'y': None}) to prepare_evaluation_data. Only 'train_data' from MyDataLoader is valid.\n"
             "Import `prepare_evaluation_data` from the local `evaluation_contract` module and call "
             f"`X_eval, y_eval, row_ids, fold_ids, evaluation_meta = prepare_evaluation_data(train_data, '{fidelity}')`. "
             "Use X_eval/y_eval for every training and validation operation, use the supplied fold_ids exactly, "
             "and train final test-prediction models on all X_eval rows. Save one OOF prediction per scheduled "
-            "row to oof_predictions.csv with columns row_id,target,prediction. Do not create a separate split.\n"
+            "row to oof_predictions.csv with columns row_id,target,prediction. Do not create a separate split. "
+            "CRITICAL: The columns of oof_predictions.csv MUST be named EXACTLY 'row_id', 'target', and 'prediction'. The target column must be named literally 'target' (not after any dataset-specific column name like 'Heart Disease').\n"
             "Fit every imputer, encoder, scaler, feature selector, and target-dependent transform on training folds only. "
             "Never use test-set statistics or target values in feature generation. Define feature engineering once and "
             "apply it symmetrically to fold-train, fold-validation, full-evaluation, and test frames. Keep raw columns "
@@ -1202,7 +1387,9 @@ Current copied artifact:
         elif "```" in response:
             clean_code = response.split("```")[1].split("```")[0]
 
-        guard_issues = inspect_generated_code(clean_code)
+        guard_issues = inspect_generated_code(
+            clean_code, task_spec=task_spec.to_dict()
+        )
         guard_issues.extend(self._resource_limit_issues(clean_code, fidelity_profile))
         guard_issues.extend(
             self._dependency_fallback_issues(clean_code, technique_record)
@@ -1238,7 +1425,9 @@ Code:
                 clean_code = repair_response.split("```", 1)[1].split("```", 1)[0]
             else:
                 clean_code = repair_response
-            remaining_issues = inspect_generated_code(clean_code)
+            remaining_issues = inspect_generated_code(
+                clean_code, task_spec=task_spec.to_dict()
+            )
             remaining_issues.extend(
                 self._resource_limit_issues(clean_code, fidelity_profile)
             )
@@ -1384,13 +1573,23 @@ Code:
                     "Apply the same fitted feature transformation to training, validation, and test frames. "
                     "Transform raw test data before reindexing it to engineered training columns, and assert exact "
                     "post-transform feature parity before prediction.\n"
+                    "CRITICAL DATA LOADING CONTRACT:\n"
+                    "1. You must ALWAYS load the dataset first using the custom loader:\n"
+                    "   from initial_dataloader import MyDataLoader\n"
+                    "   loader = MyDataLoader()\n"
+                    "   train_data, test_data = loader()\n"
+                    "2. Pass the loaded 'train_data' dictionary directly to 'prepare_evaluation_data':\n"
+                    "   X_eval, y_eval, row_ids, fold_ids, evaluation_meta = prepare_evaluation_data(train_data, '<fidelity>')\n"
+                    "3. Do NOT attempt to read raw CSV files directly (like 'train.csv') or pass placeholder dictionaries (like {'X': None, 'y': None}) to prepare_evaluation_data. Only 'train_data' from MyDataLoader is valid.\n"
                     "Keep using evaluation_contract.prepare_evaluation_data and its supplied fold_ids exactly; "
-                    "write complete OOF predictions for the scheduled rows.\n"
+                    "write complete OOF predictions for the scheduled rows. "
+                    "CRITICAL: The columns of oof_predictions.csv MUST be named EXACTLY 'row_id', 'target', and 'prediction'. The target column must be named literally 'target' (not after any dataset-specific column name like 'Heart Disease').\n"
                     f"The selected accelerator is {accelerator}, exposed as AIBUILDAI_ACCELERATOR. Preserve "
                     "framework-native GPU configuration when supported and retain a safe CPU fallback. Report "
                     "AIBUILDAI_ACTUAL_ACCELERATOR after training.\n"
                     f"{fine_tuning_instruction}"
                     f"{deep_learning_instruction}"
+                    f"Modality correctness contract:\n{modality_context}\n"
                     f"IMPORTANT: At the END of your script, write a JSON file 'result.json' in the current directory:\n"
                     f'  import json; json.dump({{"score": <float>, "metric": "{metric_name}", "direction": "{metric_direction}", '
                     f'"cv_mean": <float>, "cv_std": <float>, "folds": <int>, "fidelity": "{fidelity}", '
@@ -1447,7 +1646,9 @@ Code:
                 elif "```" in response:
                     clean_code = response.split("```")[1].split("```")[0]
 
-                debug_guard_issues = inspect_generated_code(clean_code)
+                debug_guard_issues = inspect_generated_code(
+                    clean_code, task_spec=task_spec.to_dict()
+                )
                 debug_guard_issues.extend(
                     self._resource_limit_issues(clean_code, fidelity_profile)
                 )
@@ -1760,6 +1961,27 @@ Code:
             with open(node_dir / "fine_tuning.json", "w", encoding="utf-8") as f:
                 json.dump(tuning_summary, f, indent=2, default=str)
                 f.write("\n")
+
+        contract_artifacts: dict[str, object] = {}
+        if status == "completed":
+            try:
+                contract_artifacts = self._materialize_output_contracts(
+                    node_dir,
+                    task_spec,
+                    result_data,
+                    dest_code_file,
+                )
+            except Exception as exc:
+                status = "failed"
+                score = None
+                diagnostics = (
+                    diagnostics
+                    + "\nTyped artifact contract error: "
+                    + str(exc)
+                ).strip()
+                (node_dir / "error.log").write_text(
+                    diagnostics, encoding="utf-8"
+                )
         
         return {
             "status": status,
@@ -1803,4 +2025,5 @@ Code:
                 if (node_dir / "oof_predictions.csv").is_file()
                 else None
             ),
+            **contract_artifacts,
         }

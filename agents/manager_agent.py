@@ -18,6 +18,7 @@ from .technique_agent import TechniqueAgent
 from .implementation_agent import ImplementationAgent
 from .aggregator_agent import AggregatorAgent
 from .setup_agent import SetupAgent
+from .task_analyzer import TaskAnalyzer
 from memory_pool.builder.l2_builder import L2Builder
 from memory_pool.query_tool import normalize_resource_profile
 from search import (
@@ -118,6 +119,10 @@ class ManagerAgent:
         self.task_dir = self.project_root / "tasks" / self.task_name
         if not self.task_dir.is_dir():
             raise FileNotFoundError(f"Task directory does not exist: {self.task_dir}")
+        self.task_spec = TaskAnalyzer().resolve(self.task_dir)
+        self.modality = self.task_spec.modality
+        self.component_modalities = self.task_spec.component_modalities
+        self.output_type = self.task_spec.output.type
         self.baseline_dir = (
             self.project_root / "runs" / self.task_name / "baseline"
         )
@@ -155,8 +160,8 @@ class ManagerAgent:
         self.experiments_executed = 0
 
         # Load task config for metric direction and the renewable progress lease.
-        self.metric_direction = "maximize"
-        self.metric_name = "score"
+        self.metric_direction = self.task_spec.metric_direction
+        self.metric_name = self.task_spec.primary_metric
         self.baseline_fidelity = "screen"
         self.progress_stall_seconds = 1800
         self.enable_multi_fidelity = True
@@ -175,7 +180,7 @@ class ManagerAgent:
         self.available_ram_gb = self._available_ram_gb()
 
         config_file = self.task_dir / "task_config.json"
-        configured_task_type = None
+        configured_task_type = self.task_spec.problem_type
         if config_file.exists():
             try:
                 with open(config_file, 'r', encoding='utf-8') as f:
@@ -280,7 +285,10 @@ class ManagerAgent:
         )
         
         # Load clean task description for web search queries (Bug 3: prevents branch bias leakage)
-        self.task_description = f"Tabular ML task: {task_name}"
+        self.task_description = (
+            f"{self.modality} {self.task_spec.problem_type} ML task: "
+            f"{task_name}"
+        )
         desc_file = self.task_dir / "task_description.md"
         if desc_file.exists():
             try:
@@ -288,8 +296,16 @@ class ManagerAgent:
                     self.task_description = f.read().strip()
             except Exception:
                 pass
-        self.task_type = infer_task_type(
-            self.task_description, configured_task_type
+        self.task_type = self.task_spec.problem_type
+        self.task_description = (
+            "Canonical task context: "
+            f"modality={self.modality}; "
+            f"component_modalities={list(self.component_modalities)}; "
+            f"problem_type={self.task_type}; "
+            f"output_type={self.output_type}; "
+            f"primary_metric={self.metric_name} "
+            f"({self.metric_direction}).\n"
+            + self.task_description
         )
                 
         print(
@@ -1083,6 +1099,12 @@ class ManagerAgent:
             uncertainty=validation.get("cv_std"),
             elapsed_seconds=node.result.get("elapsed_seconds"),
             trial_count=tuning.get("tuning_trials") or 1,
+            modality=self.modality,
+            problem_type=self.task_type,
+            output_type=self.output_type,
+            accelerator_class=str(
+                node.result.get("accelerator") or self.preferred_accelerator
+            ),
         )
 
     def _record_node_provenance(self, node: NodeState) -> None:
@@ -1131,6 +1153,17 @@ class ManagerAgent:
                     "fidelity": node.fidelity,
                     "score": node.result.get("score"),
                     "oof_path": node.result.get("oof_path"),
+                    "prediction_bundle": node.result.get(
+                        "prediction_bundle"
+                    ),
+                    "model_bundle": node.result.get("model_bundle"),
+                    "compatibility_key": node.result.get(
+                        "compatibility_key"
+                    ),
+                    "modality": getattr(self, "modality", "tabular"),
+                    "output_type": getattr(
+                        self, "output_type", "class_probabilities"
+                    ),
                 },
             ),
             sources=[
@@ -1262,7 +1295,10 @@ class ManagerAgent:
             fallback.get("candidate_artifact", {}).get("model_card")
         ) or {}
         artifact_id = card.get("artifact_id") or fallback.get("artifact_id")
-        original_plan = fallback.get("plan", "Build a robust tabular pipeline.")
+        modality = fallback.get("modality") or "tabular"
+        original_plan = fallback.get(
+            "plan", f"Build a robust {modality} pipeline."
+        )
         fallback["unavailable_artifact"] = {
             "artifact_id": artifact_id,
             "category": card.get("category") or fallback.get("category"),
@@ -1407,6 +1443,10 @@ class ManagerAgent:
                     dataset_fingerprint=validation.get(
                         "fold_assignment_sha256"
                     ),
+                    modality=getattr(self, "modality", "tabular"),
+                    problem_type=getattr(self, "problem_type", getattr(self, "task_type", "supervised")),
+                    output_type=getattr(self, "output_type", "class_probabilities" if getattr(self, "task_type", "") == "classification" else "scalar_predictions"),
+                    accelerator_class=getattr(self, "preferred_accelerator", "auto"),
                 )
                 tuning_context = {
                     "trigger": "posterior_material_improvement",
@@ -1652,6 +1692,9 @@ class ManagerAgent:
             "elapsed_seconds": res.get("elapsed_seconds"),
             "validation": validation,
             "oof_path": res.get("oof_path"),
+            "prediction_bundle": res.get("prediction_bundle"),
+            "model_bundle": res.get("model_bundle"),
+            "compatibility_key": res.get("compatibility_key"),
             "merge": res.get("merge"),
         }
         node.executed = True
@@ -1745,6 +1788,7 @@ class ManagerAgent:
                                 "excluded_artifact_ids", []
                             )
                         ),
+                        task_spec=self.task_spec.to_dict(),
                     )
                 except Exception as exc:
                     # Planning is not an experiment. Preserve the branch intent and
@@ -2136,6 +2180,9 @@ class ManagerAgent:
                 ),
                 "validation": validation,
                 "oof_path": res.get("oof_path"),
+                "prediction_bundle": res.get("prediction_bundle"),
+                "model_bundle": res.get("model_bundle"),
+                "compatibility_key": res.get("compatibility_key"),
                 "tuning": res.get("tuning"),
                 "artifact_repair": res.get("artifact_repair"),
                 "artifact_variant": artifact_variant,

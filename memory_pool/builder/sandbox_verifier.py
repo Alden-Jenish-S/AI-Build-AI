@@ -221,7 +221,7 @@ def verify_artifact(json_path: Path) -> bool:
     artifact_dir = json_path.parent
     verification_dir = Path(
         tempfile.mkdtemp(prefix="aibuildai_verify_")
-    )
+    ).resolve()
     isolation_mode = "resource-limited-subprocess"
     try:
         request_path = verification_dir / "verification_request.json"

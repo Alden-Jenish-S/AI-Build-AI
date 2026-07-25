@@ -1,4 +1,5 @@
 import json
+import hashlib
 import shutil
 import time
 
@@ -6,6 +7,9 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 from typing import List, Dict, Optional
+from core.runtime_contracts import EnsembleBundle, PredictionBundle, SplitPlan
+from evaluation.metrics import metric_value, normalized_metric_value
+from evaluation.prediction_io import write_prediction_bundle
 
 class AggregatorAgent:
     def __init__(self):
@@ -139,58 +143,14 @@ class AggregatorAgent:
         y_true: np.ndarray, prediction: np.ndarray, metric: str
     ) -> float:
         """Return a metric in its natural reporting direction."""
-        metric = metric.lower()
-        if "auc" in metric:
-            y_true = np.asarray(y_true, dtype=float)
-            ranks = pd.Series(prediction).rank(method="average").to_numpy()
-            positives = y_true == 1
-            n_pos = int(positives.sum())
-            n_neg = len(y_true) - n_pos
-            if not n_pos or not n_neg:
-                raise ValueError("AUC requires both target classes")
-            return float(
-                (ranks[positives].sum() - n_pos * (n_pos + 1) / 2)
-                / (n_pos * n_neg)
-            )
-        if "mae" in metric:
-            return float(np.mean(np.abs(y_true - prediction)))
-        if "rmse" in metric:
-            return float(np.sqrt(np.mean((y_true - prediction) ** 2)))
-        if "log_loss" in metric or "logloss" in metric:
-            clipped = np.clip(prediction, 1e-12, 1 - 1e-12)
-            return -float(
-                np.mean(
-                    y_true * np.log(clipped)
-                    + (1 - y_true) * np.log(1 - clipped)
-                )
-            )
-        if "accuracy" in metric:
-            return float(np.mean((prediction >= 0.5) == y_true))
-        if metric in {"f1", "f1_score"}:
-            labels = prediction >= 0.5
-            true_positive = np.sum(labels & (y_true == 1))
-            denominator = 2 * true_positive + np.sum(labels & (y_true == 0)) + np.sum((~labels) & (y_true == 1))
-            return float(2 * true_positive / denominator) if denominator else 0.0
-        if metric in {"r2", "r2_score"}:
-            denominator = np.sum((y_true - np.mean(y_true)) ** 2)
-            return float(1 - np.sum((y_true - prediction) ** 2) / denominator) if denominator else 0.0
-        raise ValueError(f"unsupported OOF ensemble metric: {metric!r}")
+        return metric_value(metric, y_true, prediction)
 
     @classmethod
     def _validation_metric(
         cls, y_true: np.ndarray, prediction: np.ndarray, metric: str
     ) -> float:
         """Return a higher-is-better objective for ensemble optimization."""
-        value = cls._metric_value(y_true, prediction, metric)
-        normalized = metric.lower()
-        if (
-            "mae" in normalized
-            or "rmse" in normalized
-            or "log_loss" in normalized
-            or "logloss" in normalized
-        ):
-            return -value
-        return value
+        return normalized_metric_value(metric, y_true, prediction)
 
     @staticmethod
     def _rank_predictions(predictions: np.ndarray) -> np.ndarray:
@@ -401,6 +361,32 @@ class AggregatorAgent:
         started = time.monotonic()
         if len(node_ids) < 2 or len(set(node_ids)) != len(node_ids):
             return None
+        typed_bundles = []
+        for node_id in node_ids:
+            manifest_path = (
+                run_root / node_id / "predictions" / "manifest.json"
+            )
+            if manifest_path.is_file():
+                try:
+                    typed_bundles.append(
+                        PredictionBundle.from_dict(
+                            json.loads(
+                                manifest_path.read_text(encoding="utf-8")
+                            )
+                        )
+                    )
+                except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                    return None
+        if typed_bundles and len(typed_bundles) != len(node_ids):
+            return None
+        if typed_bundles and len(
+            {bundle.compatibility_key for bundle in typed_bundles}
+        ) != 1:
+            print(
+                "AggregatorAgent: Typed prediction bundles are incompatible; "
+                "refusing to merge them."
+            )
+            return None
         applied_strategy = self._resolve_strategy(strategy, metric_name)
         plan = self._oof_plan(
             run_root,
@@ -510,6 +496,86 @@ class AggregatorAgent:
         (destination_dir / "merge_manifest.json").write_text(
             json.dumps(merge_manifest, indent=2) + "\n", encoding="utf-8"
         )
+        if typed_bundles:
+            split_plan = SplitPlan(
+                assignments={
+                    str(sample_id): int(fold)
+                    for sample_id, fold in zip(
+                        reference.index.to_numpy(), fold_ids
+                    )
+                },
+                strategy="manager_owned_ensemble",
+                seed=42,
+                split_fingerprint=typed_bundles[0].split_fingerprint,
+            )
+            prediction_bundle = write_prediction_bundle(
+                destination_dir,
+                task_fingerprint=typed_bundles[0].task_fingerprint,
+                split_plan=split_plan,
+                output_type=typed_bundles[0].output_type,
+                sample_ids=[
+                    str(item) for item in reference.index.to_numpy()
+                ],
+                predictions=merged_prediction,
+                targets=targets,
+                fold_ids=fold_ids,
+                class_names=typed_bundles[0].class_names,
+                metadata={
+                    "operator": "merge_ensemble",
+                    "source_node_ids": node_ids,
+                },
+            )
+            compatibility_key = prediction_bundle.compatibility_key
+        else:
+            compatibility_key = hashlib.sha256(
+                json.dumps(
+                    {
+                        "row_ids": [
+                            str(item)
+                            for item in reference.index.to_numpy()
+                        ],
+                        "metric": metric_name,
+                    },
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest()
+
+        component_bundle_paths = []
+        for node_id in node_ids:
+            model_manifest = run_root / node_id / "model" / "manifest.json"
+            component_bundle_paths.append(
+                str(model_manifest)
+                if model_manifest.is_file()
+                else str(run_root / node_id / "algorithm.py")
+            )
+        ensemble_bundle = EnsembleBundle(
+            strategy=applied_strategy,
+            component_nodes=tuple(node_ids),
+            component_bundles=tuple(component_bundle_paths),
+            output_type=(
+                typed_bundles[0].output_type
+                if typed_bundles
+                else "scalar_predictions"
+            ),
+            compatibility_key=compatibility_key,
+            weights=tuple(float(value) for value in weights),
+            inference_order=tuple([*node_ids, "weighted_combiner"]),
+            metadata={
+                "manager_owned": True,
+                "raw_code_fusion": False,
+                "metric_name": metric_name,
+            },
+        )
+        model_dir = destination_dir / "model"
+        model_dir.mkdir(parents=True, exist_ok=True)
+        ensemble_manifest_path = model_dir / "manifest.json"
+        ensemble_manifest_path.write_text(
+            json.dumps(
+                ensemble_bundle.to_dict(), indent=2, sort_keys=True
+            )
+            + "\n",
+            encoding="utf-8",
+        )
         return {
             "status": "completed",
             "score": score,
@@ -527,6 +593,13 @@ class AggregatorAgent:
             ),
             "elapsed_seconds": time.monotonic() - started,
             "merge": merge_manifest,
+            "prediction_bundle": (
+                str(destination_dir / "predictions" / "manifest.json")
+                if typed_bundles
+                else None
+            ),
+            "model_bundle": str(ensemble_manifest_path),
+            "compatibility_key": compatibility_key,
         }
 
     def aggregate_ranked_candidates(

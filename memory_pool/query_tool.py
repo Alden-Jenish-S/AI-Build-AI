@@ -47,10 +47,113 @@ def normalize_resource_profile(card: dict) -> dict:
     return {
         "accelerator": accelerator,
         "min_ram_gb": non_negative_number(profile.get("min_ram_gb")),
+        "min_vram_gb": non_negative_number(profile.get("min_vram_gb")),
+        "max_cache_gb": non_negative_number(profile.get("max_cache_gb")),
+        "decode_workers": int(
+            non_negative_number(profile.get("decode_workers"))
+        ),
+        "decode_profile": str(profile.get("decode_profile", "none")),
         "estimated_runtime_seconds": non_negative_number(
             profile.get("estimated_runtime_seconds")
         ),
     }
+
+
+def artifact_compatibility(
+    card: dict,
+    *,
+    modality: str,
+    problem_type: str,
+    output_type: str,
+    component_modalities: set[str] | None = None,
+) -> tuple[bool, str | None]:
+    """Check declared modality/problem/output compatibility.
+
+    Legacy cards without a declared input contract remain tabular-only.
+    """
+    capabilities = card.get("capabilities")
+    capabilities = capabilities if isinstance(capabilities, dict) else {}
+    interface = card.get("interface")
+    interface = interface if isinstance(interface, dict) else {}
+    input_contract = interface.get("input_contract")
+    input_contract = (
+        input_contract if isinstance(input_contract, dict) else {}
+    )
+    output_contract = interface.get("output_contract")
+    output_contract = (
+        output_contract if isinstance(output_contract, dict) else {}
+    )
+    declared_modalities = capabilities.get("modalities")
+    if not isinstance(declared_modalities, list):
+        declared = (
+            input_contract.get("modality")
+            or capabilities.get("modality")
+            or capabilities.get("data_modality")
+        )
+        declared_modalities = [declared] if declared else ["tabular"]
+    normalized_modalities = {
+        str(item).strip().lower().replace("-", "_")
+        for item in declared_modalities
+        if item
+    }
+    accepted_modalities = {str(modality).lower()}
+    if modality == "multimodal":
+        accepted_modalities.update(component_modalities or set())
+    if not normalized_modalities.intersection(accepted_modalities):
+        return (
+            False,
+            f"artifact modalities {sorted(normalized_modalities)} do not "
+            f"match task modalities {sorted(accepted_modalities)}",
+        )
+
+    declared_problems = capabilities.get("problem_types")
+    if not isinstance(declared_problems, list):
+        declared_problems = capabilities.get("target_types", [])
+    normalized_problems = {
+        str(item).strip().lower()
+        .replace("binary_", "")
+        .replace("multiclass_", "")
+        for item in declared_problems
+    }
+    if (
+        normalized_problems
+        and problem_type not in normalized_problems
+        and not (
+            problem_type == "classification"
+            and "classification" in normalized_problems
+        )
+    ):
+        return (
+            False,
+            f"artifact problem types {sorted(normalized_problems)} do not "
+            f"include {problem_type!r}",
+        )
+
+    declared_outputs = capabilities.get("output_types")
+    if not isinstance(declared_outputs, list):
+        output_kind = output_contract.get("kind")
+        declared_outputs = [output_kind] if output_kind else []
+    aliases = {
+        "predictions": {
+            "class_probabilities",
+            "continuous",
+            "labels",
+        },
+        "probabilities": {"class_probabilities"},
+        "scores": {"class_probabilities", "continuous"},
+    }
+    normalized_outputs: set[str] = set()
+    for item in declared_outputs:
+        normalized = str(item).strip().lower()
+        normalized_outputs.add(normalized)
+        normalized_outputs.update(aliases.get(normalized, set()))
+    if normalized_outputs and output_type not in normalized_outputs:
+        return (
+            False,
+            f"artifact output types {sorted(normalized_outputs)} do not "
+            f"include {output_type!r}",
+        )
+    return True, None
 
 def query(*args) -> dict:
     """

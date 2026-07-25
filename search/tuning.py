@@ -37,6 +37,10 @@ class TrialRecord:
     elapsed_seconds: float | None = None
     trial_count: int = 1
     dataset_metafeatures: dict[str, Any] = field(default_factory=dict)
+    modality: str = "tabular"
+    problem_type: str = "supervised"
+    output_type: str = "class_probabilities"
+    accelerator_class: str = "cpu"
 
 
 class TuningKnowledgeBase:
@@ -82,6 +86,10 @@ class TuningKnowledgeBase:
         metric_direction: str,
         task_name: str,
         dataset_fingerprint: str | None = None,
+        modality: str = "tabular",
+        problem_type: str = "supervised",
+        output_type: str = "class_probabilities",
+        accelerator_class: str | None = None,
         limit: int = 8,
     ) -> list[dict]:
         candidates = []
@@ -93,6 +101,19 @@ class TuningKnowledgeBase:
                 or record.get("metric_name") != metric_name
                 or record.get("metric_direction") != metric_direction
                 or not isinstance(record.get("parameters"), dict)
+            ):
+                continue
+            record_modality = record.get("modality", "tabular")
+            if record_modality != modality:
+                continue
+            if record.get("problem_type", "supervised") != problem_type:
+                continue
+            if record.get("output_type", "class_probabilities") != output_type:
+                continue
+            if (
+                accelerator_class
+                and record.get("accelerator_class", "cpu")
+                != accelerator_class
             ):
                 continue
             same_dataset = bool(
@@ -131,6 +152,10 @@ class TuningCoordinator:
         metric_name: str,
         metric_direction: str,
         dataset_fingerprint: str | None,
+        modality: str = "tabular",
+        problem_type: str = "supervised",
+        output_type: str = "class_probabilities",
+        accelerator_class: str | None = None,
     ) -> dict:
         version = self.search_space_version(tunable_parameters)
         reused = self.knowledge_base.compatible(
@@ -140,6 +165,10 @@ class TuningCoordinator:
             metric_direction=metric_direction,
             task_name=task_name,
             dataset_fingerprint=dataset_fingerprint,
+            modality=modality,
+            problem_type=problem_type,
+            output_type=output_type,
+            accelerator_class=accelerator_class,
         )
         compact = [
             {
@@ -161,6 +190,12 @@ class TuningCoordinator:
         return {
             "search_space_version": version,
             "global_trial_reuse": True,
+            "compatibility_signature": {
+                "modality": modality,
+                "problem_type": problem_type,
+                "output_type": output_type,
+                "accelerator_class": accelerator_class,
+            },
             "reused_trials": compact,
             "suggested_initial_parameters": [
                 item["parameters"] for item in compact if item.get("parameters")
@@ -189,6 +224,10 @@ class TuningCoordinator:
         uncertainty: float | None,
         elapsed_seconds: float | None,
         trial_count: int,
+        modality: str = "tabular",
+        problem_type: str = "supervised",
+        output_type: str = "class_probabilities",
+        accelerator_class: str = "cpu",
     ) -> None:
         self.knowledge_base.append(
             TrialRecord(
@@ -207,5 +246,9 @@ class TuningCoordinator:
                 uncertainty=uncertainty,
                 elapsed_seconds=elapsed_seconds,
                 trial_count=max(1, int(trial_count or 1)),
+                modality=modality,
+                problem_type=problem_type,
+                output_type=output_type,
+                accelerator_class=accelerator_class,
             )
         )

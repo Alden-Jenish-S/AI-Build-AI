@@ -2,7 +2,7 @@
 
 set -u
 
-BUDGET="${BUDGET:-6}"
+BUDGET="${BUDGET:-10}"
 FAILED=0
 
 for task_dir in tasks/*; do

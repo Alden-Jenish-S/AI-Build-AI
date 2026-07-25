@@ -8,8 +8,7 @@ from pathlib import Path
 from typing import List, Dict, Any
 from .llm_utils import call_llm
 from .web_search import search_web
-from memory_pool.query_tool import query
-from runtime_utils import infer_task_type
+from memory_pool.query_tool import artifact_compatibility, query
 
 class TechniqueAgent:
     def __init__(
@@ -39,13 +38,14 @@ class TechniqueAgent:
             f"and propose {count} distinct, promising, and tailored full modeling approaches (branches) "
             "that make sense for this specific task.\n"
             f"Respond ONLY with a valid JSON list of {count} dictionaries. Each dictionary must have two keys:\n"
-            "1. 'name': A short camel_case or snake_case name for the branch (e.g., 'xgboost_with_target_encoding', 'feature_interactions_rf', 'mlp_tabular').\n"
+            "1. 'name': A short camel_case or snake_case name describing the "
+            "model family and representation strategy.\n"
             "2. 'plan': A detailed description of the approach, serving as a strategic direction for the technique selection.\n"
             "Do not reuse stock branch labels like Branch_A_Ensembling, Branch_B_Features, or Branch_C_DeepLearning. "
             "Each root branch must specify a complete pipeline or model family, not a standalone scaler, encoder, imputer, or CV utility. "
             "The branches must be task-specific, complementary, and directly implementable. "
-            "Use a different primary model family in every branch; do not repeat CatBoost, XGBoost, LightGBM, "
-            "random forests, linear models, or the same neural architecture across branches.\n"
+            "Use a different primary model family or encoder architecture in "
+            "every branch; avoid superficial preprocessing-only variants.\n"
             "Do not include any explanation or markdown formatting, just the raw JSON list."
         )
         user_prompt = (
@@ -334,6 +334,7 @@ Return the three child experiments as JSON only.
         preferred_accelerator: str = "cpu",
         excluded_artifact_ids: set[str] | None = None,
         available_dependencies: set[str] | None = None,
+        task_spec: dict | None = None,
     ) -> Dict[str, Any]:
         """
         1. Decides if relevant techniques are in the Memory Pool.
@@ -346,7 +347,21 @@ Return the three child experiments as JSON only.
             l1_index: The L1 category index
         """
         use_pool = os.environ.get("ABLATION_USE_POOL", "1") != "0"
-        task_type = infer_task_type(task_description)
+        task_spec = dict(task_spec or {})
+        task_type = str(
+            task_spec.get("problem_type") or "supervised"
+        ).lower()
+        modality = str(task_spec.get("modality") or "tabular").lower()
+        output = task_spec.get("output")
+        output_type = (
+            str(output.get("type"))
+            if isinstance(output, dict) and output.get("type")
+            else "class_probabilities"
+        )
+        component_modalities = {
+            str(item).lower()
+            for item in task_spec.get("component_modalities", [])
+        }
         excluded_artifact_ids = {
             str(item) for item in (excluded_artifact_ids or set()) if item
         }
@@ -438,6 +453,13 @@ Which 1-2 categories best match the strategic direction? Output a comma-separate
                     not allowed_scopes
                     or artifact.get("scope") in allowed_scopes
                 )
+                and artifact_compatibility(
+                    artifact,
+                    modality=modality,
+                    problem_type=task_type,
+                    output_type=output_type,
+                    component_modalities=component_modalities,
+                )[0]
             ]
             l2_candidates.extend(verified_artifacts)
 
@@ -462,7 +484,8 @@ Which 1-2 categories best match the strategic direction? Output a comma-separate
             "Default to novelty unless a pool artifact is a strong, direct fit.\n"
             "Choose an artifact ONLY if it satisfies ALL checks:\n"
             "1. It directly implements the branch direction rather than merely belonging to the same broad category.\n"
-            "2. Its interface can plausibly be wired into the current tabular task without redesign.\n"
+            "2. Its declared modality, problem, and output contracts can be "
+            "wired into the current task without redesign.\n"
             "3. It is more useful than generating a tailored technique for this branch.\n"
             "If any check is uncertain, output ONLY 'web_search'.\n"
             "If one artifact clearly passes all checks, output ONLY its artifact_id."
@@ -541,10 +564,10 @@ Decide: Output either one artifact_id from the list, or 'web_search'.
         available_dependencies: set[str] | None = None,
     ) -> Dict[str, Any]:
         """Searches or synthesizes a new technique outline for later L2 building."""
-        # Bug 3 fix: Use clean task_description for query generation, NOT branch_plan alone
+        modality = getattr(self, "modality", "tabular")
         query_prompt_sys = (
             "You are an ML research scientist. Write a short, precise web search query "
-            "to find state-of-the-art tabular machine learning techniques, custom loss functions, "
+            f"to find state-of-the-art {modality} machine learning techniques, custom loss functions, "
             "or advanced neural architectures suitable for the given task and planned technique.\n"
             "CRITICAL: Do NOT include Kaggle file names (like 'train.csv', 'test.csv', 'sample_submission.csv') or generic words like 'notebook'. "
             "Query for scientific methodologies, architectures, or specific algorithms.\n"
@@ -572,7 +595,7 @@ Decide: Output either one artifact_id from the list, or 'web_search'.
             # deterministically and continue.
             query_error = str(exc)
             search_query = " ".join(
-                (branch_plan or task_description or "robust tabular machine learning")
+                (branch_plan or task_description or f"robust {modality} machine learning")
                 .replace("\n", " ")
                 .split()
             )[:240]
@@ -588,11 +611,11 @@ Decide: Output either one artifact_id from the list, or 'web_search'.
             print("Web search failed or blocked. Using LLM internal knowledge fallback...")
             search_results = (
                 "No web pages returned. Fallback to LLM internal knowledge base. "
-                "Provide a robust, original tabular ML technique script tailored to the planned technique."
+                f"Provide a robust, original {modality} ML technique script tailored to the planned technique."
             )
 
         build_prompt_sys = (
-            "You are the Technique Agent. Review the search results and outline ONE new reusable tabular ML technique "
+            f"You are the Technique Agent. Review the search results and outline ONE new reusable {modality} ML technique "
             "we should implement. The technique MUST faithfully implement the Planned Technique below. "
             "Do not substitute a different model family merely because it appears in the search results; "
             "the search results are supporting evidence, not permission to replace the branch. "

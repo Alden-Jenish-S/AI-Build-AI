@@ -37,17 +37,40 @@ _SENSITIVE_ENV_EXACT = {
 }
 _ACCELERATORS = {"cpu", "cuda", "mps"}
 _TASK_DATA_SUFFIXES = {
+    ".aac",
+    ".avi",
+    ".bmp",
     ".csv",
     ".feather",
+    ".flac",
+    ".gif",
+    ".jpeg",
+    ".jpg",
     ".json",
     ".jsonl",
+    ".m4a",
+    ".m4v",
+    ".mkv",
+    ".mov",
+    ".mp3",
+    ".mp4",
+    ".mpeg",
+    ".mpg",
     ".npy",
     ".npz",
+    ".ogg",
     ".parquet",
     ".pickle",
     ".pkl",
+    ".png",
+    ".ppm",
     ".tsv",
+    ".tif",
+    ".tiff",
     ".txt",
+    ".wav",
+    ".webm",
+    ".webp",
 }
 _TASK_DATA_EXCLUSIONS = {
     "dataset_analysis_report.txt",
@@ -524,7 +547,7 @@ def infer_task_type(
 
 
 def task_data_files(task_dir: Path) -> list[Path]:
-    """Return immutable task-owned data files, never generated run artifacts."""
+    """Return recursive immutable task data, never generated run artifacts."""
     task_root = Path(task_dir)
     source_root = (
         task_root / "input"
@@ -535,7 +558,7 @@ def task_data_files(task_dir: Path) -> list[Path]:
         return []
     return [
         path
-        for path in sorted(source_root.iterdir())
+        for path in sorted(source_root.rglob("*"))
         if (
             path.is_file()
             and path.suffix.lower() in _TASK_DATA_SUFFIXES
@@ -574,14 +597,16 @@ def expose_task_data(task_dir: Path, run_dir: Path) -> list[Path]:
 
     destination.mkdir(parents=True, exist_ok=True)
     linked_files = []
-    for source_file in sorted(source_root.iterdir()):
+    for source_file in sorted(source_root.rglob("*")):
         if (
             not source_file.is_file()
             or source_file.suffix.lower() not in _TASK_DATA_SUFFIXES
             or source_file.name in _TASK_DATA_EXCLUSIONS
         ):
             continue
-        target = destination / source_file.name
+        relative = source_file.relative_to(source_root)
+        target = destination / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
         if target.exists() or target.is_symlink():
             if target.is_symlink() and target.resolve() == source_file.resolve():
                 linked_files.append(target)
@@ -705,6 +730,12 @@ def accelerator_subprocess_env(
     if selected not in _ACCELERATORS:
         raise ValueError(f"Unsupported selected accelerator: {accelerator!r}")
     clean = sanitized_subprocess_env(base_env)
+    project_root = str(Path(__file__).resolve().parent)
+    existing_pythonpath = clean.get("PYTHONPATH", "")
+    if existing_pythonpath:
+        clean["PYTHONPATH"] = f"{project_root}{os.pathsep}{existing_pythonpath}"
+    else:
+        clean["PYTHONPATH"] = project_root
     clean["AIBUILDAI_ACCELERATOR"] = selected
     clean["AIBUILDAI_ACTUAL_ACCELERATOR"] = selected
     clean["AIBUILDAI_PREFER_GPU"] = "1" if selected in {"cuda", "mps"} else "0"

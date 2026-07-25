@@ -272,6 +272,7 @@ def _run_baseline(
                 manager.metric_direction,
                 baseline_fidelity,
                 getattr(manager, "task_type", "supervised"),
+                getattr(manager, "modality", "tabular"),
             )
 
     raise AssertionError("unreachable baseline execution state")

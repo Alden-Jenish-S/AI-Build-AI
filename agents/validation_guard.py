@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import ast
-from typing import List
+from typing import List, Mapping
 
 
 TEST_NAMES = {"x_test", "test_df", "test_data", "test_features"}
@@ -54,7 +54,10 @@ def _targets_task_input(path: str) -> bool:
     )
 
 
-def inspect_generated_code(code: str) -> List[str]:
+def inspect_generated_code(
+    code: str,
+    task_spec: Mapping[str, object] | None = None,
+) -> List[str]:
     """Return high-confidence leakage defects that should be repaired before execution."""
     try:
         tree = ast.parse(code)
@@ -62,6 +65,13 @@ def inspect_generated_code(code: str) -> List[str]:
         return []  # The normal debugging loop supplies better syntax diagnostics.
 
     issues: List[str] = []
+    task_spec = dict(task_spec or {})
+    modality = str(task_spec.get("modality") or "tabular").lower()
+    group_sensitive = bool(
+        task_spec.get("group_id_field")
+        or task_spec.get("entity_id_field")
+        or modality == "multimodal"
+    )
     test_derived_names = set()
     for node in ast.walk(tree):
         if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
@@ -91,6 +101,35 @@ def inspect_generated_code(code: str) -> List[str]:
         if method in STAT_METHODS and _root_name(node.func.value) in TEST_NAMES:
             issues.append(
                 f"line {node.lineno}: test-set {method} statistic is used; derive it from training data"
+            )
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if isinstance(node.func, ast.Name):
+            function_name = node.func.id.lower()
+        elif isinstance(node.func, ast.Attribute):
+            function_name = node.func.attr.lower()
+        else:
+            function_name = ""
+        if group_sensitive and function_name == "train_test_split":
+            issues.append(
+                f"line {node.lineno}: group/entity-sensitive tasks must use "
+                "the harness fold_ids; an independent train_test_split can "
+                "place one identity in multiple folds"
+            )
+        if modality in {"image", "audio", "video", "multimodal"} and (
+            "augment" in function_name or function_name.startswith("random_")
+        ) and any(
+            isinstance(child, ast.Name)
+            and any(
+                marker in child.id.lower()
+                for marker in ("valid", "val_", "test")
+            )
+            for child in ast.walk(node)
+        ):
+            issues.append(
+                f"line {node.lineno}: stochastic augmentation receives "
+                "validation/test data; augmentation must be training-only"
             )
     output_methods = {
         "dump",

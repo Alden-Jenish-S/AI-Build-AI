@@ -23,7 +23,7 @@ _PROVIDER_DEFAULTS = {
     "nvidia": {
         "api_key_env": "NVIDIA_API_KEY",
         "base_url": "https://integrate.api.nvidia.com/v1",
-        "model": "nvidia/nemotron-3-ultra-550b-a55b",
+        "model": "openai/gpt-oss-120b",
     },
     "gemini": {
         "api_key_env": "GEMINI_API_KEY",

@@ -19,35 +19,32 @@ from sklearn.metrics import (
     roc_auc_score,
     silhouette_score,
 )
-from sklearn.model_selection import KFold, StratifiedKFold, StratifiedShuffleSplit
+from sklearn.model_selection import (
+    GroupKFold,
+    KFold,
+    StratifiedGroupKFold,
+    StratifiedKFold,
+    StratifiedShuffleSplit,
+)
+
+from evaluation.fidelity import legacy_profiles
+from evaluation.metrics import metric_value
+from evaluation.runner import (
+    evaluate_prediction_bundle,
+    prepare_evaluation_bundle,
+)
+
+FIDELITY_PROFILES = legacy_profiles()
 
 
-FIDELITY_PROFILES = {
-    "screen": {
-        "data_fraction": 0.25,
-        "cv_folds": 2,
-        "max_tuning_trials": 8,
-        "max_epochs": 8,
-        "early_stopping_patience": 2,
-        "max_estimator_iterations": 500,
-    },
-    "medium": {
-        "data_fraction": 0.60,
-        "cv_folds": 3,
-        "max_tuning_trials": 20,
-        "max_epochs": 20,
-        "early_stopping_patience": 4,
-        "max_estimator_iterations": 1500,
-    },
-    "full": {
-        "data_fraction": 1.0,
-        "cv_folds": 5,
-        "max_tuning_trials": 40,
-        "max_epochs": 50,
-        "early_stopping_patience": 7,
-        "max_estimator_iterations": 4000,
-    },
-}
+def prepare_modality_evaluation(*args, **kwargs):
+    """Compatibility facade for the modality-neutral evaluation runner."""
+    return prepare_evaluation_bundle(*args, **kwargs)
+
+
+def validate_prediction_bundle(*args, **kwargs):
+    """Recompute metrics from a typed non-tabular prediction bundle."""
+    return evaluate_prediction_bundle(*args, **kwargs)
 
 
 def _array(value: Any) -> np.ndarray:
@@ -126,6 +123,13 @@ def prepare_evaluation_data(
         raise ValueError(f"unknown fidelity: {fidelity!r}")
     profile = FIDELITY_PROFILES[fidelity]
     X_full, y_full, row_ids_full = _full_training_data(train_data)
+    group_ids_full = train_data.get("group_ids_full")
+    if group_ids_full is not None:
+        group_ids_full = _array(group_ids_full)
+        if len(group_ids_full) != len(X_full):
+            raise ValueError(
+                "full training group IDs must align with features"
+            )
     unsupervised = y_full is None
     fraction = float(profile["data_fraction"])
     selected = np.arange(len(X_full))
@@ -137,7 +141,37 @@ def prepare_evaluation_data(
     else:
         classification = _is_classification(y_full)
     if fraction < 1.0:
-        if unsupervised:
+        if group_ids_full is not None:
+            rng = np.random.default_rng(seed)
+            groups = np.asarray(
+                sorted(set(str(item) for item in group_ids_full))
+            )
+            rng.shuffle(groups)
+            selected_groups = set()
+            selected_count = 0
+            target_count = max(2, int(len(X_full) * fraction))
+            for group in groups:
+                selected_groups.add(str(group))
+                selected_count += int(
+                    np.sum(
+                        np.asarray(
+                            [str(item) for item in group_ids_full]
+                        )
+                        == group
+                    )
+                )
+                if selected_count >= target_count:
+                    break
+            selected = np.flatnonzero(
+                np.asarray(
+                    [
+                        str(item) in selected_groups
+                        for item in group_ids_full
+                    ],
+                    dtype=bool,
+                )
+            )
+        elif unsupervised:
             rng = np.random.default_rng(seed)
             selected = np.sort(
                 rng.choice(
@@ -159,27 +193,59 @@ def prepare_evaluation_data(
     X = X_full.iloc[selected].reset_index(drop=True)
     y = None if unsupervised else y_full[selected]
     row_ids = row_ids_full[selected]
+    group_ids = (
+        group_ids_full[selected]
+        if group_ids_full is not None
+        else None
+    )
     folds = int(profile["cv_folds"])
     can_stratify_folds = (
         classification
         and not unsupervised
         and pd.Series(y).value_counts().min() >= folds
     )
-    splitter = (
-        StratifiedKFold(n_splits=folds, shuffle=True, random_state=seed)
-        if can_stratify_folds
-        else KFold(n_splits=folds, shuffle=True, random_state=seed)
-    )
+    if group_ids is not None:
+        if len(set(str(item) for item in group_ids)) < folds:
+            raise ValueError(
+                "group/entity count is smaller than the fidelity fold count"
+            )
+        splitter = (
+            StratifiedGroupKFold(
+                n_splits=folds, shuffle=True, random_state=seed
+            )
+            if can_stratify_folds
+            else GroupKFold(n_splits=folds)
+        )
+    else:
+        splitter = (
+            StratifiedKFold(n_splits=folds, shuffle=True, random_state=seed)
+            if can_stratify_folds
+            else KFold(n_splits=folds, shuffle=True, random_state=seed)
+        )
     fold_ids = np.full(len(X), -1, dtype=np.int16)
-    split_iterator = (
-        splitter.split(X)
-        if unsupervised
-        else splitter.split(X, y)
-    )
+    if group_ids is not None:
+        split_iterator = splitter.split(X, y, group_ids)
+    else:
+        split_iterator = (
+            splitter.split(X)
+            if unsupervised
+            else splitter.split(X, y)
+        )
     for fold, (_, validation_indices) in enumerate(split_iterator):
         fold_ids[validation_indices] = fold
     if (fold_ids < 0).any():
         raise RuntimeError("failed to assign every evaluation row to a fold")
+    if group_ids is not None:
+        for group in set(str(item) for item in group_ids):
+            group_folds = {
+                int(fold_ids[index])
+                for index, value in enumerate(group_ids)
+                if str(value) == group
+            }
+            if len(group_folds) != 1:
+                raise RuntimeError(
+                    f"group/entity {group!r} crossed evaluation folds"
+                )
 
     assignments = pd.DataFrame({"row_id": row_ids, "fold_id": fold_ids})
     digest = hashlib.sha256(
@@ -194,6 +260,9 @@ def prepare_evaluation_data(
         "data_fraction": fraction,
         "cv_folds": folds,
         "classification": classification,
+        "leakage_unit": (
+            "group_or_entity" if group_ids is not None else "row_id"
+        ),
         "task_type": (
             "unsupervised_clustering" if unsupervised else "supervised"
         ),
@@ -333,22 +402,7 @@ def evaluate_clustering_predictions(
 
 
 def _metric_value(metric_name: str, target: np.ndarray, prediction: np.ndarray) -> float:
-    metric = metric_name.lower()
-    if "auc" in metric:
-        return float(roc_auc_score(target, prediction))
-    if "mae" in metric:
-        return float(mean_absolute_error(target, prediction))
-    if "rmse" in metric:
-        return float(mean_squared_error(target, prediction) ** 0.5)
-    if "accuracy" in metric:
-        return float(accuracy_score(target, prediction >= 0.5))
-    if "log_loss" in metric or "logloss" in metric:
-        return float(log_loss(target, prediction))
-    if metric in {"f1", "f1_score"}:
-        return float(f1_score(target, prediction >= 0.5))
-    if metric in {"r2", "r2_score"}:
-        return float(r2_score(target, prediction))
-    raise ValueError(f"unsupported harness metric for OOF validation: {metric_name!r}")
+    return metric_value(metric_name, target, prediction)
 
 
 def validate_evaluation_outputs(
