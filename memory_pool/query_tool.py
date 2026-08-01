@@ -214,9 +214,6 @@ def query_l1(category: str) -> dict:
                     for item in validations
                     if item.get("status") == "completed" and item.get("score") is not None
                 ]
-                improvements = [
-                    item for item in completed if item.get("improved_over_baseline") is True
-                ]
                 rewards = [
                     float(item["reward"])
                     for item in completed
@@ -238,8 +235,10 @@ def query_l1(category: str) -> dict:
                         "runs": len(validations),
                         "completed": len(completed),
                         "failures": len(validations) - len(completed),
-                        "improvement_rate": (
-                            len(improvements) / len(completed) if completed else None
+                        "completion_rate": (
+                            len(completed) / len(validations)
+                            if validations
+                            else None
                         ),
                         "mean_reward": sum(rewards) / len(rewards) if rewards else None,
                     },

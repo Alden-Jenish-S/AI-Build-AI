@@ -9,6 +9,7 @@ from typing import List, Dict, Any
 from .llm_utils import call_llm
 from .web_search import search_web
 from memory_pool.query_tool import artifact_compatibility, query
+from .strategy_patterns import render_strategy_patterns, strategy_patterns
 
 class TechniqueAgent:
     def __init__(
@@ -37,6 +38,11 @@ class TechniqueAgent:
             "You are the Technique Agent. Given a machine learning task description, think from first principles "
             f"and propose {count} distinct, promising, and tailored full modeling approaches (branches) "
             "that make sense for this specific task.\n"
+            "CRITICAL PIPELINE-HYPOTHESIS CONTRACT:\n"
+            "- Branch on distinct data representation, feature engineering, robustness, or training hypotheses—not model-family names alone.\n"
+            "- Two branches may use the same strong estimator only when they test meaningfully different leakage-safe pipelines.\n"
+            "- Each branch must name the diagnostic evidence that would justify its encodings, interactions, clipping, selection, augmentation, or regularization.\n"
+            "- Include a model family as one component of the complete pipeline, not as the branch's entire idea.\n"
             f"Respond ONLY with a valid JSON list of {count} dictionaries. Each dictionary must have two keys:\n"
             "1. 'name': A short camel_case or snake_case name describing the "
             "model family and representation strategy.\n"
@@ -44,8 +50,9 @@ class TechniqueAgent:
             "Do not reuse stock branch labels like Branch_A_Ensembling, Branch_B_Features, or Branch_C_DeepLearning. "
             "Each root branch must specify a complete pipeline or model family, not a standalone scaler, encoder, imputer, or CV utility. "
             "The branches must be task-specific, complementary, and directly implementable. "
-            "Use a different primary model family or encoder architecture in "
-            "every branch; avoid superficial preprocessing-only variants.\n"
+            "Avoid superficial hyperparameter-only variants. Prefer complementary error profiles and robust pipeline controls.\n"
+            "Reusable design principles:\n"
+            f"{render_strategy_patterns({})}\n"
             "Do not include any explanation or markdown formatting, just the raw JSON list."
         )
         user_prompt = (
@@ -126,9 +133,20 @@ Return repaired JSON only.
         if operator not in {"refine", "tune", "diversify"}:
             raise ValueError(f"unsupported lazy operator: {operator!r}")
         instructions = {
-            "refine": "Change only the highest-impact code block and preserve the rest.",
-            "tune": "Keep the architecture and define a compact, pruned tuning experiment.",
-            "diversify": "Create a sound candidate whose prediction errors should be less correlated with the parent.",
+            "refine": (
+                "Use the parent's error_analysis to change the one data, "
+                "feature, calibration, or model component most likely to fix "
+                "the observed residual/error bucket; preserve the rest."
+            ),
+            "tune": (
+                "Keep the complete pipeline and define a compact pruned "
+                "search only when measured evidence supports tuning."
+            ),
+            "diversify": (
+                "Target a complementary representation or robustness "
+                "hypothesis whose errors should be less correlated with the "
+                "parent; a different model family alone is insufficient."
+            ),
         }
         user_prompt = (
             f"Task:\n{task_description}\n\n"
@@ -212,7 +230,7 @@ Return repaired JSON only.
         stats = candidate.get("validation_summary", {})
         runs = max(0, int(stats.get("runs", 0) or 0))
         mean_reward = float(stats.get("mean_reward", 0.0) or 0.0)
-        improvement_rate = float(stats.get("improvement_rate", 0.0) or 0.0)
+        completion_rate = float(stats.get("completion_rate", 0.0) or 0.0)
         exploration = math.sqrt(math.log(max(total_runs, 0) + 2.0) / (runs + 1.0))
         capabilities = candidate.get("capabilities") or {}
         raw_supported_accelerators = capabilities.get("supported_accelerators") or []
@@ -235,7 +253,7 @@ Return repaired JSON only.
         return (
             lexical
             + 0.35 * mean_reward
-            + 0.15 * improvement_rate
+            + 0.15 * completion_rate
             + 0.08 * exploration
             + gpu_bonus
         )
@@ -252,9 +270,10 @@ Return repaired JSON only.
             "You are an ML search-policy agent. Given a working parent pipeline and its measured result, "
             "propose exactly three complementary child experiments. Return ONLY a JSON list. The three "
             "operators must be exactly: 'refine', 'tune', and 'diversify'.\n"
-            "- refine: change only the highest-impact code block, preserving the rest.\n"
+            "- refine: use parent error_analysis to change the highest-impact representation, feature, calibration, or model block while preserving the rest.\n"
             "- tune: keep the architecture and use Optuna-style pruning or a compact search space.\n"
-            "- diversify: produce predictions likely to be less correlated with the parent for ensembling.\n"
+            "- diversify: target a complementary data representation or robustness hypothesis likely to reduce the parent's measured error buckets; changing only the model-family label is insufficient.\n"
+            "PIPELINE EVIDENCE CONTRACT: Every refine/diversify plan must cite a concrete parent residual, confidence, class, or error bucket when error_analysis is available.\n"
             "Each item must have non-empty 'name', 'plan', 'operator', and numeric 'priority' in [-0.1, 0.1]. "
             "Plans must be concrete, task-specific, leakage-safe, and directly executable."
         )
@@ -335,6 +354,7 @@ Return the three child experiments as JSON only.
         excluded_artifact_ids: set[str] | None = None,
         available_dependencies: set[str] | None = None,
         task_spec: dict | None = None,
+        enable_executable_artifacts: bool | None = None,
     ) -> Dict[str, Any]:
         """
         1. Decides if relevant techniques are in the Memory Pool.
@@ -346,12 +366,19 @@ Return the three child experiments as JSON only.
             global_memory_context: Sibling/parent context from GlobalMemory
             l1_index: The L1 category index
         """
-        use_pool = os.environ.get("ABLATION_USE_POOL", "1") != "0"
+        if enable_executable_artifacts is None:
+            enable_executable_artifacts = (
+                os.environ.get(
+                    "METHOD_TREE_ENABLE_EXECUTABLE_ARTIFACTS", "0"
+                )
+                == "1"
+            )
         task_spec = dict(task_spec or {})
         task_type = str(
             task_spec.get("problem_type") or "supervised"
         ).lower()
         modality = str(task_spec.get("modality") or "tabular").lower()
+        self.modality = modality
         output = task_spec.get("output")
         output_type = (
             str(output.get("type"))
@@ -365,12 +392,27 @@ Return the three child experiments as JSON only.
         excluded_artifact_ids = {
             str(item) for item in (excluded_artifact_ids or set()) if item
         }
+        if not enable_executable_artifacts:
+            patterns = strategy_patterns(task_spec)
+            return {
+                "status": "strategy_only",
+                "plan": (
+                    f"Implement this branch as clean task-specific code: "
+                    f"{branch_plan}\n\nApply only diagnostically justified "
+                    "robust design patterns:\n- " + "\n- ".join(patterns)
+                ),
+                "strategy_patterns": patterns,
+                "artifact_execution": "disabled",
+            }
+
+        use_pool = True
         if not use_pool or not l1_index:
             print("TechniqueAgent: Memory pool disabled or empty. Generating a new technique outline.")
             return self._bootstrap_from_web(
                 task_description,
                 branch_plan,
                 available_dependencies=available_dependencies,
+                modality=modality,
             )
 
         # Use both the branch direction and measured lineage context. The latter
@@ -421,6 +463,7 @@ Which 1-2 categories best match the strategic direction? Output a comma-separate
                 task_description,
                 branch_plan,
                 available_dependencies=available_dependencies,
+                modality=modality,
             )
             
         print(f"TechniqueAgent: Selected L1 categories: {selected_categories} (for branch: {branch_plan[:60]}...)")
@@ -555,6 +598,7 @@ Decide: Output either one artifact_id from the list, or 'web_search'.
                 task_description,
                 branch_plan,
                 available_dependencies=available_dependencies,
+                modality=modality,
             )
 
     def _bootstrap_from_web(
@@ -562,9 +606,10 @@ Decide: Output either one artifact_id from the list, or 'web_search'.
         task_description: str,
         branch_plan: str,
         available_dependencies: set[str] | None = None,
+        modality: str | None = None,
     ) -> Dict[str, Any]:
         """Searches or synthesizes a new technique outline for later L2 building."""
-        modality = getattr(self, "modality", "tabular")
+        modality = modality or getattr(self, "modality", "tabular")
         query_prompt_sys = (
             "You are an ML research scientist. Write a short, precise web search query "
             f"to find state-of-the-art {modality} machine learning techniques, custom loss functions, "

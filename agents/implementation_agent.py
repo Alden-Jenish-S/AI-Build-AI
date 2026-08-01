@@ -12,11 +12,30 @@ from pathlib import Path
 from typing import Dict, Any, Optional
 from packaging.requirements import Requirement
 from core.runtime_contracts import ModelBundle, SplitPlan
-from evaluation.prediction_io import write_prediction_bundle
-from .initial_agent import infer_metric_from_description
+from evaluation.metrics import resolve_metric_name
+from evaluation.error_analysis import build_error_analysis
+from evaluation.policy import (
+    EvaluationPolicy,
+    normalize_evaluation_mode,
+    select_evaluation_policy,
+)
+from evaluation.prediction_io import (
+    legacy_prediction_payload,
+    write_prediction_bundle,
+)
+from evaluation.submission import (
+    task_requires_submission,
+    validate_node_submission,
+)
 from .llm_utils import call_llm
+from .modality_scaffold import (
+    runtime_data_prompt,
+    task_loader_source,
+    write_runtime_data_contract,
+)
 from .prompt_context import modality_prompt_context
 from .task_analyzer import TaskAnalyzer
+from .strategy_patterns import render_strategy_patterns
 from .validation_guard import inspect_generated_code
 from evaluation_contract import FIDELITY_PROFILES, validate_evaluation_outputs
 from runtime_utils import (
@@ -61,6 +80,63 @@ class ImplementationAgent:
             
         self.model_name = model_name
         self.project_root = Path(__file__).resolve().parent.parent
+
+    @staticmethod
+    def _candidate_code_fingerprint(
+        code: str,
+        *,
+        task_spec: object,
+        evaluation_mode: str,
+    ) -> str:
+        """Hash executable structure and literal hyperparameters pre-training."""
+        tree = ast.parse(code)
+        canonical = ast.dump(
+            tree,
+            annotate_fields=True,
+            include_attributes=False,
+        )
+        task_payload = (
+            task_spec.to_dict()
+            if hasattr(task_spec, "to_dict")
+            else task_spec
+        )
+        payload = {
+            "ast": canonical,
+            "evaluation_mode": evaluation_mode,
+            "task": task_payload,
+        }
+        return hashlib.sha256(
+            json.dumps(
+                payload, sort_keys=True, default=str
+            ).encode("utf-8")
+        ).hexdigest()
+
+    @staticmethod
+    def _register_candidate_fingerprint(
+        registry_root: Path,
+        *,
+        fingerprint: str,
+        node_id: str,
+    ) -> str | None:
+        """Return the prior node for a duplicate, otherwise register it."""
+        registry_path = Path(registry_root) / "candidate_fingerprints.json"
+        try:
+            registry = json.loads(
+                registry_path.read_text(encoding="utf-8")
+            )
+        except FileNotFoundError:
+            registry = {}
+        except (OSError, ValueError, TypeError):
+            registry = {}
+        previous = registry.get(fingerprint)
+        if previous and previous != node_id:
+            return str(previous)
+        registry[fingerprint] = node_id
+        registry_path.write_text(
+            json.dumps(registry, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        return None
 
     @staticmethod
     def _looks_like_deep_learning(code: str) -> bool:
@@ -109,8 +185,11 @@ class ImplementationAgent:
             evaluation = {}
         if oof_path.is_file():
             frame = pd.read_csv(oof_path)
-            required = {"row_id", "prediction"}
+            required = {"row_id"}
             if required.issubset(frame.columns):
+                predictions, inferred_class_names = (
+                    legacy_prediction_payload(frame)
+                )
                 if "fold_id" in frame.columns:
                     fold_ids = frame["fold_id"].to_numpy(dtype=int)
                 else:
@@ -152,14 +231,17 @@ class ImplementationAgent:
                     split_plan=split_plan,
                     output_type=task_spec.output.type,
                     sample_ids=sample_ids,
-                    predictions=frame["prediction"].to_numpy(dtype=float),
+                    predictions=predictions,
                     targets=(
                         frame["target"].to_numpy()
                         if "target" in frame.columns
                         else None
                     ),
                     fold_ids=fold_ids,
-                    class_names=task_spec.output.class_names,
+                    class_names=(
+                        inferred_class_names
+                        or task_spec.output.class_names
+                    ),
                     metadata={
                         "modality": task_spec.modality,
                         "problem_type": task_spec.problem_type,
@@ -237,6 +319,7 @@ class ImplementationAgent:
         execution_stopped: bool,
         accelerator: str,
         fidelity_profile: dict,
+        evaluation_mode: str = "cross_validation",
     ) -> str:
         """Return deterministic, failure-specific constraints for the LLM debugger."""
         combined = (str(stderr) + "\n" + str(stdout)).lower()
@@ -247,8 +330,13 @@ class ImplementationAgent:
             or "timeout" in combined
             or "deadline" in combined
         ):
+            work_unit = (
+                "inside each fold"
+                if evaluation_mode == "cross_validation"
+                else "inside the single training run"
+            )
             guidance.append(
-                "Execution recovery: keep the required rows/folds, but reduce work inside each fold; "
+                f"Execution recovery: keep the required rows, but reduce work {work_unit}; "
                 "cap epochs/iterations, add early stopping, avoid repeated final refits, and emit "
                 "progress at least once per epoch or trial. Do not increase training duration while debugging."
             )
@@ -289,22 +377,59 @@ class ImplementationAgent:
         if any(marker in combined for marker in ("no module named", "modulenotfounderror", "importerror")):
             guidance.append(
                 "Dependency repair: use only installed/project-allowlisted packages and the copied local "
-                "artifact module; do not invent package paths."
+                "artifact module; remove every import of the missing package throughout the script and "
+                "implement the intended mechanism with an available lower-level library. Do not merely "
+                "wrap the missing import in try/except or invent package paths."
+            )
+        if "numpy.ndarray" in combined and any(
+            marker in combined for marker in ("iloc", "loc")
+        ):
+            guidance.append(
+                "Array-indexing repair: y_eval, row_ids, fold_ids, test_ids, and aliases passed "
+                "from them are NumPy arrays. Replace every .iloc/.loc access on those values across "
+                "the complete script with array[index] or np.asarray(array)[index]. DataFrame feature "
+                "rows may continue to use .iloc."
+            )
+        if "keyerror" in combined:
+            guidance.append(
+                "Component-layout repair: obey runtime_data_contract.json exactly. Nested input "
+                "objects are flattened by TaskDataLoader; select declared single columns directly "
+                "and select structured components with their '<component>__' column prefix. Repair "
+                "every train, validation, full-data, and test access consistently."
             )
         if any(
             marker in combined
             for marker in ("result contract", "oof", "fold_id", "evaluation_manifest", "submission")
         ):
-            guidance.append(
-                "Evaluation repair: preserve evaluation_contract rows and fold_ids exactly, write one "
-                "OOF prediction per scheduled row, and regenerate result.json and submission.csv."
-            )
+            if evaluation_mode == "cross_validation":
+                guidance.append(
+                    "Evaluation repair: preserve evaluation_contract rows and "
+                    "fold_ids exactly, write one OOF prediction per scheduled "
+                    "row, and regenerate result.json and submission.csv."
+                )
+            elif evaluation_mode == "holdout":
+                guidance.append(
+                    "Evaluation repair: preserve the harness train/validation "
+                    "split, train once, write validation_predictions.csv for "
+                    "validation_row_ids, and do not create OOF output."
+                )
+            else:
+                guidance.append(
+                    "Evaluation repair: preserve task-native validation rows, "
+                    "write validation_predictions.csv, and do not create "
+                    "supervised OOF output."
+                )
         if cls._looks_like_deep_learning(code):
+            release_clause = (
+                "and release the model between folds"
+                if evaluation_mode == "cross_validation"
+                else "and train only one validation model"
+            )
             guidance.append(
                 "Deep-learning invariant: never move the complete dataset to GPU; use DataLoader "
                 "mini-batches, place model and each batch on the same device, detach predictions to CPU, "
                 f"use at most {fidelity_profile['max_epochs']} epochs with patience "
-                f"{fidelity_profile['early_stopping_patience']}, and release the model between folds."
+                f"{fidelity_profile['early_stopping_patience']}, {release_clause}."
             )
         if not guidance:
             guidance.append(
@@ -710,6 +835,137 @@ class ImplementationAgent:
             "silently catching the import and running another model"
         ]
 
+    @staticmethod
+    def _artifact_evaluation_contract_issues(
+        code: str,
+        model_card: dict | None,
+        evaluation_mode: str = "cross_validation",
+    ) -> list[str]:
+        """Require CV artifacts to consume harness-owned fold assignments."""
+        if evaluation_mode != "cross_validation":
+            return []
+        capabilities = (
+            model_card.get("capabilities", {})
+            if isinstance(model_card, dict)
+            else {}
+        )
+        if not isinstance(capabilities, dict) or (
+            capabilities.get("accepts_harness_fold_ids") is not True
+        ):
+            return []
+        entrypoint = str(
+            (model_card.get("interface", {}) or {}).get("entrypoint", "")
+        ).split("(", 1)[0].strip()
+        if not entrypoint:
+            return []
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            return []
+        calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and (
+                (
+                    isinstance(node.func, ast.Name)
+                    and node.func.id == entrypoint
+                )
+                or (
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr == entrypoint
+                )
+            )
+        ]
+        if calls and not any(
+            any(
+                keyword.arg == "fold_ids"
+                for keyword in call.keywords
+            )
+            for call in calls
+        ):
+            return [
+                f"artifact entrypoint {entrypoint} must receive "
+                "fold_ids=fold_ids for its evaluation call"
+            ]
+        return []
+
+    def _unavailable_import_issues(
+        self, code: str, node_dir: Path
+    ) -> list[str]:
+        """Reject imports that the selected interpreter cannot resolve."""
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            return []
+        roots: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                roots.update(alias.name.split(".", 1)[0] for alias in node.names)
+            elif (
+                isinstance(node, ast.ImportFrom)
+                and node.level == 0
+                and node.module
+            ):
+                roots.add(node.module.split(".", 1)[0])
+        roots -= set(getattr(sys, "stdlib_module_names", ()))
+        roots = {
+            root
+            for root in roots
+            if not (node_dir / f"{root}.py").is_file()
+            and not (node_dir / root).is_dir()
+        }
+        if not roots:
+            return []
+        probe = (
+            "import importlib.util,json,sys;"
+            "print(json.dumps([name for name in sys.argv[1:] "
+            "if importlib.util.find_spec(name) is None]))"
+        )
+        try:
+            probe_env = os.environ.copy()
+            project_root = Path(
+                getattr(
+                    self,
+                    "project_root",
+                    Path(__file__).resolve().parents[1],
+                )
+            )
+            probe_env["PYTHONPATH"] = os.pathsep.join(
+                filter(
+                    None,
+                    (
+                        str(project_root),
+                        probe_env.get("PYTHONPATH", ""),
+                    ),
+                )
+            )
+            result = subprocess.run(
+                [self.venv_python, "-c", probe, *sorted(roots)],
+                cwd=node_dir,
+                capture_output=True,
+                text=True,
+                timeout=15,
+                env=probe_env,
+            )
+            if result.returncode != 0:
+                return []
+            unavailable = json.loads(result.stdout.strip())
+        except (
+            OSError,
+            subprocess.TimeoutExpired,
+            json.JSONDecodeError,
+            TypeError,
+        ):
+            return []
+        if not unavailable:
+            return []
+        return [
+            "selected runtime cannot import modules "
+            f"{sorted(unavailable)}; use installed/project-allowlisted packages "
+            "or implement the same method with an available lower-level library"
+        ]
+
     @classmethod
     def _tuning_lock_issues(
         cls, code: str, parent_code: str, model_card: dict
@@ -968,11 +1224,15 @@ Current copied artifact:
             "technique_record.json",
             "error.log",
             "oof_predictions.csv",
+            "validation_predictions.csv",
             "evaluation_manifest.json",
             "fold_assignments.csv",
+            "validation_assignments.csv",
+            "evaluation_policy.json",
             "execution_resource.json",
             "fine_tuning.json",
             "artifact_repair.json",
+            "error_analysis.json",
         }
         allowed_suffixes = {
             ".py", ".json", ".yaml", ".yml", ".txt",
@@ -1028,11 +1288,12 @@ Current copied artifact:
         tuning_context: Optional[dict] = None,
         max_debug_attempts: int = 3,
         metric_name: Optional[str] = None,
-        baseline_dir: Optional[Path] = None,
+        task_assets_dir: Optional[Path] = None,
+        evaluation_mode: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        1. Reads immutable task inputs and run-owned baseline skeletons.
-        2. Calls LLM to generate updated code wiring the artifact in.
+        1. Reads immutable task inputs and harness-generated task metadata.
+        2. Calls the LLM to build a root method or evolve a measured parent.
         3. Writes it to node_dir / "algorithm.py".
         4. Runs it and parses result.json for the evaluation metric score.
         
@@ -1040,15 +1301,18 @@ Current copied artifact:
             node_dir: Directory for this node's run outputs
             technique_record: Dict from TechniqueAgent with plan/model_card
             task_dir: Read-only task directory with description/config/data
-            baseline_dir: Run directory with generated starter code/report.
-                The task directory is used only as a legacy read fallback.
+            task_assets_dir: Run directory containing the canonical task
+                contract, profile, sample index, and deterministic data loader.
+                Direct callers may omit it; the assets are then created locally.
             timeout: Optional hard runtime limit reserved for focused direct
                 callers. Normal workflow nodes always pass ``None``.
             stall_seconds: Renewable progress-lease duration. Total runtime is
                 unlimited while output, artifacts, or process activity continue.
             metric_direction: "maximize" or "minimize" — used in the prompt
             metric_name: Harness metric resolved by the manager. When omitted,
-                infer it from task configuration or description.
+                use the canonical task contract.
+            evaluation_mode: Optional manager-selected validation protocol.
+                When omitted, the model-aware evaluation policy selects it.
         """
         if timeout is not None and (
             not isinstance(timeout, (int, float))
@@ -1090,9 +1354,10 @@ Current copied artifact:
             )
         task_dir = Path(task_dir)
         task_spec = TaskAnalyzer().resolve(task_dir)
+        require_submission = task_requires_submission(task_dir, task_spec)
         modality_context = modality_prompt_context(task_spec, fidelity)
-        baseline_source = (
-            Path(baseline_dir) if baseline_dir is not None else task_dir
+        robust_strategy_context = render_strategy_patterns(
+            task_spec.to_dict()
         )
         node_dir.mkdir(parents=True, exist_ok=True)
         run_started = time.monotonic()
@@ -1111,33 +1376,68 @@ Current copied artifact:
         inherited_files = self._inherit_parent_workspace(
             Path(parent_node_dir) if parent_node_dir else None, node_dir
         )
-        
-        # Copy dataloader to node_dir so imports work locally
-        src_loader = baseline_source / "initial_dataloader.py"
-        dest_loader = node_dir / "initial_dataloader.py"
-        if src_loader.exists():
-            shutil.copy(src_loader, dest_loader)
-        contract_source = self.project_root / "evaluation_contract.py"
-        if contract_source.is_file():
-            shutil.copy2(contract_source, node_dir / "evaluation_contract.py")
-        for package_name in ("core", "evaluation"):
-            package_source = self.project_root / package_name
-            if package_source.is_dir():
-                shutil.copytree(
-                    package_source,
-                    node_dir / package_name,
-                    dirs_exist_ok=True,
-                    ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+
+        if task_assets_dir is None:
+            TaskAnalyzer().analyze(
+                task_dir,
+                output_dir=node_dir,
+                include_index=True,
+            )
+            (node_dir / "task_dataloader.py").write_text(
+                task_loader_source(), encoding="utf-8"
+            )
+            write_runtime_data_contract(
+                node_dir / "dataset_index.jsonl",
+                node_dir / "runtime_data_contract.json",
+                task_spec_path=node_dir / "resolved_task_spec.json",
+                task_dir=task_dir,
+            )
+        else:
+            task_assets_source = Path(task_assets_dir)
+            required_task_assets = [
+                "task_dataloader.py",
+                "resolved_task_spec.json",
+                "dataset_profile.json",
+                "dataset_analysis_report.txt",
+                "dataset_index_manifest.json",
+                "runtime_data_contract.json",
+            ]
+            index_manifest = json.loads(
+                (
+                    task_assets_source / "dataset_index_manifest.json"
+                ).read_text(encoding="utf-8")
+            )
+            if index_manifest.get("storage") != "direct_tabular":
+                required_task_assets.append("dataset_index.jsonl")
+            missing = [
+                name
+                for name in required_task_assets
+                if not (task_assets_source / name).is_file()
+            ]
+            if missing:
+                raise FileNotFoundError(
+                    "Method-tree task assets are incomplete: "
+                    + ", ".join(missing)
                 )
-        for contract_name in (
-            "resolved_task_spec.json",
-            "dataset_index_manifest.json",
-            "dataset_index.jsonl",
-        ):
-            contract_file = baseline_source / contract_name
-            if contract_file.is_file():
-                shutil.copy2(contract_file, node_dir / contract_name)
-            
+            for name in required_task_assets:
+                source = task_assets_source / name
+                destination = node_dir / name
+                if name == "dataset_index.jsonl":
+                    # The generated loader streams this immutable, potentially
+                    # very large asset from AIBUILDAI_TASK_ASSETS_DIR.
+                    continue
+                if source.resolve() != destination.resolve():
+                    shutil.copy2(source, destination)
+        runtime_contract = json.loads(
+            (node_dir / "runtime_data_contract.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        concrete_data_context = runtime_data_prompt(runtime_contract)
+        # Framework modules are imported from the shared project root through
+        # the child PYTHONPATH. Copying core/, evaluation/, and
+        # evaluation_contract.py into every node bloats runs and lets stale
+        # snapshots drift from the harness that validates them.
         # Copy the memory pool technique python file to node_dir so it can be imported (Fixes ModuleNotFoundError)
         model_card = technique_record.get("model_card", {})
         if model_card and "category" in model_card and "code_path" in model_card:
@@ -1172,46 +1472,63 @@ Current copied artifact:
             f"{node_dir / 'input'} ({len(linked_inputs)} link(s); no dataset copy)."
         )
 
-        # Descendants evolve the measured parent implementation. Only root-level
-        # candidates start from the generated baseline.
-        src_algo = Path(base_algorithm_path) if base_algorithm_path else (
-            baseline_source / "initial_algorithm.py"
-        )
-        if not src_algo.is_file():
-            raise FileNotFoundError(f"Base algorithm does not exist: {src_algo}")
-        with open(src_algo, 'r', encoding='utf-8') as f:
-            original_code = f.read()
+        # Descendants evolve a measured parent. Root candidates are generated
+        # directly from their method plans, with no starter model.
+        if base_algorithm_path is not None:
+            src_algo = Path(base_algorithm_path)
+            if not src_algo.is_file():
+                raise FileNotFoundError(
+                    f"Measured parent algorithm does not exist: {src_algo}"
+                )
+            original_code = src_algo.read_text(encoding="utf-8")
+        else:
+            original_code = ""
             
         # Direct callers may omit the metric; tree-search callers pass the
         # manager's already-resolved value so generation and validation agree.
         if metric_name is None:
-            config_file = task_dir / "task_config.json"
-            metric_name = "score"
-            if config_file.exists():
-                with open(config_file, 'r', encoding='utf-8') as f:
-                    task_config = json.load(f)
-                metric_name = task_config.get("metric_name", "score")
-                metric_direction = task_config.get(
-                    "metric_direction", metric_direction
-                )
-            else:
-                description_file = task_dir / "task_description.md"
-                if description_file.exists():
-                    metric_name, metric_direction = (
-                        infer_metric_from_description(
-                            description_file.read_text(encoding="utf-8")
-                        )
-                    )
+            metric_name = task_spec.primary_metric
+            metric_direction = task_spec.metric_direction
             
         # Never execute an artifact that failed verification.
         if model_card and model_card.get("verified") is not True:
             raise ValueError(
                 f"Model card {model_card.get('artifact_id', '<unknown>')!r} is not verified"
             )
+        if evaluation_mode is None:
+            evaluation_policy = select_evaluation_policy(
+                task_spec,
+                technique_record,
+                model_card,
+                operator=operator,
+            )
+        else:
+            evaluation_mode = normalize_evaluation_mode(
+                evaluation_mode, allow_auto=False
+            )
+            evaluation_policy = EvaluationPolicy(
+                mode=evaluation_mode,
+                reason="evaluation mode preserved by the manager",
+                source="manager",
+            )
+        evaluation_mode = evaluation_policy.mode
+        execution_resource["evaluation_mode"] = evaluation_mode
+        execution_resource["evaluation_policy_reason"] = (
+            evaluation_policy.reason
+        )
+        with open(
+            node_dir / "execution_resource.json", "w", encoding="utf-8"
+        ) as stream:
+            json.dump(execution_resource, stream, indent=2)
+            stream.write("\n")
+        (node_dir / "evaluation_policy.json").write_text(
+            json.dumps(evaluation_policy.to_dict(), indent=2) + "\n",
+            encoding="utf-8",
+        )
             
         # Get dataset analysis report to pass to LLM
         dataset_snapshot = ""
-        report_file = baseline_source / "dataset_analysis_report.txt"
+        report_file = node_dir / "dataset_analysis_report.txt"
         try:
             if report_file.exists():
                 with open(report_file, 'r', encoding='utf-8') as f:
@@ -1220,15 +1537,15 @@ Current copied artifact:
                 from .data_analyzer import run_dataset_analysis
                 print(f"ImplementationAgent: Checking/running dataset analysis fallback for {task_dir.name}...")
                 analysis_report = run_dataset_analysis(task_dir)
-                report_file = node_dir / "dataset_analysis_report.txt"
-                with open(report_file, 'w', encoding='utf-8') as f:
-                    f.write(analysis_report)
+                report_file.write_text(analysis_report, encoding="utf-8")
                     
             dataset_snapshot = (
                 "=== Dataset Analysis & Schema Report ===\n"
                 f"{analysis_report}\n"
                 "=== Canonical Task Contract ===\n"
                 f"{json.dumps(task_spec.to_dict(), indent=2)}\n"
+                "=== Concrete Runtime Data Contract ===\n"
+                f"{concrete_data_context}\n"
                 "========================================\n"
             )
         except Exception as e:
@@ -1266,18 +1583,37 @@ Current copied artifact:
                 f"`from {module_name} import {entrypoint_name}`. Do not import from a `memory_pool` package "
                 "and do not reimplement the artifact's internal logic."
             )
+            if (
+                evaluation_mode == "cross_validation"
+                and
+                model_card.get("capabilities", {}).get(
+                    "accepts_harness_fold_ids"
+                )
+                is True
+            ):
+                integration_instruction += (
+                    " For the OOF evaluation call, pass the harness array "
+                    "explicitly as `fold_ids=fold_ids`; do not let the artifact "
+                    "create an independent split."
+                )
 
         else:
             integration_instruction = (
-                "No verified artifact is available for this node. Improve the supplied parent baseline directly "
-                "according to the technique plan, keep the script self-contained, and do not import any "
-                "`memory_pool` module or imaginary artifact."
+                "No verified artifact is available for this node. Implement the "
+                "chosen technique as a complete self-contained method. If a measured "
+                "parent is supplied, change it according to the operator; otherwise "
+                "design the root pipeline directly from the task contract. Do not "
+                "import any `memory_pool` module or imaginary artifact."
             )
 
         if fidelity not in FIDELITY_PROFILES:
             raise ValueError("fidelity must be 'screen', 'medium', or 'full'")
         fidelity_profile = FIDELITY_PROFILES[fidelity]
         operator_instruction = {
+            "root": (
+                "Build the complete root pipeline directly from this method "
+                "plan; there is no starter or parent implementation."
+            ),
             "refine": "Modify only the highest-impact relevant component; preserve working parent behavior elsewhere.",
             "tune": "Act as a fine-tuner: preserve the measured architecture and run a compact pruned hyperparameter search with a fixed seed.",
             "diversify": "Favor a sound model or representation whose errors are likely less correlated with the parent.",
@@ -1286,12 +1622,23 @@ Current copied artifact:
         fine_tuning_instruction = self._fine_tuning_instruction(
             operator, tuning_context, fidelity_profile
         )
+        deep_preprocessing_scope = (
+            "fold-local"
+            if evaluation_mode == "cross_validation"
+            else "training-split-only"
+        )
+        deep_lifecycle = (
+            "release models/tensors between folds"
+            if evaluation_mode == "cross_validation"
+            else "train only one validation model"
+        )
         deep_learning_instruction = (
-            "Deep-learning execution contract (when applicable): use fold-local numeric/categorical "
+            "Deep-learning execution contract (when applicable): use "
+            f"{deep_preprocessing_scope} numeric/categorical "
             "preprocessing; float32 features; the loss-appropriate label dtype; mini-batch DataLoaders; "
             "model and batches on the same selected device; validation-based early stopping with the "
             "best state restored; and CPU-detached predictions. Never place the full dataset on GPU or "
-            "retain models/tensors across folds. "
+            f"retain unnecessary models/tensors; {deep_lifecycle}. "
             f"Use no more than {fidelity_profile['max_epochs']} epochs and patience "
             f"{fidelity_profile['early_stopping_patience']} at this fidelity. Print concise progress "
             "at least once per epoch so long-running training remains observable.\n"
@@ -1302,12 +1649,105 @@ Current copied artifact:
             if operator == "tune" and tuning_context
             else ""
         )
+        if evaluation_mode == "cross_validation":
+            evaluation_contract_prompt = (
+                "SELECTED EVALUATION MODE: cross_validation. OOF is required "
+                "because this model was classified as fold-independent and "
+                "appropriate for CV/model comparison.\n"
+                "Import `prepare_evaluation_data` from the local "
+                "`evaluation_contract` module and call:\n"
+                f"  X_eval, y_eval, row_ids, fold_ids, evaluation_meta = "
+                f"prepare_evaluation_data(train_data, '{fidelity}', "
+                "evaluation_mode='cross_validation')\n"
+                "Use X_eval/y_eval for every cross-validation operation and "
+                "use the supplied fold_ids exactly. The harness has already "
+                "applied fidelity sampling: never subsample these rows or "
+                "create an independent split. Fit learned preprocessing on "
+                "each fold's training rows only. Save one prediction for "
+                "every scheduled row to `oof_predictions.csv`. Scalar output "
+                "uses row_id,target,prediction,fold_id. Class probabilities "
+                "use row_id,target,fold_id and one numeric "
+                "`prediction::<class_name>` column per class in stable order.\n"
+            )
+            evaluation_output_prompt = (
+                "Persist the complete OOF output described above so the "
+                "harness can independently recompute every fold metric."
+            )
+            result_statistics_prompt = (
+                f'"evaluation_mode": "cross_validation", '
+                '"cv_mean": <float>, "cv_std": <float>, "folds": <int>, '
+            )
+            progress_unit = "fold"
+        elif evaluation_mode == "holdout":
+            evaluation_contract_prompt = (
+                "SELECTED EVALUATION MODE: holdout. OOF IS NOT REQUIRED for "
+                "this model. Do not create a CV loop and do not write "
+                "`oof_predictions.csv`.\n"
+                "Import `prepare_holdout_evaluation_data` from the local "
+                "`evaluation_contract` module and call:\n"
+                f"  X_train, y_train, X_valid, y_valid, "
+                f"validation_row_ids, evaluation_meta = "
+                f"prepare_holdout_evaluation_data(train_data, '{fidelity}')\n"
+                "Train the selected model exactly once on X_train/y_train. "
+                "Fit all preprocessing only on X_train and use X_valid only "
+                "for evaluation, early stopping, and model selection. The "
+                "split is harness-owned; never call train_test_split or make "
+                "another split. Write `validation_predictions.csv` for exactly "
+                "the validation rows. Scalar output uses "
+                "row_id,target,prediction. Class probabilities use "
+                "row_id,target and one numeric `prediction::<class_name>` "
+                "column per class in stable model.classes_ order.\n"
+            )
+            evaluation_output_prompt = (
+                "Persist `validation_predictions.csv`; OOF files are not part "
+                "of this node's contract."
+            )
+            result_statistics_prompt = (
+                f'"evaluation_mode": "holdout", '
+                '"validation_score": <float>, "folds": 1, '
+            )
+            progress_unit = "training stage"
+        else:
+            evaluation_contract_prompt = (
+                "SELECTED EVALUATION MODE: task_native. OOF IS NOT REQUIRED "
+                "because this task has no supervised fold target. Do not write "
+                "`oof_predictions.csv`.\n"
+                "Import `prepare_evaluation_data` and "
+                "`evaluate_clustering_predictions` from the local "
+                "`evaluation_contract` module. Call:\n"
+                f"  X_eval, y_eval, row_ids, fold_ids, evaluation_meta = "
+                f"prepare_evaluation_data(train_data, '{fidelity}', "
+                "evaluation_mode='task_native')\n"
+                "Fit the unsupervised method once on X_eval, then call "
+                "`evaluate_clustering_predictions(X_eval, labels, row_ids, "
+                "fold_ids, fidelity=evaluation_meta['fidelity'])`. The helper "
+                "writes `validation_predictions.csv` and computes the bounded "
+                "task-native validation proxy. The fold IDs are scoring "
+                "partitions only; do not train one model per fold.\n"
+            )
+            evaluation_output_prompt = (
+                "Persist the task-native validation output; do not create OOF."
+            )
+            result_statistics_prompt = (
+                f'"evaluation_mode": "task_native", '
+                '"validation_score": <float>, "folds": <int>, '
+            )
+            progress_unit = "training stage"
 
         system_prompt = (
-            "You are the Implementation Agent. Produce a complete executable revision of the supplied parent algorithm. "
+            "You are the Implementation Agent. Produce a complete executable "
+            "method. When a measured parent is supplied, evolve it according "
+            "to the selected operator. "
             f"{integration_instruction} Ensure the output is valid Python code wrapped in a ```python block.\n"
-            f"Search operator: {operator or 'initial'}. {operator_instruction}\n"
+            f"Search operator: {operator or 'root'}. {operator_instruction}\n"
             f"Evaluation fidelity: {fidelity} ({json.dumps(fidelity_profile)}). These limits are mandatory.\n"
+            "CRITICAL MODEL ARCHITECTURE CONTRACT:\n"
+            "- You MUST implement the complete representation, preprocessing, feature, robustness, and model hypothesis specified in the Chosen Technique Plan.\n"
+            "- The model family is one pipeline component; do not collapse a feature/representation branch into generic model.fit code.\n"
+            "- Do NOT fall back to or re-execute an unchanged parent pipeline from another node.\n"
+            "- If an optional package is unavailable, implement the intended mechanism self-contained with importable project libraries.\n"
+            "ROBUST PIPELINE DESIGN PRINCIPLES (apply only when supported by dataset diagnostics):\n"
+            f"{robust_strategy_context}\n"
             f"{fine_tuning_instruction}"
             f"{deep_learning_instruction}"
             f"Modality correctness contract:\n{modality_context}\n"
@@ -1318,36 +1758,53 @@ Current copied artifact:
             "usable and fall back to CPU only when that model/library has no working backend for the selected "
             "accelerator. When the technique permits equivalent model families, prefer a GPU-capable learner "
             "over a CPU-only one. Do not send small preprocessing or unsupported scikit-learn estimators to a GPU. "
-            "After training, report os.environ.get('AIBUILDAI_ACTUAL_ACCELERATOR', selected_device) in "
-            "result.json; GPU-aware pool artifacts update this variable when they fall back.\n"
+            "AIBUILDAI_ACTUAL_ACCELERATOR starts as 'cpu'. Change it to 'cuda' or "
+            "'mps' only after this script successfully trains or infers with that "
+            "backend, then report the environment value in result.json.\n"
             "CRITICAL DATA LOADING CONTRACT:\n"
             "1. You must ALWAYS load the dataset first using the custom loader:\n"
-            "   from initial_dataloader import MyDataLoader\n"
-            "   loader = MyDataLoader()\n"
+            "   from task_dataloader import TaskDataLoader\n"
+            "   loader = TaskDataLoader()\n"
             "   train_data, test_data = loader()\n"
-            "2. Pass the loaded 'train_data' dictionary directly to 'prepare_evaluation_data':\n"
-            "   X_eval, y_eval, row_ids, fold_ids, evaluation_meta = prepare_evaluation_data(train_data, '<fidelity>')\n"
-            "3. Do NOT attempt to read raw CSV files directly (like 'train.csv') or pass placeholder dictionaries (like {'X': None, 'y': None}) to prepare_evaluation_data. Only 'train_data' from MyDataLoader is valid.\n"
-            "Import `prepare_evaluation_data` from the local `evaluation_contract` module and call "
-            f"`X_eval, y_eval, row_ids, fold_ids, evaluation_meta = prepare_evaluation_data(train_data, '{fidelity}')`. "
-            "Use X_eval/y_eval for every training and validation operation, use the supplied fold_ids exactly, "
-            "and train final test-prediction models on all X_eval rows. Save one OOF prediction per scheduled "
-            "row to oof_predictions.csv with columns row_id,target,prediction. Do not create a separate split. "
-            "CRITICAL: The columns of oof_predictions.csv MUST be named EXACTLY 'row_id', 'target', and 'prediction'. The target column must be named literally 'target' (not after any dataset-specific column name like 'Heart Disease').\n"
-            "Fit every imputer, encoder, scaler, feature selector, and target-dependent transform on training folds only. "
-            "Never use test-set statistics or target values in feature generation. Define feature engineering once and "
-            "apply it symmetrically to fold-train, fold-validation, full-evaluation, and test frames. Keep raw columns "
-            "separate from engineered columns; transform test data before aligning it to transformed training columns. "
-            "Use stratification for classification.\n"
-            "Emit and flush a concise progress line before and after every fold, "
+            "2. Pass the loaded `train_data` dictionary directly to the "
+            "selected evaluation helper. Never read raw files directly or "
+            "pass placeholder dictionaries to an evaluation helper.\n"
+            f"3. {concrete_data_context}\n"
+            f"{evaluation_contract_prompt}"
+            "Import `metric_value` from `evaluation.metrics` and call it with the exact signature "
+            f"`metric_value('{metric_name}', y_true, y_pred)` for validation reporting; the metric "
+            "name is always the FIRST argument and must not also be passed as a keyword. Never "
+            "replace the task metric with a model-default accuracy/loss.\n"
+            "Fit all learned preprocessing (imputers, encoders, scalers, tokenizers, feature extractors, target-dependent transforms) "
+            "only on the selected protocol's training data. Never use test-set statistics or target values in feature engineering or model fitting. "
+            "Define data preprocessing once and apply it symmetrically to training, validation, full-training, and test data.\n"
+            + (
+                "FINAL-PREDICTION CONTRACT (MANDATORY FOR THIS TASK):\n"
+                "After the selected validation protocol, import and call "
+                "`prepare_final_training_data(train_data, test_data)` from "
+                "`evaluation_contract`. Fit a fresh final model and fresh preprocessing "
+                "on ALL returned full-training rows, never on only the evaluation subset. Predict every "
+                "returned test row and write `submission/submission.csv`. Use test_ids as "
+                "the first column and the exact output column names/order in "
+                "`resolved_task_spec.json`; multiclass probabilities must be finite, "
+                "within [0,1], and sum to one per row. The implementation is incomplete "
+                "without both `final_training_manifest.json` and the submission file. "
+                "`prepare_final_training_data` owns the manifest; NEVER create, overwrite, "
+                "or append to that file yourself. The exact submission ID and prediction "
+                "column names are listed in resolved_task_spec.json under output.options.\n"
+                if require_submission
+                else ""
+            )
+            +
+            f"Emit and flush a concise progress line before and after every {progress_unit}, "
             "training stage, and tuning trial so the workflow can distinguish "
             "healthy long-running work from a stalled process.\n"
-            "When practical, save validation predictions to 'oof_predictions.csv' with columns row_id,target,prediction.\n"
+            f"{evaluation_output_prompt}\n"
             f"IMPORTANT: At the END of your script, write a JSON file 'result.json' in the current directory:\n"
             f'  import json; json.dump({{"score": <float>, "metric": "{metric_name}", "direction": "{metric_direction}", '
-            f'"cv_mean": <float>, "cv_std": <float>, "folds": <int>, "fidelity": "{fidelity}", '
+            f'{result_statistics_prompt}"fidelity": "{fidelity}", '
             f'"accelerator": <actual "cpu"|"cuda"|"mps">{tuning_result_fields}}}, open("result.json", "w"))\n'
-            "The score must be the cross-validation mean when CV is used, otherwise the held-out validation score."
+            "The score must be the metric from the selected evaluation protocol."
         )
         
         technique_plan = technique_record.get("plan", "")
@@ -1359,10 +1816,8 @@ Current copied artifact:
                 prompt_model_card["verification_log"]
             )[-1200:]
         user_prompt = f"""
-            Parent Code ({'measured ancestor' if base_algorithm_path else 'generated baseline'}):
-            ```python
-            {original_code}
-            ```
+            Parent implementation:
+            {f"```python{chr(10)}{original_code}{chr(10)}```" if original_code else "None. This is a root method; build the complete pipeline directly from the chosen technique plan."}
 
             Chosen Technique Plan:
             {technique_plan}
@@ -1387,17 +1842,37 @@ Current copied artifact:
         elif "```" in response:
             clean_code = response.split("```")[1].split("```")[0]
 
-        guard_issues = inspect_generated_code(
-            clean_code, task_spec=task_spec.to_dict()
-        )
-        guard_issues.extend(self._resource_limit_issues(clean_code, fidelity_profile))
-        guard_issues.extend(
-            self._dependency_fallback_issues(clean_code, technique_record)
-        )
-        if operator == "tune" and tuning_context:
-            guard_issues.extend(
-                self._tuning_lock_issues(clean_code, original_code, model_card)
+        def execution_contract_issues(candidate_code: str) -> list[str]:
+            issues = inspect_generated_code(
+                candidate_code,
+                task_spec=task_spec.to_dict(),
+                runtime_contract=runtime_contract,
             )
+            issues.extend(
+                self._resource_limit_issues(candidate_code, fidelity_profile)
+            )
+            issues.extend(
+                self._dependency_fallback_issues(
+                    candidate_code, technique_record
+                )
+            )
+            issues.extend(
+                self._artifact_evaluation_contract_issues(
+                    candidate_code, model_card, evaluation_mode
+                )
+            )
+            issues.extend(
+                self._unavailable_import_issues(candidate_code, node_dir)
+            )
+            if operator == "tune" and tuning_context:
+                issues.extend(
+                    self._tuning_lock_issues(
+                        candidate_code, original_code, model_card
+                    )
+                )
+            return list(dict.fromkeys(issues))
+
+        guard_issues = execution_contract_issues(clean_code)
         if guard_issues:
             print(
                 "ImplementationAgent: Validation guard found contract risks; "
@@ -1412,6 +1887,9 @@ Current copied artifact:
 Leakage defects:
 {json.dumps(guard_issues, indent=2)}
 
+Authoritative runtime data contract:
+{concrete_data_context}
+
 Code:
 ```python
 {clean_code}
@@ -1425,23 +1903,7 @@ Code:
                 clean_code = repair_response.split("```", 1)[1].split("```", 1)[0]
             else:
                 clean_code = repair_response
-            remaining_issues = inspect_generated_code(
-                clean_code, task_spec=task_spec.to_dict()
-            )
-            remaining_issues.extend(
-                self._resource_limit_issues(clean_code, fidelity_profile)
-            )
-            remaining_issues.extend(
-                self._dependency_fallback_issues(
-                    clean_code, technique_record
-                )
-            )
-            if operator == "tune" and tuning_context:
-                remaining_issues.extend(
-                    self._tuning_lock_issues(
-                        clean_code, original_code, model_card
-                    )
-                )
+            remaining_issues = execution_contract_issues(clean_code)
             if remaining_issues:
                 raise ValueError(
                     "Generated implementation failed execution-contract guard after repair: "
@@ -1451,6 +1913,68 @@ Code:
         dest_code_file = node_dir / "algorithm.py"
         with open(dest_code_file, 'w', encoding='utf-8') as f:
             f.write(clean_code.strip())
+
+        code_fingerprint = self._candidate_code_fingerprint(
+            clean_code,
+            task_spec=task_spec,
+            evaluation_mode=evaluation_mode,
+        )
+        duplicate_of = self._register_candidate_fingerprint(
+            (
+                Path(task_assets_dir)
+                if task_assets_dir is not None
+                else node_dir.parent
+            ),
+            fingerprint=code_fingerprint,
+            node_id=node_dir.name,
+        )
+        (node_dir / "candidate_fingerprint.json").write_text(
+            json.dumps(
+                {
+                    "fingerprint": code_fingerprint,
+                    "duplicate_of": duplicate_of,
+                    "evaluation_mode": evaluation_mode,
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        if duplicate_of is not None:
+            duplicate_result = {
+                "score": None,
+                "status": "skipped_duplicate_pre_execution",
+                "duplicate_of": duplicate_of,
+                "code_fingerprint": code_fingerprint,
+                "diagnostics": (
+                    "Candidate code structure and literal hyperparameters "
+                    f"duplicate {duplicate_of}; training was not started."
+                ),
+            }
+            (node_dir / "result.json").write_text(
+                json.dumps(duplicate_result, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            return {
+                **duplicate_result,
+                "code_path": str(dest_code_file),
+                "base_code_path": (
+                    str(base_algorithm_path)
+                    if base_algorithm_path is not None
+                    else None
+                ),
+                "parent_node_dir": (
+                    str(parent_node_dir) if parent_node_dir else None
+                ),
+                "operator": operator,
+                "fidelity": fidelity,
+                "evaluation_mode": evaluation_mode,
+                "evaluation_policy": evaluation_policy.to_dict(),
+                "elapsed_seconds": time.monotonic() - run_started,
+                "validation": {},
+                "oof_path": None,
+                "validation_path": None,
+            }
             
         print(f"ImplementationAgent: Wrote glue code to {dest_code_file}")
                     
@@ -1486,6 +2010,7 @@ Code:
                     timeout_kill,
                     accelerator,
                     fidelity_profile,
+                    evaluation_mode,
                 )
                 artifact_debug_context = ""
                 failure_output = (stderr + "\n" + stdout).strip()
@@ -1565,34 +2090,50 @@ Code:
                     "You are the Implementation Agent in failure-repair mode. The previous generated ML script failed.\n"
                     "Use the supplied code, concrete output, and deterministic repair focus to fix the causal defect.\n"
                     "Do not opportunistically fine-tune a failing model: first make it complete within the fidelity caps.\n"
+                    "CRITICAL ARCHITECTURE REPAIR CONTRACT:\n"
+                    "- Debug and fix the INTENDED model architecture specified in the plan.\n"
+                    "- Do NOT abandon the intended architecture or fall back to re-executing a parent model architecture from another node.\n"
                     f"{integration_instruction}\n"
                     "CRITICAL: Start your Python code response with a brief comment block explaining the cause of the error and how you are fixing it. "
                     "This helps trace execution logical errors correctly.\n"
                     "Ensure the output is valid Python code wrapped in a ```python block.\n"
-                    "Fit preprocessing on training folds only; never derive preprocessing statistics from test data.\n"
-                    "Apply the same fitted feature transformation to training, validation, and test frames. "
-                    "Transform raw test data before reindexing it to engineered training columns, and assert exact "
-                    "post-transform feature parity before prediction.\n"
+                    "Fit preprocessing only on the selected protocol's training data; never derive preprocessing statistics from test data.\n"
+                    "Apply the same fitted transformations symmetrically to training, validation, and test data. "
+                    "Ensure exact post-transform feature parity and structure before running prediction.\n"
                     "CRITICAL DATA LOADING CONTRACT:\n"
                     "1. You must ALWAYS load the dataset first using the custom loader:\n"
-                    "   from initial_dataloader import MyDataLoader\n"
-                    "   loader = MyDataLoader()\n"
+                    "   from task_dataloader import TaskDataLoader\n"
+                    "   loader = TaskDataLoader()\n"
                     "   train_data, test_data = loader()\n"
-                    "2. Pass the loaded 'train_data' dictionary directly to 'prepare_evaluation_data':\n"
-                    "   X_eval, y_eval, row_ids, fold_ids, evaluation_meta = prepare_evaluation_data(train_data, '<fidelity>')\n"
-                    "3. Do NOT attempt to read raw CSV files directly (like 'train.csv') or pass placeholder dictionaries (like {'X': None, 'y': None}) to prepare_evaluation_data. Only 'train_data' from MyDataLoader is valid.\n"
-                    "Keep using evaluation_contract.prepare_evaluation_data and its supplied fold_ids exactly; "
-                    "write complete OOF predictions for the scheduled rows. "
-                    "CRITICAL: The columns of oof_predictions.csv MUST be named EXACTLY 'row_id', 'target', and 'prediction'. The target column must be named literally 'target' (not after any dataset-specific column name like 'Heart Disease').\n"
+                    "2. Pass `train_data` directly to the evaluation helper selected below. Never read raw files or invent a split.\n"
+                    f"3. {concrete_data_context}\n"
+                    f"{evaluation_contract_prompt}"
+                    "Recompute validation values with "
+                    f"`evaluation.metrics.metric_value('{metric_name}', y_true, y_pred)`; the "
+                    "metric name is the first argument and must not also be passed as a keyword.\n"
+                    + (
+                        "The task requires final predictions. Call "
+                        "`evaluation_contract.prepare_final_training_data(train_data, test_data)`, "
+                        "fit a fresh model on every returned full-training row, predict every returned "
+                        "test row, and write the exact template schema to "
+                        "`submission/submission.csv`. This must also create "
+                        "`final_training_manifest.json`. The helper owns that manifest; "
+                        "never create or overwrite it yourself. Read the exact submission "
+                        "columns from output.options in resolved_task_spec.json.\n"
+                        if require_submission
+                        else ""
+                    )
+                    +
                     f"The selected accelerator is {accelerator}, exposed as AIBUILDAI_ACCELERATOR. Preserve "
-                    "framework-native GPU configuration when supported and retain a safe CPU fallback. Report "
-                    "AIBUILDAI_ACTUAL_ACCELERATOR after training.\n"
+                    "framework-native GPU configuration when supported and retain a safe CPU fallback. "
+                    "AIBUILDAI_ACTUAL_ACCELERATOR starts as cpu; promote it only after actual GPU-backed "
+                    "training or inference, then report it.\n"
                     f"{fine_tuning_instruction}"
                     f"{deep_learning_instruction}"
                     f"Modality correctness contract:\n{modality_context}\n"
                     f"IMPORTANT: At the END of your script, write a JSON file 'result.json' in the current directory:\n"
                     f'  import json; json.dump({{"score": <float>, "metric": "{metric_name}", "direction": "{metric_direction}", '
-                    f'"cv_mean": <float>, "cv_std": <float>, "folds": <int>, "fidelity": "{fidelity}", '
+                    f'{result_statistics_prompt}"fidelity": "{fidelity}", '
                     f'"accelerator": <actual "cpu"|"cuda"|"mps">{tuning_result_fields}}}, open("result.json", "w"))\n'
                     "The score should be the final validation metric value."
                 )
@@ -1646,23 +2187,7 @@ Code:
                 elif "```" in response:
                     clean_code = response.split("```")[1].split("```")[0]
 
-                debug_guard_issues = inspect_generated_code(
-                    clean_code, task_spec=task_spec.to_dict()
-                )
-                debug_guard_issues.extend(
-                    self._resource_limit_issues(clean_code, fidelity_profile)
-                )
-                debug_guard_issues.extend(
-                    self._dependency_fallback_issues(
-                        clean_code, technique_record
-                    )
-                )
-                if operator == "tune" and tuning_context:
-                    debug_guard_issues.extend(
-                        self._tuning_lock_issues(
-                            clean_code, original_code, model_card
-                        )
-                    )
+                debug_guard_issues = execution_contract_issues(clean_code)
                 if debug_guard_issues:
                     stderr = (
                         "Static leakage guard rejected the debug revision:\n"
@@ -1696,8 +2221,18 @@ Code:
                 result_json_path,
                 submission_path,
                 node_dir / "oof_predictions.csv",
+                node_dir / "validation_predictions.csv",
                 node_dir / "evaluation_manifest.json",
                 node_dir / "fold_assignments.csv",
+                node_dir / "validation_assignments.csv",
+                node_dir / "error_analysis.json",
+                node_dir / "final_training_manifest.json",
+                node_dir
+                / ".evaluation_contract"
+                / "final_training_manifest.json",
+                node_dir
+                / ".evaluation_contract"
+                / "validation_targets.json",
             ):
                 if stale_output.exists() or stale_output.is_symlink():
                     stale_output.unlink()
@@ -1705,6 +2240,11 @@ Code:
             child_env = accelerator_subprocess_env(accelerator)
             child_env.update(
                 {
+                    "AIBUILDAI_TASK_ASSETS_DIR": str(
+                        Path(task_assets_dir).resolve()
+                        if task_assets_dir is not None
+                        else node_dir.resolve()
+                    ),
                     "AIBUILDAI_MAX_EPOCHS": str(fidelity_profile["max_epochs"]),
                     "AIBUILDAI_EARLY_STOPPING_PATIENCE": str(
                         fidelity_profile["early_stopping_patience"]
@@ -1715,6 +2255,17 @@ Code:
                     "AIBUILDAI_MAX_TUNING_TRIALS": str(
                         fidelity_profile["max_tuning_trials"]
                     ),
+                    "AIBUILDAI_EVALUATION_MODE": evaluation_mode,
+                    "PYTHONPATH": os.pathsep.join(
+                        filter(
+                            None,
+                            (
+                                str(self.project_root),
+                                child_env.get("PYTHONPATH", ""),
+                            ),
+                        )
+                    ),
+                    "PYTHONDONTWRITEBYTECODE": "1",
                 }
             )
             execution = run_supervised_process(
@@ -1784,10 +2335,19 @@ Code:
                                 f"result direction {declared_direction!r} does not match {metric_direction!r}"
                             )
                         declared_metric = result_data.get("metric")
-                        if declared_metric and declared_metric != metric_name:
-                            raise ValueError(
-                                f"result metric {declared_metric!r} does not match {metric_name!r}"
+                        if declared_metric:
+                            resolved_declared_metric = resolve_metric_name(
+                                declared_metric,
+                                problem_type=task_spec.problem_type,
+                                output_type=task_spec.output.type,
                             )
+                            if resolved_declared_metric != metric_name:
+                                raise ValueError(
+                                    f"result metric {declared_metric!r} resolves "
+                                    f"to {resolved_declared_metric!r}, which does "
+                                    f"not match {metric_name!r}"
+                                )
+                            result_data["metric"] = metric_name
                         declared_fidelity = result_data.get("fidelity")
                         if declared_fidelity and declared_fidelity != fidelity:
                             raise ValueError(
@@ -1833,10 +2393,39 @@ Code:
                             result_data["tuning_trials"] = tuning_trials
                         if enforce_evaluation_contract:
                             contract_validation = validate_evaluation_outputs(
-                                node_dir, fidelity, metric_name
+                                node_dir,
+                                fidelity,
+                                metric_name,
+                                expected_class_names=(
+                                    task_spec.output.class_names
+                                ),
+                                expected_evaluation_mode=evaluation_mode,
                             )
+                            if require_submission:
+                                result_data["submission_validation"] = (
+                                    validate_node_submission(
+                                        node_dir,
+                                        task_dir=task_dir,
+                                        task_spec=task_spec,
+                                    )
+                                )
                             result_data.update(contract_validation)
-                            score = float(contract_validation["cv_mean"])
+                            score = float(contract_validation["score"])
+                            error_analysis = build_error_analysis(
+                                node_dir,
+                                evaluation_mode=evaluation_mode,
+                                problem_type=task_spec.problem_type,
+                            )
+                            result_data["error_analysis"] = error_analysis
+                            (node_dir / "error_analysis.json").write_text(
+                                json.dumps(
+                                    error_analysis,
+                                    indent=2,
+                                    default=str,
+                                )
+                                + "\n",
+                                encoding="utf-8",
+                            )
                             result_data["score"] = score
                             result_data["metric"] = metric_name
                             result_data["direction"] = metric_direction
@@ -1998,11 +2587,23 @@ Code:
             "stderr": stderr,
             "diagnostics": diagnostics,
             "code_path": str(dest_code_file),
-            "base_code_path": str(src_algo),
+            "base_code_path": (
+                str(base_algorithm_path)
+                if base_algorithm_path is not None
+                else None
+            ),
             "parent_node_dir": str(parent_node_dir) if parent_node_dir else None,
             "inherited_files": inherited_files,
             "operator": operator,
             "fidelity": fidelity,
+            "evaluation_mode": evaluation_mode,
+            "evaluation_policy": evaluation_policy.to_dict(),
+            "error_analysis": result_data.get("error_analysis"),
+            "error_analysis_path": (
+                str(node_dir / "error_analysis.json")
+                if (node_dir / "error_analysis.json").is_file()
+                else None
+            ),
             "accelerator": actual_accelerator,
             "selected_accelerator": accelerator,
             "tuning": tuning_summary,
@@ -2010,10 +2611,13 @@ Code:
             "implementation_families": sorted(
                 self._model_family_imports(clean_code)
             ),
+            "code_fingerprint": code_fingerprint,
             "elapsed_seconds": time.monotonic() - run_started,
             "validation": {
                 key: result_data.get(key)
                 for key in (
+                    "score", "score_std", "evaluation_mode",
+                    "validation_score", "validation_row_count",
                     "cv_mean", "cv_std", "folds", "fold_scores", "seed",
                     "fidelity", "row_count", "source_row_count",
                     "fold_assignment_sha256",
@@ -2023,6 +2627,11 @@ Code:
             "oof_path": (
                 str(node_dir / "oof_predictions.csv")
                 if (node_dir / "oof_predictions.csv").is_file()
+                else None
+            ),
+            "validation_path": (
+                str(node_dir / "validation_predictions.csv")
+                if (node_dir / "validation_predictions.csv").is_file()
                 else None
             ),
             **contract_artifacts,

@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 
 from agents.task_analyzer import TaskAnalyzer
+from agents.modality_scaffold import build_runtime_data_contract
 from agents.validation_guard import inspect_generated_code
 from core.runtime_contracts import FidelityProfile
 from evaluation.prediction_io import (
@@ -17,6 +18,10 @@ from evaluation.prediction_io import (
 )
 from evaluation.runner import evaluate_prediction_bundle
 from evaluation.splitters import create_split_plan
+from memory_pool.builder.verification_runtime import (
+    _build_arguments,
+    _build_fixture,
+)
 from modalities import build_default_registry
 from runtime_utils import expose_task_data, task_data_files
 
@@ -55,6 +60,104 @@ def _base_config(modality: str, input_config: dict) -> dict:
 
 
 class MediaAdapterTests(unittest.TestCase):
+    def test_runtime_contract_exposes_flattened_components_and_numpy_arrays(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            index_path = Path(temp_dir) / "dataset_index.jsonl"
+            records = [
+                {
+                    "sample_id": "train-1",
+                    "split": "train",
+                    "inputs": {
+                        "image": "input/images/1.png",
+                        "metadata": {"width": 3.0, "color": "green"},
+                    },
+                    "target": "oak",
+                },
+                {
+                    "sample_id": "test-1",
+                    "split": "test",
+                    "inputs": {
+                        "image": "input/images/2.png",
+                        "metadata": {"width": 4.0, "color": "red"},
+                    },
+                },
+            ]
+            index_path.write_text(
+                "\n".join(json.dumps(record) for record in records) + "\n"
+            )
+
+            contract = build_runtime_data_contract(index_path)
+
+            self.assertEqual(contract["feature_container"], "pandas.DataFrame")
+            self.assertEqual(
+                contract["components"]["metadata"]["column_prefix"],
+                "metadata__",
+            )
+            self.assertEqual(
+                contract["components"]["image"]["columns"], ["image"]
+            )
+            self.assertEqual(
+                contract["array_variables"]["row_ids"], "numpy.ndarray"
+            )
+
+    def test_validation_guard_rejects_runtime_container_mismatches(self):
+        runtime_contract = {
+            "components": {
+                "metadata": {
+                    "storage": "flattened_columns",
+                    "column_prefix": "metadata__",
+                }
+            },
+            "array_variables": {
+                "y_eval": "numpy.ndarray",
+                "row_ids": "numpy.ndarray",
+            },
+        }
+        issues = inspect_generated_code(
+            """
+y_train = y_eval[mask]
+selected_y = y_train.iloc[rows]
+selected_ids = row_ids.iloc[rows]
+metadata = X_train["metadata"]
+""",
+            runtime_contract=runtime_contract,
+        )
+        self.assertEqual(len(issues), 3)
+        self.assertTrue(any("NumPy array" in issue for issue in issues))
+        self.assertTrue(any("metadata__" in issue for issue in issues))
+
+    def test_multimodal_verifier_resolves_bare_and_component_path_roles(self):
+        def entrypoint(train_csv_path, test_csv_path, image_dir):
+            return train_csv_path, test_csv_path, image_dir
+
+        contract = {
+            "container": "paths",
+            "parameter_roles": {
+                "train_csv_path": "train",
+                "test_csv_path": "test",
+                "image_dir": "train.image",
+            },
+        }
+        capabilities = {"input_types": ["image", "tabular"]}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fixture = _build_fixture(
+                "multimodal",
+                contract,
+                capabilities,
+                [],
+                Path(temp_dir),
+                legacy_contract=False,
+            )
+            kwargs, roles = _build_arguments(
+                entrypoint, fixture, contract
+            )
+
+            self.assertTrue(Path(kwargs["train_csv_path"]).is_file())
+            self.assertEqual(Path(kwargs["train_csv_path"]).suffix, ".csv")
+            self.assertTrue(Path(kwargs["test_csv_path"]).is_file())
+            self.assertTrue(Path(kwargs["image_dir"]).is_dir())
+            self.assertEqual(roles["image_dir"], "train.image")
+
     def test_image_audio_and_video_adapters_build_lazy_indices(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

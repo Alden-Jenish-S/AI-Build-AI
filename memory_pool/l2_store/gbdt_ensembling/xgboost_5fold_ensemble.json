@@ -9,7 +9,7 @@
   },
   "description": "5-fold XGBoost trained on tabular features, returns OOF and test predictions.",
   "interface": {
-    "entrypoint": "fit_predict(X_train, y_train, X_test, cat_features=None, n_folds=5, is_classification=True, device=None, xgboost_params=None) -> (oof_preds, test_preds, model_list)",
+    "entrypoint": "fit_predict(X_train, y_train, X_test, cat_features=None, n_folds=5, is_classification=True, device=None, xgboost_params=None, fold_ids=None) -> (oof_preds, test_preds, model_list)",
     "input_shapes": "X_train: pd.DataFrame, y_train: np.ndarray, X_test: pd.DataFrame",
     "output_shapes": "oof_preds: np.ndarray, test_preds: np.ndarray, model_list: list",
     "output_contract": {
@@ -36,7 +36,9 @@
     "supported_accelerators": [
       "cpu",
       "cuda"
-    ]
+    ],
+    "accepts_harness_fold_ids": true,
+    "refits_full_training_data": true
   },
   "code_path": "xgboost_5fold_ensemble.py",
   "dependencies": [

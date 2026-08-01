@@ -10,7 +10,7 @@ import pandas as pd
 
 from core.runtime_contracts import DatasetBundle, PredictionBundle, SplitPlan
 from .fidelity import get_fidelity_profile
-from .metrics import metric_value
+from .metrics import metric_value, resolve_metric_name
 from .prediction_io import load_prediction_bundle
 from .splitters import create_split_plan
 
@@ -70,11 +70,17 @@ def evaluate_prediction_bundle(
     )
     if targets is None:
         raise ValueError("supervised evaluation requires target payloads")
+    resolved_metric = resolve_metric_name(
+        metric_name,
+        problem_type=bundle.metadata.get("problem_type"),
+        output_type=bundle.output_type,
+    )
     fold_scores = [
         metric_value(
-            metric_name,
+            resolved_metric,
             targets[fold_ids == fold],
             predictions[fold_ids == fold],
+            class_names=bundle.class_names,
         )
         for fold in sorted(np.unique(fold_ids))
     ]
@@ -87,4 +93,5 @@ def evaluate_prediction_bundle(
         "split_fingerprint": bundle.split_fingerprint,
         "compatibility_key": bundle.compatibility_key,
         "output_type": bundle.output_type,
+        "metric": resolved_metric,
     }

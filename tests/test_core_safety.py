@@ -14,7 +14,6 @@ import pandas as pd
 from agents.aggregator_agent import AggregatorAgent
 from agents.data_analyzer import run_dataset_analysis
 from agents.implementation_agent import ImplementationAgent
-from agents.initial_agent import InitialAgent
 from agents.llm_utils import (
     _resolve_llm_config,
     call_llm,
@@ -23,17 +22,17 @@ from agents.llm_utils import (
 )
 from agents.manager_agent import ManagerAgent
 from agents.setup_agent import SetupAgent, _validate_requirement
+from agents.task_analyzer import TaskAnalyzer
 from agents.technique_agent import TechniqueAgent
 from agents.validation_guard import inspect_generated_code
-from eval.run_ablation import (
-    _prepare_run_input,
-    _run_baseline,
-    _write_token_usage_report,
+from agents.modality_scaffold import (
+    task_loader_source,
+    write_runtime_data_contract,
 )
+from eval.run_search import _write_results, _write_token_usage_report
 from memory_pool.query_tool import infer_artifact_scope, query_l1, query_l2
 from memory_pool.builder.l2_builder import L2Builder
 from runtime_utils import (
-    SupervisedProcessResult,
     absolute_path_without_symlink_resolution,
     accelerator_subprocess_env,
     detect_available_accelerators,
@@ -52,7 +51,19 @@ from evaluation_contract import (
     prepare_evaluation_data,
     validate_evaluation_outputs,
 )
-from eval.metrics import calculate_ablation_metrics
+
+
+def _write_minimal_tabular_task(task_dir: Path) -> None:
+    pd.DataFrame(
+        {
+            "id": range(12),
+            "feature": range(12),
+            "target": [0, 1] * 6,
+        }
+    ).to_csv(task_dir / "train.csv", index=False)
+    pd.DataFrame(
+        {"id": range(12, 16), "feature": range(12, 16)}
+    ).to_csv(task_dir / "test.csv", index=False)
 
 
 class RuntimeSafetyTests(unittest.TestCase):
@@ -161,6 +172,7 @@ class RuntimeSafetyTests(unittest.TestCase):
         )
         self.assertNotIn("API_KEY", env)
         self.assertEqual(env["AIBUILDAI_ACCELERATOR"], "cuda")
+        self.assertEqual(env["AIBUILDAI_ACTUAL_ACCELERATOR"], "cpu")
         self.assertEqual(env["AIBUILDAI_PREFER_GPU"], "1")
         self.assertEqual(env["AIBUILDAI_CUDA_DEVICES"], "0")
 
@@ -411,7 +423,7 @@ class RuntimeSafetyTests(unittest.TestCase):
             ):
                 agent._verify_dependency_imports({"scikit-learn==1.7.2"})
 
-    def test_titan_xp_torch_import_check_requires_sm_61(self):
+    def test_torch_import_check_does_not_hardcode_host_gpu_architecture(self):
         agent = SetupAgent.__new__(SetupAgent)
         agent.venv_python = sys.executable
         agent.log_file = None
@@ -424,9 +436,8 @@ class RuntimeSafetyTests(unittest.TestCase):
             agent._verify_dependency_imports({"torch==2.8.0+cu126"})
 
         verification_code = run.call_args.args[0][2]
-        self.assertIn("torch._C._cuda_getArchFlags()", verification_code)
         self.assertIn("torch.version.cuda == '12.6'", verification_code)
-        self.assertIn("'sm_61' in arches", verification_code)
+        self.assertNotIn("sm_61", verification_code)
 
     def test_docker_installs_dependencies_from_requirements(self):
         dockerfile = (Path(__file__).parents[1] / "Dockerfile").read_text()
@@ -645,6 +656,68 @@ def run(X_train, X_test):
             self.assertEqual(
                 verified_card["verification_level"],
                 "mixed-missing-contract-mock-data",
+            )
+
+    def test_verifier_materializes_singular_tabular_path_roles(self):
+        verifier = (
+            Path(__file__).resolve().parents[1]
+            / "memory_pool"
+            / "builder"
+            / "sandbox_verifier.py"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            artifact_dir = Path(temp_dir)
+            (artifact_dir / "path_model.py").write_text(
+                "import pandas as pd\n"
+                "def run(train_path, test_path, target_column):\n"
+                "    train = pd.read_csv(train_path)\n"
+                "    test = pd.read_csv(test_path)\n"
+                "    assert target_column in train.columns\n"
+                "    assert target_column not in test.columns\n"
+                "    return test['num1'].to_numpy()\n"
+            )
+            card_file = artifact_dir / "path_model.json"
+            card_file.write_text(
+                json.dumps(
+                    {
+                        "artifact_id": "path_model",
+                        "category": "tabular_regression",
+                        "interface": {
+                            "entrypoint": (
+                                "run(train_path, test_path, target_column)"
+                            ),
+                            "input_contract": {
+                                "modality": "tabular",
+                                "container": "paths",
+                                "parameter_roles": {
+                                    "train_path": "train",
+                                    "test_path": "test",
+                                    "target_column": "target_column",
+                                },
+                            },
+                            "output_contract": {
+                                "kind": "predictions",
+                                "aligned_to": "test",
+                                "value_type": "continuous",
+                            },
+                        },
+                        "capabilities": {
+                            "target_types": ["regression"]
+                        },
+                        "dependencies": ["pandas"],
+                        "code_path": "path_model.py",
+                    }
+                )
+            )
+            result = subprocess.run(
+                [sys.executable, str(verifier), str(card_file)],
+                cwd=artifact_dir,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(
+                result.returncode, 0, result.stdout + result.stderr
             )
 
     def test_verifier_allows_standard_devnull_at_module_import(self):
@@ -901,17 +974,6 @@ def run(X_train, X_test):
             self.assertEqual(validation["row_count"], 100)
             self.assertEqual(len(validation["fold_scores"]), 5)
 
-    def test_skipped_implementations_do_not_distort_ablation_denominators(self):
-        metrics = calculate_ablation_metrics(
-            [
-                {"type": "implementation", "status": "completed", "score": 0.8},
-                {"type": "implementation", "status": "failed", "score": None},
-                {"type": "implementation", "status": "skipped_infeasible", "score": None},
-            ],
-            baseline_score=0.7,
-        )
-        self.assertEqual(metrics["overcome_rate"], 0.5)
-
     def test_run_input_excludes_previous_submission(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -920,7 +982,7 @@ def run(X_train, X_test):
             task_dir.mkdir()
             (task_dir / "train.csv").write_text("feature,target\n1,0\n")
             (task_dir / "submission.csv").write_text("id,prediction\n1,1\n")
-            _prepare_run_input(task_dir, run_dir)
+            expose_task_data(task_dir, run_dir)
             self.assertTrue((run_dir / "input" / "train.csv").exists())
             self.assertTrue((run_dir / "input" / "train.csv").is_symlink())
             self.assertEqual(
@@ -963,104 +1025,6 @@ def run(X_train, X_test):
 
             self.assertEqual(
                 discovered, {"train.csv", "sample_submission.csv"}
-            )
-
-    def test_initial_generation_writes_only_to_run_directory(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            task_dir = root / "tasks" / "example"
-            baseline_dir = root / "runs" / "example" / "baseline"
-            task_dir.mkdir(parents=True)
-            (task_dir / "task_description.md").write_text(
-                "Binary classification scored by accuracy."
-            )
-            (task_dir / "train.csv").write_text(
-                "feature,target\n1,0\n2,1\n"
-            )
-            before = {
-                path.name: path.read_bytes()
-                for path in task_dir.iterdir()
-                if path.is_file()
-            }
-            generated_loader = "class MyDataLoader:\n    pass\n"
-            generated_algorithm = "print('baseline')\n"
-
-            with patch(
-                "agents.initial_agent.call_llm",
-                side_effect=[generated_loader, generated_algorithm],
-            ):
-                InitialAgent().generate_initial_code(
-                    task_dir, baseline_dir, temperature=0.0
-                )
-
-            after = {
-                path.name: path.read_bytes()
-                for path in task_dir.iterdir()
-                if path.is_file()
-            }
-            self.assertEqual(after, before)
-            self.assertEqual(
-                (baseline_dir / "initial_dataloader.py").read_text(),
-                generated_loader.strip(),
-            )
-            self.assertEqual(
-                (baseline_dir / "initial_algorithm.py").read_text(),
-                generated_algorithm.strip(),
-            )
-            self.assertTrue(
-                (baseline_dir / "dataset_analysis_report.txt").is_file()
-            )
-
-    def test_initial_generation_rejects_output_inside_task(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            task_dir = Path(temp_dir) / "tasks" / "example"
-            task_dir.mkdir(parents=True)
-            with self.assertRaisesRegex(ValueError, "read-only task directory"):
-                InitialAgent().generate_initial_code(
-                    task_dir, task_dir / "generated"
-                )
-
-    def test_unsupervised_baseline_prompt_uses_discovered_data_role(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            task_dir = root / "tasks" / "clustering"
-            baseline_dir = root / "runs" / "clustering" / "baseline"
-            task_dir.mkdir(parents=True)
-            (task_dir / "task_description.md").write_text(
-                "Completely unsupervised clustering scored by Adjusted Rand Index."
-            )
-            pd.DataFrame(
-                {"id": range(8), "feature": range(8)}
-            ).to_csv(task_dir / "data.csv", index=False)
-            pd.DataFrame(
-                {"Id": range(8), "Predicted": [0] * 8}
-            ).to_csv(task_dir / "sample_submission.csv", index=False)
-            prompts = []
-
-            def fake_llm(system_prompt, user_prompt, **kwargs):
-                prompts.append(system_prompt)
-                return (
-                    "class MyDataLoader:\n    pass\n"
-                    if len(prompts) == 1
-                    else "print('baseline')\n"
-                )
-
-            with patch("agents.initial_agent.call_llm", side_effect=fake_llm):
-                InitialAgent().generate_initial_code(
-                    task_dir,
-                    baseline_dir,
-                    temperature=0.0,
-                    fidelity="screen",
-                )
-
-            self.assertIn("./input/data.csv", prompts[0])
-            self.assertIn("UNSUPERVISED CLUSTERING", prompts[0])
-            self.assertIn("evaluate_clustering_predictions", prompts[1])
-            self.assertIn(
-                "prepare_evaluation_data(train_data, 'screen')", prompts[1]
-            )
-            self.assertNotIn(
-                "prepare_evaluation_data(train_data, 'full')", prompts[1]
             )
 
     def test_active_interpreter_is_default_when_no_venv_is_requested(self):
@@ -1118,118 +1082,60 @@ def run(X_train, X_test):
 
             self.assertFalse((run_dir / "input" / "train.csv").exists())
 
-    def test_token_usage_report_includes_end_to_end_input_and_output_totals(self):
+    def test_token_usage_report_tracks_direct_method_tree(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             report_file = _write_token_usage_report(
                 "example_task",
                 {"input_tokens": 120, "output_tokens": 30},
-                {"input_tokens": 450, "output_tokens": 90},
                 runs_root=Path(temp_dir),
             )
             report = json.loads(report_file.read_text())
             self.assertEqual(
-                report["baseline"],
+                report["method_tree"],
                 {"input_tokens": 120, "output_tokens": 30, "total_tokens": 150},
             )
-            self.assertEqual(
-                report["complete_system"],
-                {"input_tokens": 450, "output_tokens": 90, "total_tokens": 540},
-            )
-            self.assertEqual(
-                report["overall"],
-                {"input_tokens": 570, "output_tokens": 120, "total_tokens": 690},
-            )
 
-    def test_stalled_baseline_invokes_bounded_debugging_then_retries(self):
+    def test_results_distinguish_attempts_from_completed_experiments(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            task_dir = root / "task"
-            baseline_dir = root / "baseline"
-            task_dir.mkdir()
-            (task_dir / "initial_dataloader.py").write_text(
-                "class MyDataLoader:\n    pass\n"
+            root = NodeState("root", None, "technique", executed=True)
+            technique = NodeState(
+                "technique", "root", "technique", executed=True
             )
-            (task_dir / "initial_algorithm.py").write_text("raise RuntimeError('bad')\n")
-
-            class ManagerStub:
-                venv_path = sys.executable
-                progress_stall_seconds = 3
-                metric_direction = "maximize"
-                metric_name = "roc_auc"
-                baseline_fidelity = "screen"
-                model_name = None
-
-            manager = ManagerStub()
-            manager.task_dir = task_dir
-            executions = 0
-
-            def fake_run(*args, **kwargs):
-                nonlocal executions
-                executions += 1
-                stalled = executions == 1
-                returncode = -15 if stalled else 0
-                stderr = "baseline made no observable progress" if stalled else ""
-                if not stalled:
-                    (baseline_dir / "result.json").write_text(
-                        '{"score": 0.75, "direction": "maximize"}'
-                    )
-                    (baseline_dir / "submission").mkdir(exist_ok=True)
-                    (baseline_dir / "submission" / "submission.csv").write_text(
-                        "id,prediction\n1,0.5\n"
-                    )
-                    (baseline_dir / "evaluation_manifest.json").write_text("{}")
-                    (baseline_dir / "oof_predictions.csv").write_text(
-                        "row_id,target,prediction\n1,0,0.1\n"
-                    )
-                return SupervisedProcessResult(
-                    args=tuple(str(item) for item in args[0]),
-                    returncode=returncode,
-                    stdout="",
-                    stderr=stderr,
-                    elapsed_seconds=0.1,
-                    stalled=stalled,
-                    hard_limit_reached=False,
-                    termination_reason=(
-                        "progress_stalled" if stalled else None
-                    ),
-                    progress_events=0 if stalled else 1,
-                    last_progress_source=(
-                        "process_started" if stalled else "process_output"
-                    ),
-                    last_progress_age_seconds=0.0,
-                )
-
-            with (
-                patch(
-                    "eval.run_ablation.run_supervised_process",
-                    side_effect=fake_run,
-                ),
-                patch(
-                    "eval.run_ablation.InitialAgent.repair_initial_algorithm"
-                ) as repair,
-                patch(
-                    "eval.run_ablation.validate_evaluation_outputs",
-                    return_value={"cv_mean": 0.75},
-                ) as validate,
-            ):
-                score = _run_baseline(manager, baseline_dir, max_debug_attempts=1)
-
-            self.assertEqual(score, 0.75)
-            self.assertEqual(executions, 2)
-            repair.assert_called_once()
-            validate.assert_called_once_with(
-                baseline_dir, "screen", "roc_auc"
+            technique.config = {
+                "technique_record": {"status": "pool_hit"}
+            }
+            failed = NodeState(
+                "failed", "technique", "implementation", executed=True
             )
-            self.assertTrue((baseline_dir / "baseline_debug.log").is_file())
-            stalled_report = json.loads(
-                (
-                    baseline_dir / "execution_supervision_attempt_1.json"
-                ).read_text()
+            failed.result = {"score": None, "status": "failed"}
+            manager = SimpleNamespace(
+                run_root=Path(temp_dir),
+                task_name="example",
+                metric_name="rmse",
+                metric_direction="minimize",
+                all_nodes={
+                    "root": root,
+                    "technique": technique,
+                    "failed": failed,
+                },
+                experiments_executed=0,
+                implementation_attempts=3,
             )
-            self.assertTrue(stalled_report["stalled"])
-            self.assertIsNone(
-                stalled_report["total_runtime_limit_seconds"]
+            result_file = _write_results(
+                manager,
+                None,
+                elapsed_seconds=1.0,
+                usage={
+                    "input_tokens": 1,
+                    "output_tokens": 1,
+                    "total_tokens": 2,
+                },
             )
+            report = result_file.read_text()
+            self.assertIn("Completed evaluation experiments: 0", report)
+            self.assertIn("Implementation attempts: 3", report)
+            self.assertIn("Technique nodes resolved: 1", report)
+            self.assertIn("Memory-pool hit rate: 100.0%", report)
 
     def test_continuous_target_is_not_reported_as_rare_classes(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1291,7 +1197,6 @@ def run(X_train, X_test):
             manager.run_root = Path(temp_dir)
             manager.task_name = "example_task"
             manager.metric_direction = "maximize"
-            manager.baseline_score = 0.5
             manager.total_budget = 2
             root = NodeState(
                 "root", None, "technique", plan="Root", executed=True
@@ -1387,7 +1292,7 @@ def run(X_train, X_test):
                                 "status": "completed",
                                 "score": 0.8,
                                 "reward": 0.2,
-                                "improved_over_baseline": True,
+                                "improved_over_reference": True,
                             },
                             {"status": "failed", "score": None},
                         ],
@@ -1398,7 +1303,7 @@ def run(X_train, X_test):
                 summary = query_l1("models")["artifacts"][0]["validation_summary"]
             self.assertEqual(summary["runs"], 2)
             self.assertEqual(summary["failures"], 1)
-            self.assertEqual(summary["improvement_rate"], 1.0)
+            self.assertEqual(summary["completion_rate"], 0.5)
 
     def test_validation_guard_detects_test_fitted_preprocessing(self):
         code = """
@@ -1439,6 +1344,17 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(ManagerAgent._initial_fanout_for_budget(6), 2)
         self.assertEqual(ManagerAgent._initial_fanout_for_budget(60), 3)
 
+    def test_small_search_pre_generates_one_recovery_approach(self):
+        self.assertEqual(
+            ManagerAgent._initial_candidate_count_for_budget(1), 2
+        )
+        self.assertEqual(
+            ManagerAgent._initial_candidate_count_for_budget(2), 2
+        )
+        self.assertEqual(
+            ManagerAgent._initial_candidate_count_for_budget(20), 3
+        )
+
     def test_failed_root_can_promote_a_pre_generated_backup(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             manager = ManagerAgent.__new__(ManagerAgent)
@@ -1468,9 +1384,39 @@ class SchedulerTests(unittest.TestCase):
             self.assertEqual(len(manager._backup_initial_approaches), 1)
             self.assertEqual(manager.scheduler.warmup_budget, 2)
 
+    def test_oof_artifact_must_accept_harness_fold_ids(self):
+        incompatible = {
+            "description": "Returns out-of-fold predictions.",
+            "interface": {
+                "entrypoint": (
+                    "fit_predict(X_train, y_train, X_test, n_folds=5)"
+                ),
+                "output_shapes": "oof_preds, test_preds",
+            },
+            "capabilities": {"supported_operators": ["initial"]},
+        }
+        self.assertIn(
+            "cannot accept harness fold_ids",
+            ManagerAgent._operator_compatibility_reason(
+                incompatible, "root"
+            ),
+        )
+        compatible = {
+            **incompatible,
+            "capabilities": {
+                "supported_operators": ["initial"],
+                "accepts_harness_fold_ids": True,
+                "refits_full_training_data": True,
+            },
+        }
+        self.assertIsNone(
+            ManagerAgent._operator_compatibility_reason(
+                compatible, "root"
+            )
+        )
+
     def test_cv_uncertainty_reduces_scheduling_reward(self):
         manager = ManagerAgent.__new__(ManagerAgent)
-        manager.baseline_score = 0.95
         manager.metric_direction = "maximize"
         manager.uncertainty_weight = 1.0
         certain = manager._score_to_reward(0.954, cv_std=0.0)
@@ -1578,7 +1524,7 @@ class SchedulerTests(unittest.TestCase):
             "validation_summary": {
                 "runs": 5,
                 "mean_reward": 0.5,
-                "improvement_rate": 1.0,
+                "completion_rate": 1.0,
             },
         }
         untested = {
@@ -1587,7 +1533,7 @@ class SchedulerTests(unittest.TestCase):
             "validation_summary": {
                 "runs": 0,
                 "mean_reward": None,
-                "improvement_rate": None,
+                "completion_rate": None,
             },
         }
         self.assertGreater(
@@ -1656,10 +1602,66 @@ class SchedulerTests(unittest.TestCase):
                 l1_index,
                 allowed_scopes={"model_family"},
                 excluded_artifact_ids={"catboost_10fold_ensemble"},
+                enable_executable_artifacts=True,
             )
 
         self.assertEqual(result, fallback)
         bootstrap.assert_called_once()
+
+    def test_default_technique_run_is_strategy_only(self):
+        agent = TechniqueAgent()
+        with patch("agents.technique_agent.query") as query_pool, patch(
+            "agents.technique_agent.call_llm"
+        ) as llm, patch("agents.technique_agent.search_web") as web:
+            result = agent.run(
+                "tabular regression",
+                "robust categorical representation with a strong baseline",
+                {},
+                {"gbdt_ensembling": {"description": "trees"}},
+                task_spec={
+                    "modality": "tabular",
+                    "problem_type": "regression",
+                    "output": {"type": "continuous"},
+                },
+            )
+        self.assertEqual(result["status"], "strategy_only")
+        self.assertEqual(result["artifact_execution"], "disabled")
+        self.assertNotIn("model_card", result)
+        query_pool.assert_not_called()
+        llm.assert_not_called()
+        web.assert_not_called()
+
+    def test_initial_branches_are_pipeline_hypotheses_not_model_names(self):
+        prompts = []
+
+        def fake_llm(system_prompt, user_prompt, **_kwargs):
+            prompts.append((system_prompt, user_prompt))
+            return json.dumps(
+                [
+                    {
+                        "name": "robust_representation",
+                        "plan": (
+                            "Test rare-category grouping, frequency encoding, "
+                            "and missingness interactions with a regularized "
+                            "tree control."
+                        ),
+                    }
+                ]
+            )
+
+        with patch(
+            "agents.technique_agent.call_llm", side_effect=fake_llm
+        ):
+            approaches = TechniqueAgent().generate_initial_approaches(
+                "tabular regression", count=1
+            )
+        self.assertEqual(len(approaches), 1)
+        self.assertIn("PIPELINE-HYPOTHESIS", prompts[0][0])
+        self.assertIn("representation", prompts[0][0])
+        self.assertNotIn(
+            "MUST use a completely distinct primary model family",
+            prompts[0][0],
+        )
 
     def test_follow_up_slots_are_created_without_eager_llm_generation(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1667,7 +1669,6 @@ class SchedulerTests(unittest.TestCase):
             manager.run_root = Path(temp_dir)
             manager.task_name = "example"
             manager.metric_direction = "maximize"
-            manager.baseline_score = 0.5
             manager.total_budget = 6
             manager.experiments_executed = 1
             manager.initial_fanout = 2
@@ -1698,8 +1699,20 @@ class SchedulerTests(unittest.TestCase):
                     }
                 },
             )
-            root.children_ids = ["node_1"]
-            manager.all_nodes = {"root": root, "node_1": parent}
+            reference = NodeState(
+                "reference",
+                "root",
+                "implementation",
+                result={"score": 0.5, "status": "completed"},
+                executed=True,
+                fidelity="screen",
+            )
+            root.children_ids = ["reference", "node_1"]
+            manager.all_nodes = {
+                "root": root,
+                "reference": reference,
+                "node_1": parent,
+            }
 
             with patch.object(
                 manager.technique_agent, "generate_follow_up_approaches"
@@ -1751,7 +1764,7 @@ class SchedulerTests(unittest.TestCase):
             ("maximize", 0.5, 0.70, 0.0, 2, None, False),
             ("maximize", 0.5, 0.70, 0.0, 0, [], False),
         )
-        for direction, baseline, score, cv_std, depth, tunables, expected in cases:
+        for direction, reference_score, score, cv_std, depth, tunables, expected in cases:
             with self.subTest(
                 direction=direction,
                 score=score,
@@ -1763,7 +1776,6 @@ class SchedulerTests(unittest.TestCase):
                 manager.run_root = Path(temp_dir)
                 manager.task_name = "example"
                 manager.metric_direction = direction
-                manager.baseline_score = baseline
                 manager.uncertainty_weight = 1.0
                 manager.total_budget = 6
                 manager.experiments_executed = 1
@@ -1797,8 +1809,23 @@ class SchedulerTests(unittest.TestCase):
                     fidelity="screen",
                     config=parent_config,
                 )
-                root.children_ids = ["node_1"]
-                manager.all_nodes = {"root": root, "node_1": parent}
+                reference = NodeState(
+                    "reference",
+                    "root",
+                    "implementation",
+                    result={
+                        "score": reference_score,
+                        "status": "completed",
+                    },
+                    executed=True,
+                    fidelity="screen",
+                )
+                root.children_ids = ["reference", "node_1"]
+                manager.all_nodes = {
+                    "root": root,
+                    "reference": reference,
+                    "node_1": parent,
+                }
                 manager._spawn_follow_up_nodes(parent, "node_1")
                 has_tune = any(
                     manager.all_nodes[node_id].operator == "tune"
@@ -1924,12 +1951,9 @@ class SchedulerTests(unittest.TestCase):
             parent_dir = manager.run_root / "parent"
             child_dir = manager.run_root / "child"
             for directory in (parent_dir, child_dir):
-                (directory / "submission").mkdir(parents=True)
+                directory.mkdir(parents=True)
                 (directory / "oof_predictions.csv").write_text(
                     "row_id,target,prediction\n1,0,0.2\n"
-                )
-                (directory / "submission" / "submission.csv").write_text(
-                    "id,target\n1,0.2\n"
                 )
             node = NodeState(
                 "child",
@@ -1940,6 +1964,20 @@ class SchedulerTests(unittest.TestCase):
             self.assertIn(
                 "byte-identical", manager._no_effect_reason(node, child_dir)
             )
+
+    def test_validation_guard_rejects_secondary_fidelity_sampling(self):
+        code = """
+import numpy as np
+from evaluation_contract import prepare_evaluation_data
+X_eval, y_eval, row_ids, fold_ids, meta = prepare_evaluation_data(train_data, 'screen')
+train_indices_full = np.where(fold_ids != 0)[0]
+submask = np.random.rand(len(train_indices_full)) < 0.25
+train_indices = train_indices_full[submask]
+"""
+        issues = inspect_generated_code(code)
+        self.assertTrue(
+            any("secondary random sample mask" in issue for issue in issues)
+        )
 
     def test_exhausted_tree_returns_none_instead_of_reexecuting_root(self):
         root = NodeState("root", None, "technique", executed=True)
@@ -2134,6 +2172,35 @@ class AggregatorTests(unittest.TestCase):
 
 
 class ImplementationExecutionTests(unittest.TestCase):
+    def test_guard_rejects_reversed_metric_call_and_manifest_write(self):
+        issues = inspect_generated_code(
+            """
+score = metric_value(y_true, y_pred, metric_name='rmse')
+manifest_path = 'final_training_manifest.json'
+with open(manifest_path, 'w') as stream:
+    json.dump({'rows': 10}, stream)
+"""
+        )
+        self.assertTrue(
+            any("metric_value uses the canonical signature" in issue for issue in issues)
+        )
+        self.assertTrue(
+            any("harness-owned contract artifact" in issue for issue in issues)
+        )
+
+    def test_missing_generated_import_is_rejected_before_execution(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            agent = ImplementationAgent.__new__(ImplementationAgent)
+            agent.venv_python = sys.executable
+            issues = agent._unavailable_import_issues(
+                "import aibuildai_package_that_does_not_exist\n",
+                Path(temp_dir),
+            )
+            self.assertTrue(issues)
+            self.assertIn(
+                "aibuildai_package_that_does_not_exist", issues[0]
+            )
+
     def test_dependency_fallback_cannot_silently_import_failed_model(self):
         record = {
             "status": "dependency_fallback",
@@ -2151,6 +2218,33 @@ except Exception:
         issues = ImplementationAgent._dependency_fallback_issues(code, record)
         self.assertTrue(issues)
         self.assertIn("pytorch_tabnet", issues[0])
+
+    def test_cv_artifact_call_must_receive_harness_fold_ids(self):
+        card = {
+            "interface": {
+                "entrypoint": "fit_predict(X, y, test, fold_ids=None)"
+            },
+            "capabilities": {"accepts_harness_fold_ids": True},
+        }
+        issues = ImplementationAgent._artifact_evaluation_contract_issues(
+            "oof, test, models = fit_predict(X_eval, y_eval, X_test)",
+            card,
+        )
+        self.assertTrue(issues)
+        self.assertFalse(
+            ImplementationAgent._artifact_evaluation_contract_issues(
+                "oof, test, models = fit_predict("
+                "X_eval, y_eval, X_test, fold_ids=fold_ids)",
+                card,
+            )
+        )
+        self.assertFalse(
+            ImplementationAgent._artifact_evaluation_contract_issues(
+                "prediction = fit_predict(X_train, y_train, X_valid)",
+                card,
+                "holdout",
+            )
+        )
 
     def test_unverified_parent_artifact_is_not_inherited(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2193,7 +2287,16 @@ except Exception:
             task_dir = root / "task"
             node_dir = root / "node"
             task_dir.mkdir()
-            (task_dir / "initial_algorithm.py").write_text("print('baseline')\n")
+            pd.DataFrame(
+                {
+                    "id": range(12),
+                    "feature": range(12),
+                    "target": [value / 3 for value in range(12)],
+                }
+            ).to_csv(task_dir / "train.csv", index=False)
+            pd.DataFrame(
+                {"id": range(12, 16), "feature": range(12, 16)}
+            ).to_csv(task_dir / "test.csv", index=False)
             (task_dir / "task_description.md").write_text(
                 "Submissions are scored on the root mean squared error.\n"
             )
@@ -2208,7 +2311,7 @@ json.dump({'score': 0.7, 'metric': 'rmse', 'direction': 'minimize',
             prompts = []
 
             def fake_llm(system, user, **kwargs):
-                prompts.append(system)
+                prompts.append((system, user))
                 return generated
 
             agent = ImplementationAgent(venv_python_path=sys.executable)
@@ -2224,7 +2327,216 @@ json.dump({'score': 0.7, 'metric': 'rmse', 'direction': 'minimize',
             self.assertEqual(result["status"], "completed")
             result_json = json.loads((node_dir / "result.json").read_text())
             self.assertEqual(result_json["metric"], "rmse")
-            self.assertIn('"metric": "rmse"', prompts[0])
+            self.assertIn('"metric": "rmse"', prompts[0][0])
+            self.assertIn(
+                "This is a root method; build the complete pipeline directly",
+                prompts[0][1],
+            )
+            self.assertTrue((node_dir / "task_dataloader.py").is_file())
+            self.assertIsNone(result["base_code_path"])
+
+    def test_enforced_execution_generates_valid_full_refit_submission(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            task_dir = root / "task"
+            node_dir = root / "node"
+            task_dir.mkdir()
+            _write_minimal_tabular_task(task_dir)
+            pd.DataFrame(
+                {
+                    "id": range(12, 16),
+                    "prediction": [0.5] * 4,
+                }
+            ).to_csv(task_dir / "sample_submission.csv", index=False)
+            task_assets_dir = root / "task_assets"
+            TaskAnalyzer().analyze(
+                task_dir,
+                output_dir=task_assets_dir,
+                include_index=True,
+            )
+            (task_assets_dir / "task_dataloader.py").write_text(
+                task_loader_source()
+            )
+            write_runtime_data_contract(
+                task_assets_dir / "dataset_index.jsonl",
+                task_assets_dir / "runtime_data_contract.json",
+                task_spec_path=(
+                    task_assets_dir / "resolved_task_spec.json"
+                ),
+                task_dir=task_dir,
+            )
+            generated = """
+import json
+from pathlib import Path
+import pandas as pd
+from task_dataloader import TaskDataLoader
+from evaluation_contract import prepare_evaluation_data, prepare_final_training_data
+
+train_data, test_data = TaskDataLoader()()
+X_eval, y_eval, row_ids, fold_ids, meta = prepare_evaluation_data(train_data, 'screen')
+pd.DataFrame({
+    'row_id': row_ids,
+    'target': y_eval,
+    'prediction': y_eval,
+    'fold_id': fold_ids,
+}).to_csv('oof_predictions.csv', index=False)
+X_full, y_full, X_test, test_ids = prepare_final_training_data(train_data, test_data)
+Path('submission').mkdir(exist_ok=True)
+pd.DataFrame({
+    'id': test_ids,
+    'prediction': [0.5] * len(test_ids),
+}).to_csv('submission/submission.csv', index=False)
+json.dump({
+    'score': 1.0,
+    'metric': 'accuracy',
+    'direction': 'maximize',
+    'fidelity': 'screen',
+    'accelerator': 'cpu',
+}, open('result.json', 'w'))
+"""
+            agent = ImplementationAgent(venv_python_path=sys.executable)
+            with patch(
+                "agents.implementation_agent.call_llm",
+                return_value=generated,
+            ):
+                result = agent.run(
+                    node_dir,
+                    {},
+                    task_dir,
+                    timeout=5,
+                    fidelity="screen",
+                    enforce_evaluation_contract=True,
+                    evaluation_mode="cross_validation",
+                    max_debug_attempts=0,
+                    task_assets_dir=task_assets_dir,
+                )
+            self.assertEqual(result["status"], "completed")
+            self.assertTrue(
+                (node_dir / "final_training_manifest.json").is_file()
+            )
+            submission = pd.read_csv(
+                node_dir / "submission" / "submission.csv"
+            )
+            self.assertEqual(submission["id"].tolist(), list(range(12, 16)))
+            self.assertFalse((node_dir / "dataset_index.jsonl").exists())
+
+    def test_neural_execution_uses_holdout_without_oof(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            task_dir = root / "task"
+            node_dir = root / "node"
+            task_dir.mkdir()
+            _write_minimal_tabular_task(task_dir)
+            pd.DataFrame(
+                {
+                    "id": range(12, 16),
+                    "prediction": [0.5] * 4,
+                }
+            ).to_csv(task_dir / "sample_submission.csv", index=False)
+            task_assets_dir = root / "task_assets"
+            TaskAnalyzer().analyze(
+                task_dir,
+                output_dir=task_assets_dir,
+                include_index=True,
+            )
+            (task_assets_dir / "task_dataloader.py").write_text(
+                task_loader_source()
+            )
+            write_runtime_data_contract(
+                task_assets_dir / "dataset_index.jsonl",
+                task_assets_dir / "runtime_data_contract.json",
+                task_spec_path=(
+                    task_assets_dir / "resolved_task_spec.json"
+                ),
+                task_dir=task_dir,
+            )
+            self.assertFalse(
+                (task_assets_dir / "dataset_index.jsonl").exists()
+            )
+            generated = """
+import json
+from pathlib import Path
+import pandas as pd
+from task_dataloader import TaskDataLoader
+from evaluation_contract import prepare_holdout_evaluation_data, prepare_final_training_data
+
+train_data, test_data = TaskDataLoader()()
+X_train, y_train, X_valid, y_valid, validation_ids, meta = prepare_holdout_evaluation_data(train_data, 'screen')
+assert list(X_train.columns) == ['feature'], list(X_train.columns)
+pd.DataFrame({
+    'row_id': validation_ids,
+    'target': y_valid,
+    'prediction': y_valid,
+}).to_csv('validation_predictions.csv', index=False)
+X_full, y_full, X_test, test_ids = prepare_final_training_data(train_data, test_data)
+Path('submission').mkdir(exist_ok=True)
+pd.DataFrame({
+    'id': test_ids,
+    'prediction': [0.5] * len(test_ids),
+}).to_csv('submission/submission.csv', index=False)
+json.dump({
+    'score': 1.0,
+    'metric': 'accuracy',
+    'direction': 'maximize',
+    'evaluation_mode': 'holdout',
+    'fidelity': 'screen',
+    'accelerator': 'cpu',
+}, open('result.json', 'w'))
+"""
+            agent = ImplementationAgent(venv_python_path=sys.executable)
+            with patch(
+                "agents.implementation_agent.call_llm",
+                return_value=generated,
+            ):
+                result = agent.run(
+                    node_dir,
+                    {"plan": "Train a PyTorch neural transformer."},
+                    task_dir,
+                    timeout=5,
+                    fidelity="screen",
+                    enforce_evaluation_contract=True,
+                    max_debug_attempts=0,
+                    task_assets_dir=task_assets_dir,
+                )
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(result["evaluation_mode"], "holdout")
+            self.assertIsNone(result["oof_path"])
+            self.assertIsNotNone(result["validation_path"])
+            self.assertFalse(
+                (node_dir / "oof_predictions.csv").exists()
+            )
+            self.assertFalse((node_dir / "evaluation_contract.py").exists())
+            self.assertFalse((node_dir / "evaluation").exists())
+            self.assertFalse((node_dir / "core").exists())
+            self.assertTrue((node_dir / "error_analysis.json").is_file())
+            policy = json.loads(
+                (node_dir / "evaluation_policy.json").read_text()
+            )
+            self.assertEqual(policy["mode"], "holdout")
+
+            duplicate_dir = root / "duplicate_node"
+            with patch(
+                "agents.implementation_agent.call_llm",
+                return_value=generated,
+            ):
+                duplicate = agent.run(
+                    duplicate_dir,
+                    {"plan": "Train a PyTorch neural transformer."},
+                    task_dir,
+                    timeout=5,
+                    fidelity="screen",
+                    enforce_evaluation_contract=True,
+                    max_debug_attempts=0,
+                    task_assets_dir=task_assets_dir,
+                )
+            self.assertEqual(
+                duplicate["status"],
+                "skipped_duplicate_pre_execution",
+            )
+            self.assertEqual(duplicate["duplicate_of"], node_dir.name)
+            self.assertFalse(
+                (duplicate_dir / "validation_predictions.csv").exists()
+            )
 
     def test_descendant_uses_parent_code_and_inherits_support_files(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2234,8 +2546,6 @@ json.dump({'score': 0.7, 'metric': 'rmse', 'direction': 'minimize',
             node_dir = root / "child"
             task_dir.mkdir()
             parent_dir.mkdir()
-            (task_dir / "initial_algorithm.py").write_text("BASELINE_MARKER = True\n")
-            (task_dir / "initial_dataloader.py").write_text("LOADER_MARKER = True\n")
             (task_dir / "train.csv").write_text("feature,target\n1,0\n")
             parent_code = parent_dir / "algorithm.py"
             parent_code.write_text("PARENT_MARKER = True\n")
@@ -2268,9 +2578,8 @@ json.dump({'score': 0.7, 'direction': 'maximize', 'fidelity': 'medium'}, open('r
                 )
             self.assertEqual(result["status"], "completed")
             self.assertIn("PARENT_MARKER", prompts[0])
-            self.assertNotIn("BASELINE_MARKER", prompts[0])
             self.assertTrue((node_dir / "support.json").is_file())
-            self.assertTrue((node_dir / "initial_dataloader.py").is_file())
+            self.assertTrue((node_dir / "task_dataloader.py").is_file())
             self.assertTrue((node_dir / "input" / "train.csv").is_symlink())
             self.assertEqual(
                 (node_dir / "input" / "train.csv").resolve(),
@@ -2285,7 +2594,7 @@ json.dump({'score': 0.7, 'direction': 'maximize', 'fidelity': 'medium'}, open('r
             node_dir = root / "node"
             task_dir.mkdir()
             node_dir.mkdir()
-            (task_dir / "initial_algorithm.py").write_text("print('baseline')\n")
+            _write_minimal_tabular_task(task_dir)
             (node_dir / "result.json").write_text('{"score": 0.99}')
             agent = ImplementationAgent(venv_python_path=sys.executable)
             failing_code = "raise SystemExit(1)"
@@ -2300,7 +2609,7 @@ json.dump({'score': 0.7, 'direction': 'maximize', 'fidelity': 'medium'}, open('r
             task_dir = root / "task"
             node_dir = root / "node"
             task_dir.mkdir()
-            (task_dir / "initial_algorithm.py").write_text("print('baseline')\n")
+            _write_minimal_tabular_task(task_dir)
             agent = ImplementationAgent(venv_python_path=sys.executable)
             sleeping_code = "import time\ntime.sleep(10)"
             started = time.monotonic()
@@ -2317,7 +2626,7 @@ json.dump({'score': 0.7, 'direction': 'maximize', 'fidelity': 'medium'}, open('r
             task_dir = root / "task"
             node_dir = root / "node"
             task_dir.mkdir()
-            (task_dir / "initial_algorithm.py").write_text("print('baseline')\n")
+            _write_minimal_tabular_task(task_dir)
             completed_code = """
 import json
 import time
@@ -2356,7 +2665,7 @@ json.dump({'score': 0.71, 'direction': 'maximize', 'fidelity': 'full'}, open('re
             task_dir = root / "task"
             node_dir = root / "node"
             task_dir.mkdir()
-            (task_dir / "initial_algorithm.py").write_text("print('baseline')\n")
+            _write_minimal_tabular_task(task_dir)
             sleeping_code = "import time\ntime.sleep(10)"
             repaired_code = """
 import json
@@ -2388,7 +2697,7 @@ json.dump({'score': 0.71, 'direction': 'maximize', 'fidelity': 'full'}, open('re
             task_dir = root / "task"
             node_dir = root / "node"
             task_dir.mkdir()
-            (task_dir / "initial_algorithm.py").write_text("print('baseline')\n")
+            _write_minimal_tabular_task(task_dir)
             stalled_code = "import time\ntime.sleep(10)"
             repaired_code = """
 import json
@@ -2421,7 +2730,7 @@ json.dump({'score': 0.73, 'direction': 'maximize', 'fidelity': 'full'}, open('re
             task_dir = root / "task"
             node_dir = root / "node"
             task_dir.mkdir()
-            (task_dir / "initial_algorithm.py").write_text("print('baseline')\n")
+            _write_minimal_tabular_task(task_dir)
             invalid_tune = """
 import json
 from pathlib import Path
@@ -2453,7 +2762,7 @@ json.dump({'score': 0.91, 'direction': 'maximize', 'fidelity': 'full'}, open('re
             task_dir = root / "task"
             node_dir = root / "node"
             task_dir.mkdir()
-            (task_dir / "initial_algorithm.py").write_text("print('baseline')\n")
+            _write_minimal_tabular_task(task_dir)
             tuned_code = """
 import json
 from pathlib import Path

@@ -68,7 +68,10 @@ class FixtureSet:
     categorical_columns: list[str]
     feature_columns: list[str]
     train_with_target: Any
+    train_path: str | None
+    test_path: str | None
     predictions: list[np.ndarray]
+    output_path: str
 
 
 def _bounded_size(value: Any, default: int, minimum: int, maximum: int) -> int:
@@ -349,6 +352,8 @@ def _build_fixture(
     categorical_columns: list[str] = []
     feature_columns: list[str] = []
     train_with_target = None
+    train_path = None
+    test_path = None
 
     if modality == "tabular":
         import pandas as pd
@@ -472,14 +477,79 @@ def _build_fixture(
 
         train, test = graphs(train_size), graphs(test_size)
     elif modality == "multimodal":
-        train = {
-            "text": [f"sample {index}" for index in range(train_size)],
-            "image": rng.random((train_size, 8, 8, 3), dtype=np.float32),
+        import pandas as pd
+
+        parameter_roles = contract.get("parameter_roles", {})
+        declared_components = {
+            str(role).split(".", 1)[1].lower()
+            for role in (
+                parameter_roles.values()
+                if isinstance(parameter_roles, Mapping)
+                else ()
+            )
+            if isinstance(role, str)
+            and role.lower().startswith(("train.", "test."))
         }
-        test = {
-            "text": [f"test {index}" for index in range(test_size)],
-            "image": rng.random((test_size, 8, 8, 3), dtype=np.float32),
-        }
+        declared_components.update(
+            item
+            for item in input_types
+            if item in {
+                "audio",
+                "graph",
+                "image",
+                "tabular",
+                "text",
+                "timeseries",
+                "video",
+            }
+        )
+        declared_components.update({"image", "tabular"})
+
+        def multimodal_components(size: int, prefix: str) -> dict[str, Any]:
+            result: dict[str, Any] = {}
+            for component in sorted(declared_components):
+                if component == "image":
+                    result[component] = rng.random(
+                        (size, 8, 8, 3), dtype=np.float32
+                    )
+                elif component == "text":
+                    result[component] = [
+                        f"{prefix} document {index}" for index in range(size)
+                    ]
+                elif component == "audio":
+                    result[component] = rng.normal(
+                        size=(size, 256)
+                    ).astype(np.float32)
+                elif component == "video":
+                    result[component] = rng.random(
+                        (size, 3, 8, 8, 3), dtype=np.float32
+                    )
+                elif component == "timeseries":
+                    result[component] = rng.normal(
+                        size=(size, 12, 3)
+                    ).astype(np.float32)
+                elif component == "graph":
+                    result[component] = [
+                        {
+                            "x": rng.normal(size=(5, 3)).astype(np.float32),
+                            "edge_index": np.asarray(
+                                [[0, 1, 2, 3], [1, 2, 3, 4]]
+                            ),
+                        }
+                        for _ in range(size)
+                    ]
+                else:
+                    result[component] = pd.DataFrame(
+                        {
+                            "sample_id": np.arange(size),
+                            "feature_1": rng.normal(size=size),
+                            "feature_2": rng.normal(size=size),
+                        }
+                    )
+            return result
+
+        train = multimodal_components(train_size, "training")
+        test = multimodal_components(test_size, "test")
     else:
         shape = _sample_shape(contract, (8,))
         train = _vary_rows(rng.normal(size=(train_size, *shape)).astype(np.float32))
@@ -520,10 +590,61 @@ def _build_fixture(
         if is_dataframe:
             train_with_target = train.copy()
             train_with_target["target"] = target
+            train_path_obj = work_dir / "tabular_train.csv"
+            test_path_obj = work_dir / "tabular_test.csv"
+            train_with_target.to_csv(train_path_obj, index=False)
+            test.to_csv(test_path_obj, index=False)
+            train_path = str(train_path_obj)
+            test_path = str(test_path_obj)
 
     if container in {"paths", "file_paths", "files", "directory", "dir", "file", "single_file"}:
-        train = _materialize_files(work_dir, modality, "train", train, contract)
-        test = _materialize_files(work_dir, modality, "test", test, contract)
+        if modality == "multimodal" and isinstance(train, Mapping):
+            default_extensions = {
+                "audio": ".wav",
+                "image": ".png",
+                "tabular": ".csv",
+                "text": ".txt",
+                "timeseries": ".npy",
+                "video": ".npy",
+            }
+            materialized_train = {}
+            materialized_test = {}
+            for component in train:
+                component_modality = (
+                    "tabular" if component == "metadata" else component
+                )
+                component_contract = dict(contract)
+                component_contract["file_extension"] = default_extensions.get(
+                    component_modality, ".pkl"
+                )
+                component_contract["container"] = (
+                    "directory"
+                    if component_modality in {
+                        "audio",
+                        "image",
+                        "text",
+                        "video",
+                    }
+                    else "file"
+                )
+                materialized_train[component] = _materialize_files(
+                    work_dir,
+                    component_modality,
+                    f"train_{component}",
+                    train[component],
+                    component_contract,
+                )
+                materialized_test[component] = _materialize_files(
+                    work_dir,
+                    component_modality,
+                    f"test_{component}",
+                    test[component],
+                    component_contract,
+                )
+            train, test = materialized_train, materialized_test
+        else:
+            train = _materialize_files(work_dir, modality, "train", train, contract)
+            test = _materialize_files(work_dir, modality, "test", test, contract)
 
     predictions = [
         np.linspace(0.05, 0.95, test_size, dtype=np.float32),
@@ -540,7 +661,10 @@ def _build_fixture(
         categorical_columns=categorical_columns,
         feature_columns=feature_columns,
         train_with_target=train_with_target,
+        train_path=train_path,
+        test_path=test_path,
         predictions=predictions,
+        output_path=str(work_dir / "artifact_predictions.csv"),
     )
 
 
@@ -574,18 +698,31 @@ def _role_value(role: str, fixture: FixtureSet) -> Any:
         )
     mapping = {
         "categorical_columns": fixture.categorical_columns,
+        "categorical": fixture.categorical_columns,
         "cat_columns": fixture.categorical_columns,
+        "continuous": fixture.numeric_columns,
+        "continuous_columns": fixture.numeric_columns,
         "feature_columns": fixture.feature_columns,
         "features": fixture.feature_columns,
+        "id": "id",
+        "id_column": "id",
+        "ids": np.arange(fixture.test_size),
         "numeric_columns": fixture.numeric_columns,
+        "numeric": fixture.numeric_columns,
+        "output": fixture.output_path,
+        "output_path": fixture.output_path,
         "predictions": fixture.predictions,
         "prediction_ensemble": fixture.predictions,
+        "random_seed": 42,
+        "seed": 42,
         "target": fixture.target,
         "target_column": "target",
         "test": fixture.test,
         "test_data": fixture.test,
+        "test_path": fixture.test_path,
         "train": fixture.train,
         "train_data": fixture.train,
+        "train_path": fixture.train_path,
         "train_table_with_target": fixture.train_with_target,
     }
     if normalized not in mapping:
@@ -606,6 +743,57 @@ def _build_arguments(
     assigned_roles: dict[str, str] = {}
     positional_required_index = 0
 
+    def role_value_for_parameter(role: str, parameter_name: str) -> Any:
+        value = _role_value(role, fixture)
+        normalized = role.lower().replace("-", "_")
+        lowered_parameter = parameter_name.lower()
+        if any(
+            marker in lowered_parameter
+            for marker in ("random_state", "random_seed", "seed")
+        ):
+            return 42
+        if normalized in {"target", "id", "id_column"} and any(
+            marker in lowered_parameter
+            for marker in ("column", "field", "name")
+        ):
+            return "target" if normalized == "target" else "id"
+        if normalized in {"predictions", "output", "output_path"} and any(
+            marker in lowered_parameter
+            for marker in ("output", "path", "file", "csv")
+        ):
+            return fixture.output_path
+        if normalized in {"train", "train_data", "train_path"} and any(
+            marker in lowered_parameter
+            for marker in ("csv", "file", "path")
+        ) and fixture.train_path:
+            return fixture.train_path
+        if normalized in {"test", "test_data", "test_path"} and any(
+            marker in lowered_parameter
+            for marker in ("csv", "file", "path")
+        ) and fixture.test_path:
+            return fixture.test_path
+        if (
+            fixture.modality == "multimodal"
+            and normalized in {"train", "test"}
+            and isinstance(value, Mapping)
+            and any(
+                marker in parameter_name.lower()
+                for marker in ("csv", "table", "metadata", "frame")
+            )
+        ):
+            for component in ("tabular", "metadata"):
+                if component in value:
+                    return value[component]
+        if (
+            fixture.modality == "multimodal"
+            and normalized in {"train", "test"}
+            and isinstance(value, Mapping)
+        ):
+            for component in ("image", "audio", "video", "text"):
+                if component in lowered_parameter and component in value:
+                    return value[component]
+        return value
+
     for parameter_name, parameter in signature.parameters.items():
         if parameter.kind in (
             inspect.Parameter.VAR_KEYWORD,
@@ -615,7 +803,9 @@ def _build_arguments(
         lowered = parameter_name.lower()
         role = _explicit_role(parameter_roles, parameter_name)
         if role:
-            kwargs[parameter_name] = _role_value(role, fixture)
+            kwargs[parameter_name] = role_value_for_parameter(
+                role, parameter_name
+            )
             assigned_roles[parameter_name] = role
             continue
         if lowered in {"x_train", "x_tr", "train_data"}:
@@ -701,7 +891,9 @@ def _build_arguments(
                 f"cannot synthesize required parameter {parameter_name!r}; "
                 "declare interface.input_contract.parameter_roles"
             )
-        kwargs[parameter_name] = _role_value(role, fixture)
+        kwargs[parameter_name] = role_value_for_parameter(
+            role, parameter_name
+        )
         assigned_roles[parameter_name] = role
         positional_required_index += 1
     return kwargs, assigned_roles

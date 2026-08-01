@@ -214,7 +214,7 @@ class TabularAdapterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             task_dir = root / "task"
-            output_dir = root / "run" / "baseline"
+            output_dir = root / "run" / "task_assets"
             task_dir.mkdir()
             self._write_task(task_dir)
             original_files = {

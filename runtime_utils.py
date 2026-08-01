@@ -74,15 +74,20 @@ _TASK_DATA_SUFFIXES = {
 }
 _TASK_DATA_EXCLUSIONS = {
     "dataset_analysis_report.txt",
-    "initial_algorithm.py",
-    "initial_dataloader.py",
+    "task_dataloader.py",
     "submission.csv",
     "task_config.json",
 }
 _TASK_TYPES = {
+    "captioning",
     "classification",
+    "detection",
+    "multilabel_classification",
     "regression",
+    "retrieval",
+    "segmentation",
     "supervised",
+    "temporal_localization",
     "unsupervised_clustering",
 }
 
@@ -506,14 +511,16 @@ def infer_task_type(
     if configured_task_type is not None:
         normalized = str(configured_task_type).strip().lower().replace("-", "_")
         aliases = {
+            "binary_classification": "classification",
             "clustering": "unsupervised_clustering",
+            "multiclass_classification": "classification",
             "unsupervised": "unsupervised_clustering",
         }
         normalized = aliases.get(normalized, normalized)
         if normalized not in _TASK_TYPES:
             raise ValueError(
-                "task_type must be classification, regression, supervised, or "
-                f"unsupervised_clustering; got {configured_task_type!r}"
+                "task_type must be one of the registered problem types "
+                f"{sorted(_TASK_TYPES)}; got {configured_task_type!r}"
             )
         return normalized
 
@@ -737,7 +744,9 @@ def accelerator_subprocess_env(
     else:
         clean["PYTHONPATH"] = project_root
     clean["AIBUILDAI_ACCELERATOR"] = selected
-    clean["AIBUILDAI_ACTUAL_ACCELERATOR"] = selected
+    # Selection is intent, not evidence of use. GPU-aware model code promotes
+    # this value only after it successfully configures and executes that backend.
+    clean["AIBUILDAI_ACTUAL_ACCELERATOR"] = "cpu"
     clean["AIBUILDAI_PREFER_GPU"] = "1" if selected in {"cuda", "mps"} else "0"
     if selected == "cuda":
         clean.setdefault("AIBUILDAI_CUDA_DEVICES", "0")

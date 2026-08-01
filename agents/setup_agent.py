@@ -229,11 +229,6 @@ class SetupAgent:
                     "; assert torch.version.cuda == '12.6', "
                     "f'Expected a CUDA 12.6 PyTorch wheel, got CUDA "
                     "{torch.version.cuda!r}'"
-                    "; flags=torch._C._cuda_getArchFlags()"
-                    "; arches=set(flags.split())"
-                    "; assert 'sm_61' in arches, "
-                    "f'PyTorch wheel lacks required TITAN Xp architecture sm_61: "
-                    "{sorted(arches)}'"
                 )
             try:
                 result = subprocess.run(

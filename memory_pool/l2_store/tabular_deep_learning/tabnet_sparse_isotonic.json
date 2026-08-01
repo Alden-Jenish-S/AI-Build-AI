@@ -61,17 +61,6 @@
   "task_validations": [
     {
       "task_name": "playground-series",
-      "node_id": "node_4",
-      "score": 7.909017556937547,
-      "metric_direction": "minimize",
-      "status": "completed",
-      "reward": 0.0033626177756613,
-      "fidelity": "screen",
-      "elapsed_seconds": 65.23470604099566,
-      "improved_over_baseline": true
-    },
-    {
-      "task_name": "playground-series",
       "node_id": "node_12",
       "score": 7.909017556937547,
       "metric_direction": "minimize",
@@ -80,6 +69,18 @@
       "fidelity": "screen",
       "elapsed_seconds": 411.40998425,
       "improved_over_baseline": true
+    },
+    {
+      "task_name": "playground-series",
+      "node_id": "node_4",
+      "score": 7.921238686341424,
+      "metric_direction": "minimize",
+      "status": "completed",
+      "reward": -0.8884014894412392,
+      "fidelity": "screen",
+      "elapsed_seconds": 591.8754729579668,
+      "reference_score": 7.875064976438873,
+      "improved_over_reference": false
     }
   ]
 }

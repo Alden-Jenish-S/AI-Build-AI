@@ -112,6 +112,8 @@ class EvidenceService:
         reference_fidelity = reference_validation.get("fidelity")
         candidate_split = candidate_validation.get("fold_assignment_sha256")
         reference_split = reference_validation.get("fold_assignment_sha256")
+        candidate_mode = candidate_validation.get("evaluation_mode")
+        reference_mode = reference_validation.get("evaluation_mode")
         aligned_protocol = not (
             candidate_fidelity
             and reference_fidelity
@@ -120,6 +122,10 @@ class EvidenceService:
             candidate_split
             and reference_split
             and candidate_split != reference_split
+        ) and not (
+            candidate_mode
+            and reference_mode
+            and candidate_mode != reference_mode
         )
         if (
             len(candidate_folds) >= 2
@@ -148,10 +154,24 @@ class EvidenceService:
             paired_observations = len(deltas)
         else:
             candidate_std = max(
-                0.0, float(candidate_validation.get("cv_std", 0.0) or 0.0)
+                0.0,
+                float(
+                    candidate_validation.get(
+                        "score_std",
+                        candidate_validation.get("cv_std", 0.0),
+                    )
+                    or 0.0
+                ),
             )
             reference_std = max(
-                0.0, float(reference_validation.get("cv_std", 0.0) or 0.0)
+                0.0,
+                float(
+                    reference_validation.get(
+                        "score_std",
+                        reference_validation.get("cv_std", 0.0),
+                    )
+                    or 0.0
+                ),
             )
             candidate_count = max(
                 1, int(candidate_validation.get("folds", len(candidate_folds) or 1))
@@ -177,6 +197,11 @@ class EvidenceService:
         p_material = self._probability_above(
             delta_mean, standard_error, material_effect
         )
+        information_gain = (
+            0.0
+            if standard_error <= 1e-15
+            else self._binary_entropy(p_material)
+        )
         return EvidenceEstimate(
             candidate_score=candidate_score,
             reference_score=reference_score,
@@ -188,7 +213,7 @@ class EvidenceService:
             expected_material_improvement=self._positive_part_expectation(
                 delta_mean, standard_error, material_effect
             ),
-            information_gain=self._binary_entropy(p_material),
+            information_gain=information_gain,
             paired_observations=paired_observations,
             method=method,
         )

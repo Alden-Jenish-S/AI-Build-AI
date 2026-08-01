@@ -12,6 +12,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from evaluation.metrics import (
+    canonical_metric_name,
+    infer_metric_direction,
+    resolve_metric_name,
+)
+
 
 _MODALITY_ALIASES = {
     "images": "image",
@@ -315,8 +321,10 @@ class MetricSpec:
     options: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        if not str(self.name).strip():
+        name = canonical_metric_name(self.name)
+        if not name:
             raise ValueError("metric name must be non-empty")
+        object.__setattr__(self, "name", name)
         direction = str(self.direction).strip().lower()
         if direction not in _SUPPORTED_DIRECTIONS:
             raise ValueError(
@@ -329,10 +337,13 @@ class MetricSpec:
 
     @classmethod
     def from_value(
-        cls, raw: object, *, default_direction: str
+        cls, raw: object, *, default_direction: str | None = None
     ) -> "MetricSpec":
         if isinstance(raw, str):
-            return cls(name=raw, direction=default_direction)
+            return cls(
+                name=raw,
+                direction=default_direction or infer_metric_direction(raw),
+            )
         if not isinstance(raw, Mapping):
             raise ValueError("each metric must be a name or object")
         name = raw.get("name")
@@ -348,7 +359,11 @@ class MetricSpec:
         )
         return cls(
             name=str(name),
-            direction=str(raw.get("direction") or default_direction),
+            direction=str(
+                raw.get("direction")
+                or default_direction
+                or infer_metric_direction(name)
+            ),
             options=merged_options,
         )
 
@@ -613,24 +628,57 @@ class TaskSpec:
         if problem_type == "unsupervised_clustering":
             target = None
 
-        default_direction = str(
-            config.get("metric_direction", "maximize")
-        ).lower()
+        output = OutputSpec.from_value(
+            config.get("output"), problem_type=problem_type
+        )
+        default_direction = (
+            str(config["metric_direction"]).lower()
+            if config.get("metric_direction") is not None
+            else None
+        )
         raw_metrics = config.get("metrics")
         if raw_metrics is None:
-            raw_metrics = [config.get("metric_name", "score")]
+            raw_metrics = [
+                resolve_metric_name(
+                    config.get("metric_name"),
+                    problem_type=problem_type,
+                    output_type=output.type,
+                )
+            ]
         if not isinstance(raw_metrics, Sequence) or isinstance(
             raw_metrics, (str, bytes)
         ):
             raise ValueError("metrics must be a list")
+
+        def resolved_metric_value(metric: object) -> object:
+            if isinstance(metric, str):
+                return resolve_metric_name(
+                    metric,
+                    problem_type=problem_type,
+                    output_type=output.type,
+                )
+            if isinstance(metric, Mapping):
+                resolved = dict(metric)
+                if resolved.get("name") is not None:
+                    resolved["name"] = resolve_metric_name(
+                        resolved["name"],
+                        problem_type=problem_type,
+                        output_type=output.type,
+                    )
+                return resolved
+            return metric
+
         metrics = tuple(
             MetricSpec.from_value(
-                metric, default_direction=default_direction
+                resolved_metric_value(metric),
+                default_direction=default_direction,
             )
             for metric in raw_metrics
         )
-        primary_metric = str(
-            config.get("primary_metric") or metrics[0].name
+        primary_metric = resolve_metric_name(
+            config.get("primary_metric") or metrics[0].name,
+            problem_type=problem_type,
+            output_type=output.type,
         )
 
         component_values = config.get("component_modalities")
@@ -677,9 +725,7 @@ class TaskSpec:
                 if config.get("time_field") is not None
                 else None
             ),
-            output=OutputSpec.from_value(
-                config.get("output"), problem_type=problem_type
-            ),
+            output=output,
             metrics=metrics,
             primary_metric=primary_metric,
             resource_limits=ResourceLimits.from_mapping(

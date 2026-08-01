@@ -98,7 +98,10 @@ def discover_dataset_layout(task_dir: Path) -> dict:
             sample_path = submission_candidates[0]
             roles["sample_submission"] = sample_path
 
-    task_type = infer_task_type(description, config.get("task_type"))
+    task_type = infer_task_type(
+        f"{task_dir.name}\n{description}",
+        config.get("problem_type") or config.get("task_type"),
+    )
     unused = [path for path in tabular if path not in set(roles.values())]
     if task_type == "unsupervised_clustering":
         if "data" not in roles:
@@ -218,6 +221,77 @@ def _resolved_target_field(task_dir: Path, layout: dict) -> str | None:
         if column.lower() in {"target", "label", "class", "cover_type"}
     ]
     return str(common[0]) if common else None
+
+
+def infer_tabular_problem_type(
+    task_dir: Path,
+    layout: dict | None = None,
+    target_field: str | None = None,
+) -> str:
+    """Resolve an ambiguous legacy supervised table from target semantics.
+
+    Explicit configuration and description/name markers are handled during
+    layout discovery. This fallback is only used for the legacy ``supervised``
+    value, where returning an abstract task and the placeholder metric
+    ``score`` would make independent evaluation impossible.
+    """
+    task_dir = Path(task_dir)
+    layout = layout or discover_dataset_layout(task_dir)
+    task_type = str(layout.get("task_type") or "supervised")
+    if task_type != "supervised":
+        return task_type
+    target_field = target_field or _resolved_target_field(task_dir, layout)
+    train_path = _role_path(
+        task_dir, layout.get("roles", {}).get("train")
+    )
+    if target_field is None or train_path is None:
+        return "classification"
+
+    # A wide submission template is an unambiguous multiclass probability
+    # contract even when a generated loader later integer-encodes the labels.
+    sample_path = _role_path(
+        task_dir, layout.get("roles", {}).get("sample_submission")
+    )
+    if sample_path is not None:
+        separator = "\t" if sample_path.suffix.lower() == ".tsv" else ","
+        try:
+            if len(pd.read_csv(sample_path, sep=separator, nrows=0).columns) > 2:
+                return "classification"
+        except Exception:
+            pass
+
+    separator = "\t" if train_path.suffix.lower() == ".tsv" else ","
+    try:
+        target = pd.read_csv(
+            train_path,
+            sep=separator,
+            usecols=[target_field],
+            nrows=100_000,
+        )[target_field].dropna()
+    except Exception:
+        return "classification"
+    if target.empty:
+        return "classification"
+    if (
+        pd.api.types.is_bool_dtype(target.dtype)
+        or pd.api.types.is_object_dtype(target.dtype)
+        or pd.api.types.is_string_dtype(target.dtype)
+        or isinstance(target.dtype, pd.CategoricalDtype)
+    ):
+        return "classification"
+    numeric = pd.to_numeric(target, errors="coerce")
+    if numeric.isna().any():
+        return "classification"
+    unique_count = int(numeric.nunique())
+    repeated_fraction = unique_count / max(len(numeric), 1)
+    integer_like = bool(
+        np.allclose(numeric.to_numpy(), np.round(numeric.to_numpy()))
+    )
+    if integer_like and (
+        unique_count <= 100 or repeated_fraction <= 0.20
+    ):
+        return "classification"
+    return "regression"
 
 
 def build_task_profile(
@@ -519,12 +593,15 @@ class TabularAdapter:
         task_dir = Path(task_dir)
         config = _read_config(task_dir)
         layout = discover_dataset_layout(task_dir)
+        target_field = _resolved_target_field(task_dir, layout)
         return TaskSpec.from_mapping(
             task_id=task_dir.name,
             raw=config,
-            inferred_problem_type=layout["task_type"],
+            inferred_problem_type=infer_tabular_problem_type(
+                task_dir, layout, target_field
+            ),
             legacy_roles=layout["roles"],
-            inferred_target_field=_resolved_target_field(task_dir, layout),
+            inferred_target_field=target_field,
         )
 
     def profile(
@@ -552,7 +629,15 @@ class TabularAdapter:
             split = "test" if role == "test" else "train"
             for index, series in frame.iterrows():
                 row = series.to_dict()
-                raw_id = row.get(task_spec.sample_id_field)
+                # ``iterrows`` coerces mixed numeric rows to a common dtype,
+                # turning integer identifiers such as 250000 into 250000.0.
+                # Read identity fields directly from their source Series so
+                # submission keys retain their declared representation.
+                raw_id = (
+                    frame.at[index, task_spec.sample_id_field]
+                    if task_spec.sample_id_field in frame.columns
+                    else None
+                )
                 sample_id = (
                     str(raw_id)
                     if raw_id is not None and not pd.isna(raw_id)
@@ -561,12 +646,22 @@ class TabularAdapter:
                 target = (
                     None
                     if split == "test" or target_field is None
-                    else json_safe(row.get(target_field))
+                    else json_safe(frame.at[index, target_field])
                 )
+                identity_fields = {
+                    field
+                    for field in (
+                        task_spec.sample_id_field,
+                        task_spec.entity_id_field,
+                        task_spec.group_id_field,
+                    )
+                    if field
+                }
                 inputs = {
                     str(column): json_safe(value)
                     for column, value in row.items()
                     if column != target_field
+                    and column not in identity_fields
                 }
                 records.append(
                     SampleRecord(
@@ -574,22 +669,27 @@ class TabularAdapter:
                         inputs={"tabular": inputs},
                         target=target,
                         entity_id=(
-                            str(row.get(task_spec.entity_id_field))
+                            str(frame.at[index, task_spec.entity_id_field])
                             if task_spec.entity_id_field
-                            and row.get(task_spec.entity_id_field)
-                            is not None
+                            and task_spec.entity_id_field in frame.columns
+                            and not pd.isna(
+                                frame.at[index, task_spec.entity_id_field]
+                            )
                             else sample_id
                         ),
                         group_id=(
-                            str(row.get(task_spec.group_id_field))
+                            str(frame.at[index, task_spec.group_id_field])
                             if task_spec.group_id_field
-                            and row.get(task_spec.group_id_field)
-                            is not None
+                            and task_spec.group_id_field in frame.columns
+                            and not pd.isna(
+                                frame.at[index, task_spec.group_id_field]
+                            )
                             else None
                         ),
                         timestamp=(
-                            row.get(task_spec.time_field)
+                            frame.at[index, task_spec.time_field]
                             if task_spec.time_field
+                            and task_spec.time_field in frame.columns
                             else None
                         ),
                         split=split,

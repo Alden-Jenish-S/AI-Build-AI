@@ -3,13 +3,15 @@ import math
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
 
+import numpy as np
 import pandas as pd
 
 from agents.manager_agent import ManagerAgent
-from search.policies import DiversityAssessment
-from search.evidence import EvidenceService
+from search.policies import DiversityAssessment, DiversityController
+from search.evidence import EvidenceEstimate, EvidenceService
 from search.policies import PromotionController, PruningPolicy
 from search.provenance import ArtifactRecord, ProvenanceGraph
 from search.tuning import (
@@ -21,6 +23,27 @@ from tree.node import NodeState
 
 
 class StatisticalPolicyTests(unittest.TestCase):
+    def test_exact_tie_has_no_remaining_information_gain(self):
+        evidence = EvidenceService().compare(
+            {
+                "score": 0.5,
+                "validation": {
+                    "fold_scores": [0.5, 0.5],
+                    "folds": 2,
+                },
+            },
+            {
+                "score": 0.5,
+                "validation": {
+                    "fold_scores": [0.5, 0.5],
+                    "folds": 2,
+                },
+            },
+            direction="maximize",
+        )
+        self.assertEqual(evidence.standard_error, 0.0)
+        self.assertEqual(evidence.information_gain, 0.0)
+
     def test_paired_fold_evidence_drives_pruning_and_promotion(self):
         service = EvidenceService()
         strong = service.compare(
@@ -130,7 +153,12 @@ class ProvenanceTests(unittest.TestCase):
                 "node_2",
                 "root",
                 "implementation",
-                result={"score": 0.8, "status": "completed"},
+                result={
+                    "score": 0.8,
+                    "status": "completed",
+                    "oof_path": "node_2/oof_predictions.csv",
+                    "evaluation_mode": "cross_validation",
+                },
                 executed=True,
                 fidelity="screen",
             )
@@ -162,6 +190,33 @@ class ProvenanceTests(unittest.TestCase):
             self.assertEqual(merge.operator, "merge_ensemble")
             self.assertTrue(merge.config["manager_owned_merge"])
             self.assertFalse(merge.config["raw_code_fusion"])
+
+    def test_holdout_node_does_not_schedule_oof_ensemble(self):
+        manager = ManagerAgent.__new__(ManagerAgent)
+        manager.total_budget = 6
+        manager.experiments_executed = 1
+        manager.task_type = "classification"
+        parent = NodeState(
+            "node_1",
+            "root",
+            "implementation",
+            result={
+                "score": 0.8,
+                "status": "completed",
+                "evaluation_mode": "holdout",
+                "validation_path": "validation_predictions.csv",
+                "oof_path": None,
+            },
+            executed=True,
+            fidelity="screen",
+        )
+        manager.all_nodes = {"node_1": parent}
+        manager._spawn_merge_ensemble_slot(
+            parent,
+            "node_1",
+            SimpleNamespace(utility=1.0),
+        )
+        self.assertEqual(set(manager.all_nodes), {"node_1"})
 
 
 class TuningKnowledgeTests(unittest.TestCase):
@@ -211,6 +266,59 @@ class TuningKnowledgeTests(unittest.TestCase):
 
 
 class ManagerOwnedEnsembleTests(unittest.TestCase):
+    def test_diversity_controller_discovers_multiclass_probability_blend(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run_root = Path(temp_dir)
+            targets = ["a", "b", "a", "b"]
+            probabilities = {
+                "one": [0.99, 0.49, 0.99, 0.49],
+                "two": [0.51, 0.01, 0.51, 0.01],
+            }
+            for node_id, first_class in probabilities.items():
+                node_dir = run_root / node_id
+                node_dir.mkdir()
+                first = np.asarray(first_class)
+                pd.DataFrame(
+                    {
+                        "row_id": [1, 2, 3, 4],
+                        "target": targets,
+                        "prediction::a": first,
+                        "prediction::b": 1.0 - first,
+                    }
+                ).to_csv(node_dir / "oof_predictions.csv", index=False)
+            nodes = {
+                node_id: SimpleNamespace(
+                    node_type="implementation",
+                    fidelity="screen",
+                    result={"status": "completed", "score": 0.4},
+                )
+                for node_id in probabilities
+            }
+            evidence = EvidenceEstimate(
+                candidate_score=0.4,
+                reference_score=0.4,
+                delta_mean=0.0,
+                standard_error=0.1,
+                minimum_worthwhile_effect=0.1,
+                probability_improvement=0.5,
+                probability_material_improvement=0.2,
+                expected_material_improvement=0.0,
+                information_gain=0.2,
+                paired_observations=2,
+                method="test",
+            )
+            assessment = DiversityController().best_partner(
+                node_id="one",
+                node_fidelity="screen",
+                all_nodes=nodes,
+                run_root=run_root,
+                metric_name="log_loss",
+                evidence=evidence,
+            )
+            self.assertIsNotNone(assessment)
+            self.assertEqual(assessment.partner_node_id, "two")
+            self.assertGreater(assessment.blend_gain, 0.0)
+
     def test_manager_ensembles_two_node_models_with_oof_selected_weights(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             run_root = Path(temp_dir)
@@ -265,7 +373,6 @@ class ManagerOwnedEnsembleTests(unittest.TestCase):
             manager.task_name = "example"
             manager.metric_name = "rmse"
             manager.metric_direction = "minimize"
-            manager.baseline_score = 2.0
             manager.total_budget = 4
             manager.initial_fanout = 2
             manager.experiments_executed = 2

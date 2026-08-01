@@ -10,15 +10,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Any, List
 from packaging.requirements import Requirement
+from evaluation.metrics import default_metric_for_problem
+from evaluation.submission import validate_submission_file
 from tree.node import NodeState
 from tree.scheduler import UCB1Scheduler
 from tree.global_memory import GlobalMemory
-from .initial_agent import InitialAgent, infer_metric_from_description
 from .technique_agent import TechniqueAgent
 from .implementation_agent import ImplementationAgent
 from .aggregator_agent import AggregatorAgent
 from .setup_agent import SetupAgent
 from .task_analyzer import TaskAnalyzer
+from .modality_scaffold import task_loader_source, write_runtime_data_contract
 from memory_pool.builder.l2_builder import L2Builder
 from memory_pool.query_tool import normalize_resource_profile
 from search import (
@@ -46,7 +48,6 @@ class ManagerAgent:
         task_name: str,
         total_budget: int = 10,
         venv_path: str | None = None,
-        baseline_score: float = None,
         model_name: str = None,
         run_suffix: str = None,
     ):
@@ -56,11 +57,6 @@ class ManagerAgent:
         if not isinstance(total_budget, int) or isinstance(total_budget, bool) or total_budget < 1:
             raise ValueError(f"total_budget must be a positive integer, got {total_budget!r}")
         self.total_budget = total_budget
-        if baseline_score is not None:
-            baseline_score = float(baseline_score)
-            if not math.isfinite(baseline_score):
-                raise ValueError("baseline_score must be finite")
-        self.baseline_score = baseline_score
         self.model_name = model_name
         
         # Directories
@@ -123,9 +119,6 @@ class ManagerAgent:
         self.modality = self.task_spec.modality
         self.component_modalities = self.task_spec.component_modalities
         self.output_type = self.task_spec.output.type
-        self.baseline_dir = (
-            self.project_root / "runs" / self.task_name / "baseline"
-        )
         if run_suffix:
             self.run_root = self.project_root / "runs" / self.task_name / run_suffix
         else:
@@ -158,11 +151,11 @@ class ManagerAgent:
         self.all_nodes: Dict[str, NodeState] = {}
         self.node_counter = 0
         self.experiments_executed = 0
+        self.implementation_attempts = 0
 
         # Load task config for metric direction and the renewable progress lease.
         self.metric_direction = self.task_spec.metric_direction
         self.metric_name = self.task_spec.primary_metric
-        self.baseline_fidelity = "screen"
         self.progress_stall_seconds = 1800
         self.enable_multi_fidelity = True
         self.ensemble_top_k = 3
@@ -173,6 +166,12 @@ class ManagerAgent:
         self.max_fine_tune_rounds = 2
         self.max_debug_attempts = 3
         self.enforce_evaluation_contract = True
+        self.enable_executable_artifacts = (
+            os.environ.get(
+                "METHOD_TREE_ENABLE_EXECUTABLE_ARTIFACTS", "0"
+            )
+            == "1"
+        )
         self.accelerator_allowlist = None
         self.accelerator_preference = "auto"
         self.available_accelerators = {"cpu"}
@@ -180,17 +179,10 @@ class ManagerAgent:
         self.available_ram_gb = self._available_ram_gb()
 
         config_file = self.task_dir / "task_config.json"
-        configured_task_type = self.task_spec.problem_type
         if config_file.exists():
             try:
                 with open(config_file, 'r', encoding='utf-8') as f:
                     task_config = json.load(f)
-                self.metric_direction = task_config.get("metric_direction", "maximize")
-                self.metric_name = task_config.get("metric_name", "score")
-                self.baseline_fidelity = str(
-                    task_config.get("baseline_fidelity", "screen")
-                ).lower()
-                configured_task_type = task_config.get("task_type")
                 self.progress_stall_seconds = task_config.get(
                     "progress_stall_seconds", 1800
                 )
@@ -215,6 +207,12 @@ class ManagerAgent:
                 )
                 self.max_debug_attempts = max(
                     0, int(task_config.get("max_debug_attempts", 3))
+                )
+                self.enable_executable_artifacts = bool(
+                    task_config.get(
+                        "enable_executable_artifacts",
+                        self.enable_executable_artifacts,
+                    )
                 )
                 resource_limits = task_config.get("resource_limits", {})
                 if isinstance(resource_limits, dict):
@@ -242,23 +240,11 @@ class ManagerAgent:
                             self.available_ram_gb = configured_ram_gb
             except Exception as e:
                 print(f"ManagerAgent WARNING: Failed to parse task_config.json: {e}")
-        else:
-            description_file = self.task_dir / "task_description.md"
-            if description_file.exists():
-                description = description_file.read_text(encoding="utf-8")
-                self.metric_name, self.metric_direction = (
-                    infer_metric_from_description(description)
-                )
         self._refresh_accelerator_state()
         if self.metric_direction not in {"maximize", "minimize"}:
             raise ValueError(
                 f"task_config metric_direction must be 'maximize' or 'minimize', "
                 f"got {self.metric_direction!r}"
-            )
-        if self.baseline_fidelity not in {"screen", "medium", "full"}:
-            raise ValueError(
-                "task_config baseline_fidelity must be screen, medium, or full; "
-                f"got {self.baseline_fidelity!r}"
             )
         if (
             not isinstance(self.progress_stall_seconds, (int, float))
@@ -312,8 +298,7 @@ class ManagerAgent:
             "ManagerAgent initialized: "
             f"direction={self.metric_direction}, "
             "runtime_limit=None, "
-            f"progress_stall_seconds={self.progress_stall_seconds}, "
-            f"baseline_score={self.baseline_score}"
+            f"progress_stall_seconds={self.progress_stall_seconds}"
         )
 
     @staticmethod
@@ -324,6 +309,19 @@ class ManagerAgent:
             ) / (1024 ** 3)
         except (AttributeError, OSError, ValueError):
             return 0.0
+
+    def _resolved_metric_name(self) -> str:
+        """Return the task metric for normal and lightweight test instances."""
+        metric_name = getattr(self, "metric_name", None)
+        if metric_name:
+            return str(metric_name)
+        task_spec = getattr(self, "task_spec", None)
+        if task_spec is not None:
+            return str(task_spec.primary_metric)
+        return default_metric_for_problem(
+            getattr(self, "task_type", "supervised"),
+            getattr(self, "output_type", None),
+        )
 
     def _refresh_accelerator_state(self) -> None:
         """Re-probe the selected interpreter after dependency installation."""
@@ -341,6 +339,11 @@ class ManagerAgent:
     def _initial_fanout_for_budget(total_budget: int) -> int:
         return min(3, max(1, int(total_budget) // 3))
 
+    @staticmethod
+    def _initial_candidate_count_for_budget(total_budget: int) -> int:
+        """Include one bounded recovery approach for very small searches."""
+        return min(3, max(2, int(total_budget)))
+
     def _spawn_root_approach(
         self, root_id: str, approach: dict, *, replacement: bool = False
     ) -> str:
@@ -353,7 +356,7 @@ class ManagerAgent:
             parent_id=root_id,
             node_type="technique",
             plan=plan,
-            operator="initial",
+            operator="root",
             fidelity="screen" if self.enable_multi_fidelity else "full",
             config={
                 "priority": 0.0,
@@ -448,6 +451,17 @@ class ManagerAgent:
                 "elapsed_seconds": node.result.get("elapsed_seconds"),
                 "validation": node.result.get("validation", {}),
                 "oof_path": node.result.get("oof_path"),
+                "validation_path": node.result.get("validation_path"),
+                "evaluation_mode": node.result.get("evaluation_mode"),
+                "evaluation_policy": node.result.get("evaluation_policy"),
+                "error_analysis": node.result.get("error_analysis"),
+                "error_analysis_path": node.result.get(
+                    "error_analysis_path"
+                ),
+                "duplicate_of": node.result.get("duplicate_of"),
+                "code_fingerprint": node.result.get(
+                    "code_fingerprint"
+                ),
                 "tuning": node.result.get("tuning"),
                 "merge": node.result.get("merge"),
                 "statistical_evidence": node.result.get(
@@ -541,54 +555,77 @@ class ManagerAgent:
         return digest.hexdigest()
 
     def _no_effect_reason(self, node: NodeState, node_dir: Path) -> str | None:
-        """Detect descendants whose generated predictions exactly reproduce a parent."""
+        """Detect nodes whose measured predictions reproduce an earlier node."""
         base_node_id = (node.config or {}).get("base_node_id")
-        if not base_node_id:
-            return None
-        parent_dir = self.run_root / base_node_id
-        pairs = (
-            (parent_dir / "oof_predictions.csv", node_dir / "oof_predictions.csv", "OOF"),
-            (
-                parent_dir / "submission" / "submission.csv",
-                node_dir / "submission" / "submission.csv",
-                "submission",
-            ),
+        candidate_ids = []
+        if base_node_id:
+            candidate_ids.append(str(base_node_id))
+        candidate_ids.extend(
+            node_id
+            for node_id, state in getattr(self, "all_nodes", {}).items()
+            if node_id not in {node.node_id, base_node_id, "root"}
+            and state.node_type == "implementation"
+            and state.result
+            and state.result.get("status") == "completed"
         )
-        matches = [
-            label
-            for parent_path, child_path, label in pairs
-            if self._sha256_file(parent_path)
-            and self._sha256_file(parent_path) == self._sha256_file(child_path)
-        ]
-        if "OOF" in matches and "submission" in matches:
-            return "child OOF predictions and submission are byte-identical to the measured parent"
+        candidate_ids = list(dict.fromkeys(candidate_ids))
+        child_oof = node_dir / "oof_predictions.csv"
+        child_hash = self._sha256_file(child_oof)
+        for candidate_id in candidate_ids:
+            candidate_oof = (
+                self.run_root / candidate_id / "oof_predictions.csv"
+            )
+            candidate_hash = self._sha256_file(candidate_oof)
+            if child_hash and child_hash == candidate_hash:
+                return (
+                    "OOF predictions are byte-identical to measured node "
+                    f"{candidate_id}"
+                )
         try:
             import numpy as np
             import pandas as pd
+            from evaluation.prediction_io import legacy_prediction_payload
 
-            def same_predictions(parent_path: Path, child_path: Path) -> bool:
-                if not parent_path.is_file() or not child_path.is_file():
+            def same_oof(reference_path: Path, measured_path: Path) -> bool:
+                if not reference_path.is_file() or not measured_path.is_file():
                     return False
-                parent_frame, child_frame = pd.read_csv(parent_path), pd.read_csv(child_path)
-                if list(parent_frame.columns) != list(child_frame.columns) or len(parent_frame) != len(child_frame):
+                reference = pd.read_csv(reference_path)
+                measured = pd.read_csv(measured_path)
+                if (
+                    "row_id" not in reference
+                    or "row_id" not in measured
+                    or reference["row_id"].duplicated().any()
+                    or measured["row_id"].duplicated().any()
+                ):
                     return False
-                id_column = parent_frame.columns[0]
-                if set(parent_frame[id_column]) != set(child_frame[id_column]):
+                if set(reference["row_id"]) != set(measured["row_id"]):
                     return False
-                prediction_columns = list(parent_frame.columns[1:])
-                left = parent_frame.set_index(id_column).sort_index()[prediction_columns]
-                right = child_frame.set_index(id_column).sort_index()[prediction_columns]
+                left = reference.set_index("row_id").sort_index().reset_index()
+                right = measured.set_index("row_id").sort_index().reset_index()
+                left_values, left_classes = legacy_prediction_payload(left)
+                right_values, right_classes = legacy_prediction_payload(right)
                 return bool(
+                    left_classes == right_classes
+                    and np.asarray(left_values).shape
+                    == np.asarray(right_values).shape
+                    and
                     np.allclose(
-                        left.to_numpy(dtype=float),
-                        right.to_numpy(dtype=float),
+                        np.asarray(left_values, dtype=float),
+                        np.asarray(right_values, dtype=float),
                         rtol=1e-12,
                         atol=1e-12,
                     )
                 )
 
-            if all(same_predictions(parent_path, child_path) for parent_path, child_path, _ in pairs):
-                return "child OOF predictions and submission are numerically identical to the measured parent"
+            for candidate_id in candidate_ids:
+                if same_oof(
+                    self.run_root / candidate_id / "oof_predictions.csv",
+                    child_oof,
+                ):
+                    return (
+                        "OOF predictions are numerically identical to measured "
+                        f"node {candidate_id}"
+                    )
         except Exception:
             pass
         return None
@@ -626,42 +663,35 @@ class ManagerAgent:
         node_dir.mkdir(parents=True, exist_ok=True)
         with open(node_dir / "node_state.json", "w", encoding="utf-8") as f:
             json.dump(self._node_payload(node), f, indent=2, default=str)
-        if node.node_type == "technique":
-            with open(node_dir / "technique_plan.md", "w", encoding="utf-8") as f:
-                f.write((node.plan or "") + "\n")
-        technique_record = (node.config or {}).get("technique_record")
-        if technique_record:
-            raw_outline = technique_record.get("raw_outline")
-            if raw_outline:
-                (node_dir / "raw_outline.md").write_text(
-                    str(raw_outline), encoding="utf-8"
-                )
-            with open(node_dir / "technique_record.json", "w", encoding="utf-8") as f:
-                persisted_record = self._compact_technique_record(technique_record)
-                if raw_outline:
-                    persisted_record["raw_outline_path"] = "raw_outline.md"
-                json.dump(
-                    persisted_record,
-                    f,
-                    indent=2,
-                    default=str,
-                )
+        # tree_state.json is the canonical graph snapshot and node_state.json is
+        # the compact crash-recovery shard. Separate technique_plan,
+        # technique_record, and raw_outline files duplicated the same payload
+        # without adding recovery information.
 
     def _persist_tree_state(self) -> None:
         """Write the canonical tree used to generate method_tree.png."""
         payload = {
             "task_name": self.task_name,
             "metric_direction": self.metric_direction,
-            "metric_name": getattr(self, "metric_name", "score"),
-            "baseline_score": self.baseline_score,
+            "metric_name": self._resolved_metric_name(),
             "budget": self.total_budget,
-            "budget_unit": "executed_implementation_experiment",
+            "budget_unit": "completed_evaluation_experiment",
             "initial_fanout": getattr(self, "initial_fanout", None),
             "ucb_eligible_budget": max(
                 0, self.total_budget - getattr(self, "initial_fanout", 0)
             ),
             "experiments_executed": getattr(self, "experiments_executed", 0),
+            "implementation_attempts": getattr(
+                self, "implementation_attempts", 0
+            ),
             "max_fine_tune_rounds": getattr(self, "max_fine_tune_rounds", 2),
+            "best_node_id": getattr(self, "best_node_id", None),
+            "final_submission_status": getattr(
+                self, "final_submission_status", "not_attempted"
+            ),
+            "final_submission_validation": getattr(
+                self, "final_submission_validation", None
+            ),
             "provenance_graph": "provenance_graph.json",
             "execution_graph": "single_parent_tree",
             "merge_operator": "merge_ensemble",
@@ -681,45 +711,6 @@ class ManagerAgent:
         }
         with open(self.run_root / "tree_state.json", "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2, default=str)
-
-    def initialize_task(self, temperature: float = 0.2):
-        """
-        Generate fresh baseline assets under ``runs/<task>/baseline``.
-
-        The task directory is an immutable input boundary: task descriptions,
-        configuration, and datasets are read from it but never changed.
-        """
-        print(f"ManagerAgent: Dynamically generating initial task baselines for {self.task_name}...")
-        
-        self.baseline_dir.mkdir(parents=True, exist_ok=True)
-        loader_path = self.baseline_dir / "initial_dataloader.py"
-        algo_path = self.baseline_dir / "initial_algorithm.py"
-
-        original_files = {
-            path: path.read_bytes() for path in (loader_path, algo_path) if path.exists()
-        }
-        try:
-            for path in (loader_path, algo_path):
-                if path.exists() or path.is_symlink():
-                    path.unlink()
-
-            initial_agent = InitialAgent(model_name=self.model_name)
-            initial_agent.generate_initial_code(
-                self.task_dir,
-                self.baseline_dir,
-                temperature=temperature,
-                fidelity=self.baseline_fidelity,
-            )
-            if not loader_path.is_file() or not algo_path.is_file():
-                raise RuntimeError("InitialAgent did not produce both required baseline files")
-        except Exception:
-            for path in (loader_path, algo_path):
-                if path.exists() or path.is_symlink():
-                    path.unlink()
-                if path in original_files:
-                    path.write_bytes(original_files[path])
-            raise
-        print("ManagerAgent: Baseline generated successfully!")
 
     def _feasibility_reason(
         self, model_card: dict | None, check_accelerator: bool = True
@@ -755,9 +746,34 @@ class ManagerAgent:
     def _operator_compatibility_reason(
         model_card: dict | None, operator: str | None
     ) -> str | None:
-        if not model_card or not operator or operator in {"initial", "promote"}:
+        if not model_card or not operator:
             return None
         capabilities = model_card.get("capabilities")
+        interface = model_card.get("interface", {})
+        interface_text = json.dumps(interface, default=str).lower()
+        description = str(model_card.get("description", "")).lower()
+        if (
+            ("oof" in interface_text or "out-of-fold" in description)
+            and (
+                not isinstance(capabilities, dict)
+                or capabilities.get("accepts_harness_fold_ids") is not True
+            )
+        ):
+            return (
+                "OOF-producing artifact cannot accept harness fold_ids; "
+                "its internal split would invalidate evaluation"
+            )
+        if (
+            ("oof" in interface_text or "out-of-fold" in description)
+            and isinstance(capabilities, dict)
+            and capabilities.get("refits_full_training_data") is not True
+        ):
+            return (
+                "OOF-producing artifact does not declare a full-training "
+                "refit for final predictions"
+            )
+        if operator in {"root", "promote"}:
+            return None
         if not isinstance(capabilities, dict):
             return None  # legacy cards remain usable; no-effect detection is the backstop
         supported = capabilities.get("supported_operators")
@@ -769,11 +785,26 @@ class ManagerAgent:
 
     def run_tree_search(self) -> str:
         """
-        Runs the budget-scaled tree search on the task.
-        Returns the best leaf node ID.
-        Note: initialize_task() must be called by the caller before this method.
+        Run the budget-scaled method tree directly on the task.
+
+        Task profiling and data-loader scaffolding are prepared before root
+        branches; no preliminary model is generated or executed.
         """
         self._prepare_run_root()
+        TaskAnalyzer().analyze(
+            self.task_dir,
+            output_dir=self.run_root,
+            include_index=True,
+        )
+        (self.run_root / "task_dataloader.py").write_text(
+            task_loader_source(), encoding="utf-8"
+        )
+        write_runtime_data_contract(
+            self.run_root / "dataset_index.jsonl",
+            self.run_root / "runtime_data_contract.json",
+            task_spec_path=self.run_root / "resolved_task_spec.json",
+            task_dir=self.task_dir,
+        )
         self._ensure_search_services()
         self._scheduled_merge_pairs.clear()
         print(f"\n==========================================")
@@ -797,7 +828,10 @@ class ManagerAgent:
         # If ideation fails, stop clearly instead of silently biasing the run with canned defaults.
         self.initial_fanout = self._initial_fanout_for_budget(self.total_budget)
         self.scheduler.set_warmup_budget(self.initial_fanout)
-        candidate_count = min(3, self.total_budget)
+        # Keep a pre-generated recovery plan even for a one-experiment search.
+        candidate_count = self._initial_candidate_count_for_budget(
+            self.total_budget
+        )
         dynamic_approaches = self.technique_agent.generate_initial_approaches(
             self.task_description, count=candidate_count
         )
@@ -820,11 +854,14 @@ class ManagerAgent:
 
         # Load L1 index for the technique agents
         l1_path = self.project_root / "memory_pool" / "l1_index.json"
-        with open(l1_path, 'r', encoding='utf-8') as f:
-            l1_index = json.load(f)
+        if self.enable_executable_artifacts:
+            with open(l1_path, 'r', encoding='utf-8') as f:
+                l1_index = json.load(f)
+        else:
+            l1_index = {}
             
-        # 3. Main search loop. Planning/technique resolution does not consume the
-        # experiment budget; only an attempted implementation run does.
+        # 3. Main search loop. Planning and broken generated scripts do not
+        # consume scientific budget; completed evaluation runs do.
         action_count = 0
         action_guard = self.total_budget * 8 + 16
         while self.experiments_executed < self.total_budget:
@@ -877,8 +914,14 @@ class ManagerAgent:
                     "diagnostics": f"Node exception: {e}",
                 }
                 if node.node_type == "implementation":
-                    self.experiments_executed += 1
                     self.scheduler.backpropagate(selected_id, -1.0, self.all_nodes)
+                    if node.operator == "root":
+                        replacement_id = self._promote_backup_approach(root_id)
+                        if replacement_id:
+                            print(
+                                "ManagerAgent: Promoted a backup approach after "
+                                "a pre-execution implementation failure."
+                            )
                 self._persist_node(selected_id)
                 self._persist_tree_state()
                 continue
@@ -915,12 +958,14 @@ class ManagerAgent:
                         best_node_id = nid
                     
         if best_node_id:
+            self.best_node_id = best_node_id
             print(
                 f"\nManagerAgent: Search finished after {self.experiments_executed} experiments. "
                 f"Best Node: {best_node_id} (Score: {best_score:.5f}, "
                 f"Fidelity: {self.all_nodes[best_node_id].fidelity})"
             )
         else:
+            self.best_node_id = None
             print(f"\nManagerAgent: Tree Search finished! No successful implementation nodes found.")
             
         # Save final method tree image
@@ -950,16 +995,6 @@ class ManagerAgent:
             else score + uncertainty
         )
 
-    def _beats_baseline(self, score: float, cv_std: float = 0.0) -> bool:
-        if self.baseline_score is None or score is None:
-            return False
-        conservative = self._conservative_score(score, cv_std)
-        return (
-            conservative > self.baseline_score
-            if self.metric_direction == "maximize"
-            else conservative < self.baseline_score
-        )
-
     def _improves_on_score(
         self, score: float, comparison_score: float, cv_std: float = 0.0
     ) -> bool:
@@ -971,30 +1006,36 @@ class ManagerAgent:
         )
 
     def _score_to_reward(self, score: float, cv_std: float = 0.0) -> float:
-        """Normalize a conservative, uncertainty-discounted metric around baseline."""
+        """Map the task metric monotonically into a bounded scheduler reward."""
         conservative_score = self._conservative_score(score, cv_std)
-        if self.baseline_score is None:
-            reward = (
-                conservative_score
-                if self.metric_direction == "maximize"
-                else -conservative_score
+        oriented = (
+            conservative_score
+            if self.metric_direction == "maximize"
+            else -conservative_score
+        )
+        return oriented / (1.0 + abs(oriented))
+
+    def _relative_improvement(
+        self, score: float, reference_score: float
+    ) -> float:
+        """Normalize a candidate's change from a measured parent/reference."""
+        score = float(score)
+        reference_score = float(reference_score)
+        if (
+            self.metric_direction == "maximize"
+            and 0.0 <= reference_score < 1.0
+            and 0.0 <= score <= 1.0
+        ):
+            return (score - reference_score) / max(
+                1.0 - reference_score, 1e-12
             )
-        elif self.metric_direction == "maximize":
-            # For bounded scores such as AUC, use relative error reduction. Fall
-            # back to baseline-relative change for unbounded metrics.
-            if 0.0 <= self.baseline_score < 1.0 and 0.0 <= conservative_score <= 1.0:
-                reward = (conservative_score - self.baseline_score) / max(
-                    1.0 - self.baseline_score, 1e-12
-                )
-            else:
-                reward = (conservative_score - self.baseline_score) / max(
-                    abs(self.baseline_score), 1e-12
-                )
-        else:
-            reward = (self.baseline_score - conservative_score) / max(
-                abs(self.baseline_score), 1e-12
+        if self.metric_direction == "maximize":
+            return (score - reference_score) / max(
+                abs(reference_score), 1e-12
             )
-        return max(-1.0, min(1.0, reward))
+        return (reference_score - score) / max(
+            abs(reference_score), 1e-12
+        )
 
     @staticmethod
     def _next_fidelity(fidelity: str) -> str:
@@ -1002,36 +1043,31 @@ class ManagerAgent:
             fidelity, "full"
         )
 
-    def _baseline_result_record(self) -> dict | None:
-        """Load fold-level baseline evidence when the harness persisted it."""
-        if self.baseline_score is None:
+    def _reference_result_for_node(self, node: NodeState) -> dict | None:
+        """Return a measured parent or the strongest comparable prior method."""
+        base_node_id = (node.config or {}).get("base_node_id")
+        parent = self.all_nodes.get(base_node_id)
+        if (
+            parent is not None
+            and parent.result
+            and parent.result.get("score") is not None
+            and parent.result.get("status") == "completed"
+        ):
+            return parent.result
+        candidates = [
+            state.result
+            for state in self.all_nodes.values()
+            if state.node_id != node.node_id
+            and state.node_type == "implementation"
+            and state.fidelity == node.fidelity
+            and state.result
+            and state.result.get("score") is not None
+            and state.result.get("status") == "completed"
+        ]
+        if not candidates:
             return None
-        record: dict[str, Any] = {"score": float(self.baseline_score)}
-        baseline_dir = getattr(
-            self, "baseline_dir", Path(self.run_root) / "baseline"
-        )
-        result_path = Path(baseline_dir) / "result.json"
-        if not result_path.is_file():
-            return record
-        try:
-            payload = json.loads(result_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return record
-        validation = {
-            key: payload.get(key)
-            for key in (
-                "cv_mean",
-                "cv_std",
-                "folds",
-                "fold_scores",
-                "fidelity",
-                "fold_assignment_sha256",
-            )
-            if payload.get(key) is not None
-        }
-        if validation:
-            record["validation"] = validation
-        return record
+        selector = max if self.metric_direction == "maximize" else min
+        return selector(candidates, key=lambda item: float(item["score"]))
 
     def _evidence_for_result(
         self, node: NodeState, reference: dict | None = None
@@ -1040,7 +1076,7 @@ class ManagerAgent:
         candidate = node.result or {}
         if candidate.get("score") is None:
             return None
-        reference = reference or self._baseline_result_record()
+        reference = reference or self._reference_result_for_node(node)
         if not reference or reference.get("score") is None:
             return None
         try:
@@ -1080,6 +1116,12 @@ class ManagerAgent:
         score = node.result.get("score")
         if score is None:
             return
+        parent_score = context.get("parent_score")
+        relative_improvement = (
+            self._relative_improvement(score, parent_score)
+            if parent_score is not None
+            else 0.0
+        )
         self.tuning_coordinator.record(
             trial_id=node.node_id,
             task_name=self.task_name,
@@ -1091,8 +1133,8 @@ class ManagerAgent:
             ),
             parameters=parameters,
             score=float(score),
-            normalized_improvement=self._score_to_reward(float(score), 0.0),
-            metric_name=getattr(self, "metric_name", "score"),
+            normalized_improvement=relative_improvement,
+            metric_name=self._resolved_metric_name(),
             metric_direction=self.metric_direction,
             fidelity=node.fidelity,
             dataset_fingerprint=validation.get("fold_assignment_sha256"),
@@ -1153,6 +1195,12 @@ class ManagerAgent:
                     "fidelity": node.fidelity,
                     "score": node.result.get("score"),
                     "oof_path": node.result.get("oof_path"),
+                    "validation_path": node.result.get(
+                        "validation_path"
+                    ),
+                    "evaluation_mode": node.result.get(
+                        "evaluation_mode"
+                    ),
                     "prediction_bundle": node.result.get(
                         "prediction_bundle"
                     ),
@@ -1179,6 +1227,7 @@ class ManagerAgent:
             evidence is None
             or self.experiments_executed + 1 >= self.total_budget
             or getattr(self, "task_type", None) == "unsupervised_clustering"
+            or not (node.result or {}).get("oof_path")
         ):
             return
         self._ensure_search_services()
@@ -1187,7 +1236,7 @@ class ManagerAgent:
             node_fidelity=node.fidelity,
             all_nodes=self.all_nodes,
             run_root=Path(self.run_root),
-            metric_name=getattr(self, "metric_name", "score"),
+            metric_name=self._resolved_metric_name(),
             evidence=evidence,
             excluded_pairs=self._scheduled_merge_pairs,
             strategy=getattr(self, "ensemble_strategy", "auto"),
@@ -1252,6 +1301,13 @@ class ManagerAgent:
             "pool_hit", "pool_added"
         }:
             return
+        node = self.all_nodes.get(node_id)
+        reference = (
+            self._reference_result_for_node(node) if node is not None else None
+        )
+        reference_score = (
+            reference.get("score") if reference is not None else None
+        )
         L2Builder(
             project_root=self.project_root,
             model_name=self.model_name,
@@ -1268,13 +1324,14 @@ class ManagerAgent:
                 "reward": reward,
                 "fidelity": fidelity,
                 "elapsed_seconds": elapsed_seconds,
-                "improved_over_baseline": (
+                "reference_score": reference_score,
+                "improved_over_reference": (
                     None
-                    if score is None or self.baseline_score is None
+                    if score is None or reference_score is None
                     else (
-                        score > self.baseline_score
+                        score > reference_score
                         if self.metric_direction == "maximize"
-                        else score < self.baseline_score
+                        else score < reference_score
                     )
                 ),
             },
@@ -1316,11 +1373,11 @@ class ManagerAgent:
         fallback["status"] = "dependency_fallback"
         fallback["plan"] = (
             "The selected optional artifact could not be installed. Implement a "
-            "dependency-light, self-contained equivalent using only libraries that "
+            "dependency-light, self-contained equivalent of the INTENDED model family/architecture using only libraries that "
             "are already importable in the selected interpreter. Do not import the "
             f"unavailable artifact {artifact_id or '<unknown>'!r} or any of its "
-            f"unavailable dependencies {card.get('dependencies', [])!r}. Preserve the "
-            f"original branch intent: {original_plan}"
+            f"unavailable dependencies {card.get('dependencies', [])!r}. Do NOT revert to or re-execute an already executed "
+            f"parent model architecture. Preserve the original branch intent: {original_plan}"
         )
         return fallback
 
@@ -1438,7 +1495,7 @@ class ManagerAgent:
                     task_name=self.task_name,
                     model_family=model_family,
                     tunable_parameters=tunable_parameters,
-                    metric_name=getattr(self, "metric_name", "score"),
+                    metric_name=self._resolved_metric_name(),
                     metric_direction=self.metric_direction,
                     dataset_fingerprint=validation.get(
                         "fold_assignment_sha256"
@@ -1452,12 +1509,18 @@ class ManagerAgent:
                     "trigger": "posterior_material_improvement",
                     "parent_node_id": node_id,
                     "parent_score": score,
-                    "parent_cv_std": validation.get("cv_std", 0.0),
-                    "baseline_score": self.baseline_score,
+                    "parent_cv_std": validation.get(
+                        "score_std", validation.get("cv_std", 0.0)
+                    ),
                     "metric_direction": self.metric_direction,
                     "comparison_fidelity": node.fidelity,
                     "fine_tune_round": fine_tune_depth + 1,
                     "artifact_variant": artifact_variant,
+                    "evaluation_mode": (
+                        None
+                        if operator == "diversify"
+                        else (node.result or {}).get("evaluation_mode")
+                    ),
                     "tunable_parameters_declared": tunable_parameters_declared,
                     "tunable_parameters": tunable_parameters,
                     "model_family": model_family,
@@ -1492,6 +1555,11 @@ class ManagerAgent:
                         fine_tune_depth + 1 if is_fine_tune else fine_tune_depth
                     ),
                     "tuning_context": tuning_context,
+                    "evaluation_mode": (
+                        None
+                        if operator == "diversify"
+                        else (node.result or {}).get("evaluation_mode")
+                    ),
                     "policy_evidence": (
                         evidence.to_dict() if evidence is not None else None
                     ),
@@ -1531,7 +1599,6 @@ class ManagerAgent:
                         "node_id": new_id,
                         "parent_node_id": node_id,
                         "parent_score": score,
-                        "baseline_score": self.baseline_score,
                         "fine_tune_round": fine_tune_depth + 1,
                         "reused_trial_count": len(
                             (tuning_context or {}).get("reused_trials", [])
@@ -1567,7 +1634,7 @@ class ManagerAgent:
                 "and apply early stopping. Trigger context: "
                 + json.dumps(context, default=str)
             )
-            config["proposal_name"] = "baseline_winner_fine_tune"
+            config["proposal_name"] = "measured_parent_fine_tune"
             config["materialized"] = True
             node.config = config
             self._persist_node(node.node_id)
@@ -1639,7 +1706,7 @@ class ManagerAgent:
             Path(self.run_root),
             source_node_ids,
             node_dir,
-            metric_name=getattr(self, "metric_name", "score"),
+            metric_name=self._resolved_metric_name(),
             strategy=(node.config or {}).get("requested_strategy", "auto"),
         )
         if res is None:
@@ -1765,8 +1832,11 @@ class ManagerAgent:
                     )
             else:
                 # Pool additions from earlier nodes in this same run must be visible.
-                with open(l1_path, 'r', encoding='utf-8') as f:
-                    l1_index = json.load(f)
+                if self.enable_executable_artifacts:
+                    with open(l1_path, 'r', encoding='utf-8') as f:
+                        l1_index = json.load(f)
+                else:
+                    l1_index = {}
 
                 context = self.global_memory.get_default_context(
                     selected_id, self.all_nodes
@@ -1789,6 +1859,9 @@ class ManagerAgent:
                             )
                         ),
                         task_spec=self.task_spec.to_dict(),
+                        enable_executable_artifacts=(
+                            self.enable_executable_artifacts
+                        ),
                     )
                 except Exception as exc:
                     # Planning is not an experiment. Preserve the branch intent and
@@ -1898,10 +1971,10 @@ class ManagerAgent:
                     tech_record["plan"] = f"Import and use local bootstrapped artifact {artifact_id} from category {category}."
                     tech_record["status"] = "local_verified"
 
-                    # A verified reusable method belongs in the memory pool even
-                    # before it beats this task's baseline. Task performance is
+                    # A verified reusable method belongs in the memory pool before
+                    # task-specific performance is known. Evaluation evidence is
                     # recorded separately after implementation.
-                    use_pool = os.environ.get("ABLATION_USE_POOL", "1") != "0"
+                    use_pool = os.environ.get("METHOD_TREE_USE_POOL", "1") != "0"
                     if use_pool:
                         committed = builder.commit_artifact(
                             category=category,
@@ -1934,11 +2007,9 @@ class ManagerAgent:
                         "preserved it in the node directory and will use a self-contained fallback."
                     )
 
+            # Failed candidates are diagnostic records only. They must not
+            # constrain the self-contained recovery implementation.
             feasibility_card = tech_record.get("model_card")
-            if not feasibility_card:
-                feasibility_card = (
-                    tech_record.get("candidate_artifact", {}).get("model_card")
-                )
             # Accelerator libraries may not exist until dependency setup runs.
             # Check static RAM constraints now and accelerator feasibility
             # after installing into and re-probing the selected interpreter.
@@ -2007,7 +2078,6 @@ class ManagerAgent:
             
             # Install dependencies via Setup Agent
             model_card = tech_record.get("model_card")
-            candidate_card = None
             try:
                 requirements_file = self.project_root / "requirements.txt"
                 if model_card:
@@ -2018,14 +2088,6 @@ class ManagerAgent:
                     self.setup_agent.install_allowlisted_dependencies(
                         [model_card], requirements_file
                     )
-                else:
-                    candidate_card = (
-                        tech_record.get("candidate_artifact", {}).get("model_card")
-                    )
-                    if candidate_card and candidate_card.get("dependencies"):
-                        self.setup_agent.install_allowlisted_dependencies(
-                            [candidate_card], requirements_file
-                        )
             except Exception as exc:
                 if node.operator in {"tune", "promote"} or (
                     node.config or {}
@@ -2065,7 +2127,6 @@ class ManagerAgent:
                 node.config["technique_record"] = tech_record
                 node.config["artifact_variant"] = None
                 model_card = None
-                candidate_card = None
                 self._trace_search(
                     {
                         "event": "dependency_fallback",
@@ -2089,8 +2150,7 @@ class ManagerAgent:
             # node device, then apply accelerator-only feasibility without charging
             # the experiment budget on failure.
             self._refresh_accelerator_state()
-            post_setup_card = model_card or candidate_card
-            accelerator_reason = self._feasibility_reason(post_setup_card)
+            accelerator_reason = self._feasibility_reason(model_card)
             if accelerator_reason:
                 node.executed = True
                 node.result = {
@@ -2117,12 +2177,23 @@ class ManagerAgent:
             # Run implementation script in its own run folder
             node_dir = self.run_root / selected_id
             node_dir.mkdir(parents=True, exist_ok=True)
+            self.implementation_attempts = (
+                getattr(self, "implementation_attempts", 0) + 1
+            )
+            self._trace_search(
+                {
+                    "event": "implementation_attempt_started",
+                    "node_id": selected_id,
+                    "implementation_attempt": self.implementation_attempts,
+                    "fidelity": node.fidelity,
+                }
+            )
             
             res = self.implementation_agent.run(
                 node_dir,
                 tech_record,
                 self.task_dir,
-                baseline_dir=self.baseline_dir,
+                task_assets_dir=self.run_root,
                 stall_seconds=self.progress_stall_seconds,
                 metric_direction=self.metric_direction,
                 base_algorithm_path=(node.config or {}).get("base_code_path"),
@@ -2139,6 +2210,9 @@ class ManagerAgent:
                 tuning_context=(node.config or {}).get("tuning_context"),
                 max_debug_attempts=getattr(self, "max_debug_attempts", 3),
                 metric_name=self.metric_name,
+                evaluation_mode=(node.config or {}).get(
+                    "evaluation_mode"
+                ),
             )
             
             # Bug 1 fix: Handle execution failures properly
@@ -2160,7 +2234,13 @@ class ManagerAgent:
             # Record result to NodeState
             node.code = res.get("code_path")
             validation = res.get("validation", {})
-            cv_std = validation.get("cv_std", 0.0) if validation else 0.0
+            cv_std = (
+                validation.get(
+                    "score_std", validation.get("cv_std", 0.0)
+                )
+                if validation
+                else 0.0
+            )
             raw_reward = (
                 self._score_to_reward(score, 0.0) if score is not None else -1.0
             )
@@ -2180,6 +2260,13 @@ class ManagerAgent:
                 ),
                 "validation": validation,
                 "oof_path": res.get("oof_path"),
+                "validation_path": res.get("validation_path"),
+                "evaluation_mode": res.get("evaluation_mode"),
+                "evaluation_policy": res.get("evaluation_policy"),
+                "error_analysis": res.get("error_analysis"),
+                "error_analysis_path": res.get("error_analysis_path"),
+                "duplicate_of": res.get("duplicate_of"),
+                "code_fingerprint": res.get("code_fingerprint"),
                 "prediction_bundle": res.get("prediction_bundle"),
                 "model_bundle": res.get("model_bundle"),
                 "compatibility_key": res.get("compatibility_key"),
@@ -2191,6 +2278,39 @@ class ManagerAgent:
                 ),
             }
             node.executed = True
+
+            if status == "skipped_duplicate_pre_execution":
+                self.scheduler.backpropagate(
+                    selected_id, -1.0, self.all_nodes
+                )
+                self.global_memory.record_implementation(
+                    selected_id,
+                    {
+                        "node_id": selected_id,
+                        "duplicate_of": res.get("duplicate_of"),
+                        "code_fingerprint": res.get("code_fingerprint"),
+                    },
+                    0.0,
+                    status,
+                )
+                self._trace_search(
+                    {
+                        "event": "duplicate_pruned_pre_execution",
+                        "node_id": selected_id,
+                        "duplicate_of": res.get("duplicate_of"),
+                        "code_fingerprint": res.get("code_fingerprint"),
+                    }
+                )
+                if node.operator == "root":
+                    self._promote_backup_approach(root_id)
+                self._persist_node(selected_id)
+                self._persist_tree_state()
+                print(
+                    "ManagerAgent: Pruned duplicate implementation "
+                    f"{selected_id} before training; matches "
+                    f"{res.get('duplicate_of')}."
+                )
+                return False
             
             if status == "failed":
                 print(f"ManagerAgent: Implementation Node {selected_id} FAILED. No score produced.")
@@ -2207,7 +2327,7 @@ class ManagerAgent:
                 self.global_memory.record_implementation(selected_id, {"node_id": selected_id}, 0.0, "failed")
                 # Backpropagate zero reward
                 self.scheduler.backpropagate(selected_id, -1.0, self.all_nodes)
-                if node.operator == "initial":
+                if node.operator == "root":
                     replacement_id = self._promote_backup_approach(root_id)
                     if replacement_id:
                         print(
@@ -2217,7 +2337,10 @@ class ManagerAgent:
                 self._persist_node(selected_id)
                 self._persist_tree_state()
                 # Do NOT spawn follow-up technique nodes from failed implementations
-                return True
+                # Broken generated code is a technical failure, not a completed
+                # scientific experiment. A finite backup list plus action_guard
+                # bounds recovery without consuming the user's search budget.
+                return False
 
             no_effect_reason = self._no_effect_reason(node, node_dir)
             deduplicated_outputs = self._deduplicate_node_outputs(node, node_dir)
@@ -2325,23 +2448,32 @@ class ManagerAgent:
             return True
 
     def generate_final_submission(self, best_node_id: str):
-        """
-        Locates the submission file of the best node, aligns it with the sample_submission.csv 
-        in the task directory, and saves the final submission inside the run.
-        """
-        if not best_node_id:
-            print("ManagerAgent: No best node found to generate final submission.")
+        """Validate, optionally ensemble, and persist the final submission."""
+        self.best_node_id = best_node_id or None
+        self.final_submission_status = "failed"
+        self.final_submission_validation = None
+
+        def fail(message: str) -> bool:
+            print(message)
+            self.final_submission_status = "failed"
+            try:
+                self._persist_tree_state()
+            except Exception:
+                pass
             return False
-            
-        import pandas as pd
-        
+
+        if not best_node_id:
+            return fail(
+                "ManagerAgent: No best node found to generate final submission."
+            )
+
         best_node_dir = self.run_root / best_node_id
         generated_sub_path = best_node_dir / "submission" / "submission.csv"
-        sample_sub_path = self.task_dir / "sample_submission.csv"
-        
         if not generated_sub_path.exists():
-            print(f"ManagerAgent WARNING: Generated submission file not found at {generated_sub_path}")
-            return False
+            return fail(
+                "ManagerAgent WARNING: Generated submission file not found at "
+                f"{generated_sub_path}"
+            )
 
         # Ensemble only candidates evaluated at the same fidelity as the selected
         # best node. This avoids mixing cheap screening predictions with full runs.
@@ -2382,73 +2514,59 @@ class ManagerAgent:
             )
             with open(self.run_root / "ensemble_manifest.json", "w", encoding="utf-8") as f:
                 json.dump(ensemble_manifest, f, indent=2)
-            
+
         # The task directory is read-only; final predictions belong to the run.
         run_output_path = self.run_root / "submission.csv"
-        
-        if sample_sub_path.exists():
-            print(f"ManagerAgent: Formatting final submission based on sample submission: {sample_sub_path.name}")
-            try:
-                sample_df = pd.read_csv(sample_sub_path)
-                generated_df = pd.read_csv(generated_sub_path)
-                if sample_df.empty or generated_df.empty:
-                    raise ValueError("submission files must not be empty")
-                
-                id_col = sample_df.columns[0]
-                prediction_cols = list(sample_df.columns[1:])
-                if not prediction_cols:
-                    raise ValueError("sample submission has no prediction columns")
-                if sample_df[id_col].duplicated().any():
-                    raise ValueError(f"sample submission contains duplicate {id_col!r} values")
-                missing_prediction_cols = [
-                    col for col in prediction_cols if col not in generated_df.columns
-                ]
-                if missing_prediction_cols:
-                    raise ValueError(
-                        f"generated submission is missing columns: {missing_prediction_cols}"
+        task_spec = getattr(self, "task_spec", None)
+        if task_spec is None:
+            classification_metric = self.metric_name in {
+                "accuracy",
+                "balanced_accuracy",
+                "log_loss",
+                "cross_entropy",
+            } or "auc" in str(self.metric_name)
+            task_spec = {
+                "problem_type": (
+                    "classification" if classification_metric else "regression"
+                ),
+                "output": {
+                    "type": (
+                        "class_probabilities"
+                        if classification_metric
+                        else "continuous"
                     )
-                
-                if id_col in generated_df.columns:
-                    if generated_df[id_col].duplicated().any():
-                        raise ValueError(f"generated submission contains duplicate {id_col!r} values")
-                    if set(generated_df[id_col]) != set(sample_df[id_col]):
-                        raise ValueError("generated IDs do not exactly match sample submission IDs")
-                    aligned = generated_df.set_index(id_col).reindex(sample_df[id_col])
-                    final_df = sample_df[[id_col]].copy()
-                    for col in prediction_cols:
-                        final_df[col] = aligned[col].to_numpy()
-                else:
-                    if len(generated_df) != len(sample_df):
-                        raise ValueError(
-                            "generated submission has no ID column and its row count differs from the sample"
-                        )
-                    final_df = sample_df[[id_col]].copy()
-                    for col in prediction_cols:
-                        final_df[col] = generated_df[col].to_numpy()
-
-                if final_df[prediction_cols].isnull().any().any():
-                    raise ValueError("generated predictions contain missing values")
-
-                final_df.to_csv(run_output_path, index=False)
-                print(
-                    "ManagerAgent: Aligned final submission saved to "
-                    f"{run_output_path}"
-                )
-                return True
-            except Exception as e:
-                print(f"ManagerAgent ERROR: Refusing invalid final submission: {e}")
-                return False
-        else:
-            print("ManagerAgent: No sample submission found. Copying best node submission directly.")
+                },
+                "inputs": {},
+            }
+        try:
+            final_frame, validation = validate_submission_file(
+                generated_sub_path,
+                task_dir=self.task_dir,
+                task_spec=task_spec,
+                normalize_probabilities=True,
+            )
+            final_frame.to_csv(run_output_path, index=False)
+            self.final_submission_status = "completed"
+            self.final_submission_validation = {
+                **validation,
+                "source_path": str(generated_sub_path),
+                "output_path": str(run_output_path),
+                "ensemble_node_ids": selected_ensemble_nodes,
+            }
             try:
-                generated_df = pd.read_csv(generated_sub_path)
-                if generated_df.empty or generated_df.isnull().any().any():
-                    raise ValueError("generated submission is empty or contains missing values")
-                generated_df.to_csv(run_output_path, index=False)
-                return True
-            except Exception as e:
-                print(f"ManagerAgent ERROR: Refusing invalid final submission: {e}")
-                return False
+                self._persist_tree_state()
+            except Exception:
+                pass
+            print(
+                "ManagerAgent: Validated final submission saved to "
+                f"{run_output_path}"
+            )
+            return True
+        except Exception as exc:
+            return fail(
+                "ManagerAgent ERROR: Refusing invalid final submission: "
+                f"{exc}"
+            )
 
     def save_tree_image(self, output_path: Path):
         """
@@ -2516,17 +2634,17 @@ class ManagerAgent:
                     artifact_id = tech_record.get("artifact_id")
                     if artifact_id:
                         desc = (
-                            f"{node.operator or 'initial'} / {node.fidelity}\n"
+                            f"{node.operator or 'root'} / {node.fidelity}\n"
                             f"Use: {artifact_id}\nScore: {score:.5f}"
                         )
                     elif tech_record.get("status") == "bootstrap_failed":
                         desc = (
-                            f"{node.operator or 'initial'} / {node.fidelity}\n"
+                            f"{node.operator or 'root'} / {node.fidelity}\n"
                             f"Use: Self-contained fallback\nScore: {score:.5f}"
                         )
                     else:
                         desc = (
-                            f"{node.operator or 'initial'} / {node.fidelity}\n"
+                            f"{node.operator or 'root'} / {node.fidelity}\n"
                             f"Score: {score:.5f}"
                         )
                     color, border = "#E8F5E9", "#2E7D32"

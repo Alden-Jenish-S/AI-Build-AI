@@ -9,7 +9,11 @@ from pathlib import Path
 from typing import List, Dict, Optional
 from core.runtime_contracts import EnsembleBundle, PredictionBundle, SplitPlan
 from evaluation.metrics import metric_value, normalized_metric_value
-from evaluation.prediction_io import write_prediction_bundle
+from evaluation.prediction_io import (
+    legacy_prediction_payload,
+    write_legacy_oof,
+    write_prediction_bundle,
+)
 
 class AggregatorAgent:
     def __init__(self):
@@ -140,26 +144,54 @@ class AggregatorAgent:
 
     @staticmethod
     def _metric_value(
-        y_true: np.ndarray, prediction: np.ndarray, metric: str
+        y_true: np.ndarray,
+        prediction: np.ndarray,
+        metric: str,
+        class_names: tuple[str, ...] = (),
     ) -> float:
         """Return a metric in its natural reporting direction."""
-        return metric_value(metric, y_true, prediction)
+        return metric_value(
+            metric,
+            y_true,
+            prediction,
+            class_names=class_names,
+        )
 
     @classmethod
     def _validation_metric(
-        cls, y_true: np.ndarray, prediction: np.ndarray, metric: str
+        cls,
+        y_true: np.ndarray,
+        prediction: np.ndarray,
+        metric: str,
+        class_names: tuple[str, ...] = (),
     ) -> float:
         """Return a higher-is-better objective for ensemble optimization."""
-        return normalized_metric_value(metric, y_true, prediction)
+        return normalized_metric_value(
+            metric,
+            y_true,
+            prediction,
+            class_names=class_names,
+        )
 
     @staticmethod
     def _rank_predictions(predictions: np.ndarray) -> np.ndarray:
-        return np.stack(
-            [
-                pd.Series(model_prediction).rank(pct=True).to_numpy()
-                for model_prediction in predictions
-            ]
-        )
+        values = np.asarray(predictions, dtype=float)
+        if values.ndim == 2:
+            return np.stack(
+                [
+                    pd.Series(model_prediction).rank(pct=True).to_numpy()
+                    for model_prediction in values
+                ]
+            )
+        if values.ndim == 3:
+            ranked = np.empty_like(values)
+            for model_index in range(values.shape[0]):
+                for class_index in range(values.shape[2]):
+                    ranked[model_index, :, class_index] = pd.Series(
+                        values[model_index, :, class_index]
+                    ).rank(pct=True).to_numpy()
+            return ranked
+        raise ValueError("rank averaging supports scalar or class-probability OOF")
 
     def _oof_plan(
         self,
@@ -175,59 +207,76 @@ class AggregatorAgent:
             if not path.is_file():
                 return None
             frame = pd.read_csv(path)
-            required = {"row_id", "target", "prediction"}
+            required = {"row_id", "target"}
             if (
                 not required.issubset(frame.columns)
                 or frame["row_id"].duplicated().any()
             ):
                 return None
             frames.append(
-                frame[["row_id", "target", "prediction"]]
-                .set_index("row_id")
-                .sort_index()
+                frame.set_index("row_id").sort_index()
             )
         if not frames or any(
             not frame.index.equals(frames[0].index) for frame in frames[1:]
         ):
             return None
-        targets = frames[0]["target"].to_numpy(dtype=float)
+        targets = frames[0]["target"].to_numpy()
         if any(
             not np.array_equal(
-                frame["target"].to_numpy(dtype=float), targets
+                frame["target"].to_numpy(), targets
             )
             for frame in frames[1:]
         ):
             return None
-        predictions = np.stack(
-            [frame["prediction"].to_numpy(dtype=float) for frame in frames]
-        )
+        try:
+            payloads = [
+                legacy_prediction_payload(frame.reset_index())
+                for frame in frames
+            ]
+            class_names = payloads[0][1]
+            if any(names != class_names for _, names in payloads[1:]):
+                return None
+            predictions = np.stack(
+                [np.asarray(values, dtype=float) for values, _ in payloads]
+            )
+        except (TypeError, ValueError):
+            return None
         if (
-            not np.isfinite(targets).all()
-            or not np.isfinite(predictions).all()
+            not np.isfinite(predictions).all()
         ):
             return None
         if strategy == "rank_average":
             predictions = self._rank_predictions(predictions)
 
+        def blend(weights: np.ndarray) -> np.ndarray:
+            return np.tensordot(weights, predictions, axes=(0, 0))
+
         try:
             single_objectives = [
-                self._validation_metric(targets, prediction, metric_name)
+                self._validation_metric(
+                    targets,
+                    prediction,
+                    metric_name,
+                    class_names,
+                )
                 for prediction in predictions
             ]
         except ValueError as exc:
             print(f"AggregatorAgent WARNING: {exc}")
             return None
         single_scores = [
-            self._metric_value(targets, prediction, metric_name)
+            self._metric_value(
+                targets, prediction, metric_name, class_names
+            )
             for prediction in predictions
         ]
         best_single_index = int(np.argmax(single_objectives))
         best_single_objective = single_objectives[best_single_index]
 
         uniform = np.full(len(frames), 1.0 / len(frames))
-        uniform_prediction = uniform @ predictions
+        uniform_prediction = blend(uniform)
         uniform_objective = self._validation_metric(
-            targets, uniform_prediction, metric_name
+            targets, uniform_prediction, metric_name, class_names
         )
         best_weights = uniform
         best_objective = uniform_objective
@@ -249,7 +298,10 @@ class AggregatorAgent:
 
                 optimized = minimize(
                     lambda candidate: -self._validation_metric(
-                        targets, candidate @ predictions, metric_name
+                        targets,
+                        blend(candidate),
+                        metric_name,
+                        class_names,
                     ),
                     x0=uniform,
                     method="SLSQP",
@@ -269,7 +321,10 @@ class AggregatorAgent:
                     candidate = np.clip(candidate, 0.0, None)
                     candidate /= candidate.sum()
                     objective = self._validation_metric(
-                        targets, candidate @ predictions, metric_name
+                        targets,
+                        blend(candidate),
+                        metric_name,
+                        class_names,
                     )
                     if objective > best_objective + 1e-12:
                         best_weights, best_objective = candidate, objective
@@ -295,19 +350,22 @@ class AggregatorAgent:
                         candidate[source] -= amount
                         candidate[target] += amount
                         objective = self._validation_metric(
-                            targets, candidate @ predictions, metric_name
+                            targets,
+                            blend(candidate),
+                            metric_name,
+                            class_names,
                         )
                         if objective > best_objective + 1e-12:
                             best_weights = candidate
                             best_objective = objective
                             improved = True
 
-        final_prediction = best_weights @ predictions
+        final_prediction = blend(best_weights)
         final_score = self._metric_value(
-            targets, final_prediction, metric_name
+            targets, final_prediction, metric_name, class_names
         )
         uniform_score = self._metric_value(
-            targets, uniform_prediction, metric_name
+            targets, uniform_prediction, metric_name, class_names
         )
         guardrail_applied = (
             uniform_objective < best_single_objective - 1e-12
@@ -330,6 +388,7 @@ class AggregatorAgent:
                 if guardrail_applied
                 else None
             ),
+            "class_names": list(class_names),
         }
 
     def _oof_weights(
@@ -409,18 +468,32 @@ class AggregatorAgent:
         reference = frames[0]
         if any(not frame.index.equals(reference.index) for frame in frames[1:]):
             return None
-        targets = reference["target"].to_numpy(dtype=float)
-        prediction_matrix = np.stack(
-            [frame["prediction"].to_numpy(dtype=float) for frame in frames]
-        )
+        targets = reference["target"].to_numpy()
+        try:
+            payloads = [
+                legacy_prediction_payload(frame.reset_index())
+                for frame in frames
+            ]
+            class_names = payloads[0][1]
+            if any(names != class_names for _, names in payloads[1:]):
+                return None
+            prediction_matrix = np.stack(
+                [np.asarray(values, dtype=float) for values, _ in payloads]
+            )
+        except (TypeError, ValueError):
+            return None
         if applied_strategy == "rank_average":
             prediction_matrix = self._rank_predictions(prediction_matrix)
-        merged_prediction = weights @ prediction_matrix
+        merged_prediction = np.tensordot(
+            weights, prediction_matrix, axes=(0, 0)
+        )
         ensemble_objective = self._validation_metric(
-            targets, merged_prediction, metric_name
+            targets, merged_prediction, metric_name, class_names
         )
         best_single_objective = max(
-            self._validation_metric(targets, prediction, metric_name)
+            self._validation_metric(
+                targets, prediction, metric_name, class_names
+            )
             for prediction in prediction_matrix
         )
         if ensemble_objective <= best_single_objective + 1e-12:
@@ -444,14 +517,14 @@ class AggregatorAgent:
                 return None
 
         destination_dir.mkdir(parents=True, exist_ok=True)
-        pd.DataFrame(
-            {
-                "row_id": reference.index.to_numpy(),
-                "target": targets,
-                "prediction": merged_prediction,
-                "fold_id": fold_ids,
-            }
-        ).to_csv(destination_dir / "oof_predictions.csv", index=False)
+        write_legacy_oof(
+            destination_dir / "oof_predictions.csv",
+            sample_ids=reference.index.to_numpy(),
+            targets=targets,
+            predictions=merged_prediction,
+            fold_ids=fold_ids,
+            class_names=class_names,
+        )
         pd.DataFrame(
             {"row_id": reference.index.to_numpy(), "fold_id": fold_ids}
         ).to_csv(destination_dir / "fold_assignments.csv", index=False)
@@ -476,6 +549,7 @@ class AggregatorAgent:
                 targets[fold_ids == fold_id],
                 merged_prediction[fold_ids == fold_id],
                 metric_name,
+                class_names,
             )
             for fold_id in sorted(np.unique(fold_ids))
         ]
@@ -519,7 +593,9 @@ class AggregatorAgent:
                 predictions=merged_prediction,
                 targets=targets,
                 fold_ids=fold_ids,
-                class_names=typed_bundles[0].class_names,
+                class_names=(
+                    class_names or typed_bundles[0].class_names
+                ),
                 metadata={
                     "operator": "merge_ensemble",
                     "source_node_ids": node_ids,
@@ -610,7 +686,7 @@ class AggregatorAgent:
         maximize: bool = True,
         top_k: int = 3,
         strategy: str = "auto",
-        metric_name: str = "score",
+        metric_name: str | None = None,
         correlation_limit: float = 0.995,
     ) -> List[str]:
         """Select strong, prediction-diverse candidates and aggregate them."""
@@ -664,12 +740,18 @@ class AggregatorAgent:
                 break
         if not selected:
             return []
-        applied_strategy = self._resolve_strategy(strategy, metric_name)
-        oof_plan = self._oof_plan(
-            run_root,
-            selected,
-            metric_name,
-            strategy=applied_strategy,
+        applied_strategy = self._resolve_strategy(
+            strategy, metric_name or ""
+        )
+        oof_plan = (
+            self._oof_plan(
+                run_root,
+                selected,
+                metric_name,
+                strategy=applied_strategy,
+            )
+            if metric_name
+            else None
         )
         if oof_plan is None:
             # Blind equal-weight blending has no evidence that it improves the

@@ -53,7 +53,6 @@ agent_system/
 │   ├── task_analyzer.py          # Registry-driven task configuration analyzer
 │   ├── data_analyzer.py          # Backward-compatible tabular analyzer facade
 │   ├── manager_agent.py          # Search orchestrator and merge builder
-│   ├── initial_agent.py          # Generates base code against DatasetBundle
 │   ├── technique_agent.py        # Retrieves techniques and designs approaches
 │   ├── implementation_agent.py   # Generates and refines executable scripts
 │   ├── aggregator_agent.py       # Blends predictions using OOF weights
@@ -70,7 +69,7 @@ agent_system/
 │       └── verification_runtime.py # Runs isolated verification tests
 │
 ├── eval/
-│   ├── run_ablation.py           # CLI entrypoint to execute budget search
+│   ├── run_search.py             # Direct method-tree search entrypoint
 │   └── evolve_harness.py         # Proposes prompt/harness improvements
 │
 ├── tests/                        # Full test suite covering all modules
@@ -106,16 +105,16 @@ agent_system/
 To launch an autonomous model search for a specific task under a target experiment budget:
 
 ```bash
-python eval/run_ablation.py playground-series-s6e2 --budget 6
+python eval/run_search.py playground-series-s6e2 --budget 6
 ```
 
 ### Output Artifacts
 Each search run generates a workspace directory structure under `runs/<task_name>/`:
-- `baseline/`: The deterministic baseline model and loader scripts.
-- `complete_system/node_<n>/`: Source code, execution logs, OOF predictions, and metrics for each search tree node.
+- `resolved_task_spec.json`, `dataset_profile.json`, and `dataset_index.jsonl`: Harness-generated task assets used by every root method.
+- `node_<n>/`: Source code, execution logs, OOF predictions, and metrics for each search-tree node.
 - `ensemble_manifest.json`: Evaluated ensemble configurations and weights.
 - `submission.csv`: Final ensembled predictions ready for deployment.
-- `results.md`: Markdown summary of scores, improvements, and execution metadata.
+- `results.md`: Markdown summary of the best method and execution metadata.
 
 ---
 
@@ -162,6 +161,14 @@ Tasks are described using a `task_config.json` file in the task's source directo
   }
 }
 ```
+
+`problem_type`, `output`, and `metrics` are independent of modality. If a
+legacy task omits its metric, the resolver chooses a concrete task-aware
+default (`accuracy`, `rmse`, `dice`, `box_iou`, `ndcg@10`, and so on);
+the legacy word `score` is not treated as an evaluator name. Mixed legacy
+datasets whose tabular IDs match image/audio/video filenames are indexed as
+multimodal automatically. Ambiguous media layouts should use the explicit
+schema-v2 form above.
 
 ### Environment Settings
 Define your preferred LLM provider and credentials:

@@ -9,6 +9,7 @@ from typing import Any, Mapping
 import numpy as np
 import pandas as pd
 
+from evaluation.prediction_io import legacy_prediction_payload
 from .evidence import EvidenceEstimate
 
 
@@ -194,40 +195,81 @@ class DiversityController:
     @staticmethod
     def _aligned_oof(
         run_root: Path, first_node_id: str, second_node_id: str
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    ) -> tuple[
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        tuple[str, ...],
+    ] | None:
         frames = []
         for node_id in (first_node_id, second_node_id):
             path = run_root / node_id / "oof_predictions.csv"
             if not path.is_file():
                 return None
             frame = pd.read_csv(path)
-            required = {"row_id", "target", "prediction"}
+            required = {"row_id", "target"}
             if (
                 not required.issubset(frame.columns)
                 or frame["row_id"].duplicated().any()
             ):
                 return None
-            frames.append(
-                frame[["row_id", "target", "prediction"]]
-                .set_index("row_id")
-                .sort_index()
-            )
+            frames.append(frame.set_index("row_id").sort_index())
         if not frames[0].index.equals(frames[1].index):
             return None
-        targets = frames[0]["target"].to_numpy(dtype=float)
+        targets = frames[0]["target"].to_numpy()
         if not np.array_equal(
-            targets, frames[1]["target"].to_numpy(dtype=float)
+            targets, frames[1]["target"].to_numpy()
         ):
             return None
-        first = frames[0]["prediction"].to_numpy(dtype=float)
-        second = frames[1]["prediction"].to_numpy(dtype=float)
-        if not (
-            np.isfinite(targets).all()
-            and np.isfinite(first).all()
-            and np.isfinite(second).all()
+        try:
+            payloads = [
+                legacy_prediction_payload(frame.reset_index())
+                for frame in frames
+            ]
+            if payloads[0][1] != payloads[1][1]:
+                return None
+            first = np.asarray(payloads[0][0], dtype=float)
+            second = np.asarray(payloads[1][0], dtype=float)
+            class_names = tuple(payloads[0][1])
+        except (TypeError, ValueError):
+            return None
+        if (
+            first.shape != second.shape
+            or not np.isfinite(first).all()
+            or not np.isfinite(second).all()
         ):
             return None
-        return targets, first, second
+        return targets, first, second, class_names
+
+    @staticmethod
+    def _residual_vector(
+        targets: np.ndarray,
+        prediction: np.ndarray,
+        class_names: tuple[str, ...],
+    ) -> np.ndarray | None:
+        values = np.asarray(prediction, dtype=float)
+        if values.ndim == 1:
+            try:
+                truth = np.asarray(targets, dtype=float).reshape(-1)
+            except (TypeError, ValueError):
+                return None
+            return truth - values
+        if values.ndim == 2 and class_names:
+            class_index = {
+                str(class_name): index
+                for index, class_name in enumerate(class_names)
+            }
+            try:
+                indices = np.asarray(
+                    [class_index[str(value)] for value in targets],
+                    dtype=int,
+                )
+            except KeyError:
+                return None
+            expected = np.zeros_like(values)
+            expected[np.arange(len(values)), indices] = 1.0
+            return (expected - values).reshape(-1)
+        return None
 
     def best_partner(
         self,
@@ -260,11 +302,17 @@ class DiversityController:
             aligned = self._aligned_oof(run_root, node_id, partner_id)
             if aligned is None:
                 continue
-            targets, first, second = aligned
+            targets, first, second, class_names = aligned
             if np.allclose(first, second, rtol=1e-12, atol=1e-12):
                 continue
-            first_residual = targets - first
-            second_residual = targets - second
+            first_residual = self._residual_vector(
+                targets, first, class_names
+            )
+            second_residual = self._residual_vector(
+                targets, second, class_names
+            )
+            if first_residual is None or second_residual is None:
+                continue
             if np.std(first_residual) == 0 or np.std(second_residual) == 0:
                 residual_correlation = 1.0
             else:
@@ -291,16 +339,21 @@ class DiversityController:
                     prediction_matrix
                 )
             weights = np.asarray(plan["weights"], dtype=float)
-            ensemble_prediction = weights @ prediction_matrix
+            ensemble_prediction = np.tensordot(
+                weights, prediction_matrix, axes=(0, 0)
+            )
             try:
                 single_objectives = [
                     AggregatorAgent._validation_metric(
-                        targets, prediction, metric_name
+                        targets, prediction, metric_name, class_names
                     )
                     for prediction in prediction_matrix
                 ]
                 ensemble_objective = AggregatorAgent._validation_metric(
-                    targets, ensemble_prediction, metric_name
+                    targets,
+                    ensemble_prediction,
+                    metric_name,
+                    class_names,
                 )
             except ValueError:
                 continue

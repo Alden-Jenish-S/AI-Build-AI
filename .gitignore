@@ -25,3 +25,4 @@ eval/
 !eval/
 eval/*
 !eval/evolve_harness.py
+!eval/run_search.py
