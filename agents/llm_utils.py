@@ -486,6 +486,8 @@ def _validate_json_schema(value: object, schema: Mapping[str, object]) -> None:
                 _validate_json_schema(item, item_schema)
     elif expected_type == "string" and not isinstance(value, str):
         raise ValueError("structured LLM response field must be a string")
+    elif expected_type == "boolean" and not isinstance(value, bool):
+        raise ValueError("structured LLM response field must be boolean")
     elif expected_type == "number" and not isinstance(value, (int, float)):
         raise ValueError("structured LLM response field must be numeric")
     if "enum" in schema and value not in schema["enum"]:

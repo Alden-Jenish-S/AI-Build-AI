@@ -8,7 +8,11 @@ score a preliminary model before search.
 ```text
 eval/run_search.py
   -> ManagerAgent(task_name, budget)
-  -> TaskAnalyzer resolves TaskSpec and builds a lazy DatasetBundle index
+  -> TaskAnalyzer inventories every task-owned file without assigning roles
+  -> content/identifier relationships resolve a task-local runtime contract
+  -> if relationships alone are insufficient, the task-analysis agent reasons
+       over the bounded inventory and must cite exact observed sources
+  -> TaskAnalyzer verifies sources, targets, coverage, and record alignment
   -> deterministic task_dataloader.py is written to the run directory
   -> TechniqueAgent proposes distinct root methods
   -> scheduler selects technique and implementation nodes
@@ -22,8 +26,12 @@ eval/run_search.py
   -> submission.csv, method_tree.png, results.md, and token_usage.json
 ```
 
-The initial task-analysis step is model-free. It only creates contracts and
-data references needed by root methods.
+The initial deterministic inspection is model-free; an evidence-grounded
+task-analysis agent is available only when those observations do not establish
+a complete contract. The combined analysis is a hard planning gate. If the
+observed files do not justify a complete contract, the run stops before a root
+method-tree node is created. It never fills missing evidence with
+`train.csv`, a scalar target, a tabular classification, or another canned task.
 
 ## Main modules
 
@@ -48,7 +56,8 @@ agent_system/
 │   ├── image.py
 │   ├── audio.py
 │   ├── video.py
-│   └── multimodal.py
+│   ├── multimodal.py
+│   └── generic.py                # Exact-contract indexing for unseen formats
 ├── evaluation/
 │   ├── metrics.py                # Task-aware metric registry
 │   ├── splitters.py              # Leakage-unit-aware deterministic folds
@@ -65,80 +74,72 @@ agent_system/
 
 ## Task contract
 
-Schema-v2 tasks declare their modality, problem, inputs, output, and metrics:
+Schema-v2 tasks declare concrete sources, roles, target facts, output, and
+metrics. Task-kind and objective identifiers are not allowlisted:
 
 ```json
 {
   "schema_version": 2,
-  "modality": "multimodal",
-  "component_modalities": ["image", "tabular"],
-  "problem_type": "classification",
+  "modality": "task-native-records",
+  "problem_type": "next-state-utility",
   "inputs": {
-    "image": {
-      "modality": "image",
-      "source": "input/entities.csv",
-      "format": "file_manifest",
-      "path_field": "image_path"
+    "observed": {
+      "role": "train",
+      "source": "input/observed.jsonl",
+      "format": "jsonl",
+      "id_field": "entity_key"
     },
-    "metadata": {
-      "modality": "tabular",
-      "source": "input/entities.csv",
-      "format": "csv"
+    "requested": {
+      "role": "test",
+      "source": "input/requested.jsonl",
+      "format": "jsonl",
+      "id_field": "entity_key"
     }
   },
-  "sample_id_field": "entity_id",
-  "entity_id_field": "entity_id",
+  "sample_id_field": "entity_key",
   "target": {
-    "source": "input/entities.csv",
-    "field": "label"
+    "source": "input/observed.jsonl",
+    "field": "utility"
   },
   "output": {
-    "type": "class_probabilities"
+    "type": "next-state-value"
   },
   "metrics": [
     {
-      "name": "accuracy",
-      "direction": "maximize"
+      "name": "absolute-utility-error",
+      "direction": "minimize"
     }
   ],
-  "primary_metric": "accuracy"
+  "primary_metric": "absolute-utility-error"
 }
 ```
 
-Legacy tabular and safely discoverable table-plus-media tasks are normalized
-into the same `TaskSpec`. Ambiguous layouts require an explicit schema-v2
-configuration.
-
-When a concrete metric is absent, the task contract selects a problem-aware
-default:
-
-- classification: `accuracy`
-- regression: `rmse`
-- multilabel classification: `f1_macro`
-- segmentation: `dice`
-- object detection: `box_iou`
-- retrieval: `ndcg@10`
-- captioning: `token_f1`
-- temporal localization: `temporal_iou`
-- clustering: `silhouette_score`
-
-Metric direction comes from the registered metric definition.
+Registered decoders and legacy configurations are normalized into the same
+`TaskSpec`, but their labels are not passed to planning as modeling recipes.
+Unseen identifiers are accepted by the generic adapter. Metric direction is an
+explicit contract fact; compatibility defaults exist only for legacy schemas.
 
 ## Direct root-method generation
 
-`ManagerAgent.run_tree_search()` prepares these model-free assets:
+`ManagerAgent.run_tree_search()` prepares these model-free assets before it
+creates the method tree:
 
+- `task_inventory.json`
+- `task_verification.json`
 - `resolved_task_spec.json`
 - `dataset_profile.json`
 - `dataset_analysis.md`
 - `dataset_index.jsonl`
 - `task_dataloader.py`
 
-`dataset_profile.json` contains the runtime dataset-index contract plus bounded,
-modality-neutral diagnostics for target topology, missingness, train/test KS
-drift, dimensionality, and collinearity. `dataset_analysis.md` turns those
-signals into concise modeling directives for the planning and implementation
-agents. Direct tabular sources do not materialize `dataset_index.jsonl`.
+`task_inventory.json` records observed file groups, content signatures, bounded
+table/document previews, and cross-directory stem relationships.
+`task_verification.json` records exactly which sources were claimed, any
+unclaimed groups, indexed record counts, warnings, and the final gate decision.
+Both the planning and implementation agents receive this evidence and are
+instructed to derive representations from actual values and shapes rather than
+from a data-category label. Direct columnar sources do not materialize
+`dataset_index.jsonl`.
 
 It then asks `TechniqueAgent` for distinct root approaches. Each selected root
 approach becomes an implementation node. `ImplementationAgent` receives no
@@ -194,9 +195,10 @@ manager-owned ensemble action.
 
 ## Multi-fidelity and resource safety
 
-The registered profiles are `screen`, `medium`, and `full`. They jointly cap
-sample fraction, folds, epochs, estimator iterations, tuning trials, spatial
-resolution, audio duration/sample rate, and video frame sampling.
+The registered profiles are `screen`, `medium`, and `full`. They cap task-neutral
+sample fraction, folds, epochs, estimator iterations, and tuning trials. Any
+decoding, resolution, duration, or truncation choice must come from measured
+task evidence rather than a data-family label.
 
 Long jobs use a renewable progress lease: total runtime is unbounded while the
 process continues to produce observable activity. Credentials are removed from
@@ -209,6 +211,8 @@ allowlist.
 ```text
 runs/<task>/
 ├── resolved_task_spec.json
+├── task_inventory.json
+├── task_verification.json
 ├── dataset_profile.json
 ├── dataset_analysis.md
 ├── dataset_index.jsonl

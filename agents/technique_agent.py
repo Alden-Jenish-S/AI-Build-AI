@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import List, Dict, Any
 from .llm_utils import call_llm, call_llm_json
 from .web_search import search_web
-from memory_pool.query_tool import artifact_compatibility, query
+from memory_pool.query_tool import query
 from .strategy_patterns import render_strategy_patterns, strategy_patterns
 
 class TechniqueAgent:
@@ -21,6 +21,15 @@ class TechniqueAgent:
         self.max_l1_categories = max(1, int(max_l1_categories))
         self.max_artifact_candidates = max(1, int(max_artifact_candidates))
         self.dataset_directives: tuple[str, ...] = ()
+        self.task_evidence = ""
+
+    def set_task_evidence(self, evidence: object) -> None:
+        """Provide the verified, content-first task inspection to planning."""
+        if isinstance(evidence, str):
+            rendered = evidence
+        else:
+            rendered = json.dumps(evidence, indent=2, sort_keys=True, default=str)
+        self.task_evidence = rendered.strip()[:60_000]
 
     def set_dataset_directives(self, directives: object) -> None:
         """Set task-local, analyzer-derived evidence for planning prompts."""
@@ -70,6 +79,13 @@ class TechniqueAgent:
             f"{render_strategy_patterns({})}\n"
             "AUTHORITATIVE DATASET-DIAGNOSTIC DIRECTIVES:\n"
             f"{self._dataset_directive_prompt()}\n"
+            "VERIFIED TASK-DIRECTORY EVIDENCE:\n"
+            f"{self.task_evidence or '- No verified task evidence was supplied.'}\n"
+            "First reconcile the task narrative with the observed files, content "
+            "signatures, table previews, and cross-file relationships. Every "
+            "branch must cite concrete evidence from this inspection. Do not "
+            "assume conventional filenames, a predefined data family, scalar "
+            "targets, or a particular prediction shape.\n"
             "Use these as evidence for branch design while keeping every "
             "learned operation leakage-safe.\n"
             "Do not include any explanation or markdown formatting, just the raw JSON list."
@@ -184,7 +200,9 @@ class TechniqueAgent:
             "operator into a concrete task-specific experiment. Return ONLY one JSON object "
             "with fields name, plan, operator, priority. Priority must be numeric in [-0.1, 0.1].\n"
             "AUTHORITATIVE DATASET-DIAGNOSTIC DIRECTIVES:\n"
-            f"{self._dataset_directive_prompt()}\n",
+            f"{self._dataset_directive_prompt()}\n"
+            "VERIFIED TASK-DIRECTORY EVIDENCE:\n"
+            f"{self.task_evidence or '- No verified task evidence was supplied.'}\n",
             user_prompt,
             model=self.model_name,
             schema_name="follow_up_approach",
@@ -412,21 +430,6 @@ Return the three child experiments as JSON only.
                 == "1"
             )
         task_spec = dict(task_spec or {})
-        task_type = str(
-            task_spec.get("problem_type") or "supervised"
-        ).lower()
-        modality = str(task_spec.get("modality") or "tabular").lower()
-        self.modality = modality
-        output = task_spec.get("output")
-        output_type = (
-            str(output.get("type"))
-            if isinstance(output, dict) and output.get("type")
-            else "class_probabilities"
-        )
-        component_modalities = {
-            str(item).lower()
-            for item in task_spec.get("component_modalities", [])
-        }
         excluded_artifact_ids = {
             str(item) for item in (excluded_artifact_ids or set()) if item
         }
@@ -450,7 +453,6 @@ Return the three child experiments as JSON only.
                 task_description,
                 branch_plan,
                 available_dependencies=available_dependencies,
-                modality=modality,
             )
 
         # Use both the branch direction and measured lineage context. The latter
@@ -465,7 +467,12 @@ Return the three child experiments as JSON only.
         )
         
         visible_l1 = self._prefilter_l1(
-            l1_index, task_description + "\n" + branch_plan
+            l1_index,
+            task_description
+            + "\n"
+            + branch_plan
+            + "\n"
+            + self.task_evidence[:10_000],
         )
         l1_summary = ""
         for cat, details in visible_l1.items():
@@ -477,6 +484,12 @@ Strategic Direction:
 
 Measured Parent/Sibling Context:
 {json.dumps(global_memory_context or {}, indent=2, default=str)}
+
+Verified Task Evidence:
+{self.task_evidence or '- No verified evidence was supplied.'}
+
+Verified Task Evidence:
+{self.task_evidence or '- No verified evidence was supplied.'}
 
 Execution Resources:
 Available accelerators: {sorted(available_accelerators or {'cpu'})}
@@ -501,7 +514,6 @@ Which 1-2 categories best match the strategic direction? Output a comma-separate
                 task_description,
                 branch_plan,
                 available_dependencies=available_dependencies,
-                modality=modality,
             )
             
         print(f"TechniqueAgent: Selected L1 categories: {selected_categories} (for branch: {branch_plan[:60]}...)")
@@ -515,32 +527,9 @@ Which 1-2 categories best match the strategic direction? Output a comma-separate
                 if artifact.get("verified") is True
                 and artifact.get("artifact_id") not in excluded_artifact_ids
                 and (
-                    task_type != "unsupervised_clustering"
-                    or "unsupervised_clustering"
-                    in {
-                        str(item).lower()
-                        for item in (
-                            artifact.get("capabilities", {}).get(
-                                "target_types", []
-                            )
-                            if isinstance(
-                                artifact.get("capabilities"), dict
-                            )
-                            else []
-                        )
-                    }
-                )
-                and (
                     not allowed_scopes
                     or artifact.get("scope") in allowed_scopes
                 )
-                and artifact_compatibility(
-                    artifact,
-                    modality=modality,
-                    problem_type=task_type,
-                    output_type=output_type,
-                    component_modalities=component_modalities,
-                )[0]
             ]
             l2_candidates.extend(verified_artifacts)
 
@@ -560,8 +549,9 @@ Which 1-2 categories best match the strategic direction? Output a comma-separate
             "Default to novelty unless a pool artifact is a strong, direct fit.\n"
             "Choose an artifact ONLY if it satisfies ALL checks:\n"
             "1. It directly implements the branch direction rather than merely belonging to the same broad category.\n"
-            "2. Its declared modality, problem, and output contracts can be "
-            "wired into the current task without redesign.\n"
+            "2. Its concrete callable interface can consume the verified runtime "
+            "values and produce the required output without inventing a loader, "
+            "target, or prediction shape. Category labels are not evidence.\n"
             "3. It is more useful than generating a tailored technique for this branch.\n"
             "If any check is uncertain, output ONLY 'web_search'.\n"
             "If one artifact clearly passes all checks, output ONLY its artifact_id."
@@ -629,7 +619,6 @@ Decide: Output either one artifact_id from the list, or 'web_search'.
                 task_description,
                 branch_plan,
                 available_dependencies=available_dependencies,
-                modality=modality,
             )
 
     def _bootstrap_from_web(
@@ -640,11 +629,12 @@ Decide: Output either one artifact_id from the list, or 'web_search'.
         modality: str | None = None,
     ) -> Dict[str, Any]:
         """Searches or synthesizes a new technique outline for later L2 building."""
-        modality = modality or getattr(self, "modality", "tabular")
         query_prompt_sys = (
             "You are an ML research scientist. Write a short, precise web search query "
-            f"to find state-of-the-art {modality} machine learning techniques, custom loss functions, "
-            "or advanced neural architectures suitable for the given task and planned technique.\n"
+            "to find machine learning techniques, objective functions, or "
+            "architectures suitable for the verified task evidence and planned "
+            "technique. Do not add a data-family label that is not established "
+            "by the observed files.\n"
             "CRITICAL: Do NOT include Kaggle file names (like 'train.csv', 'test.csv', 'sample_submission.csv') or generic words like 'notebook'. "
             "Query for scientific methodologies, architectures, or specific algorithms.\n"
             "Output ONLY the search query string, nothing else."
@@ -652,6 +642,8 @@ Decide: Output either one artifact_id from the list, or 'web_search'.
         query_prompt_user = (
             f"Task Description:\n{task_description}\n\n"
             f"Planned Technique to Implement:\n{branch_plan}\n\n"
+            "Verified Task Evidence:\n"
+            f"{self.task_evidence or '- No verified evidence was supplied.'}\n\n"
             "Write only the query string."
         )
         query_error = None
@@ -671,7 +663,7 @@ Decide: Output either one artifact_id from the list, or 'web_search'.
             # deterministically and continue.
             query_error = str(exc)
             search_query = " ".join(
-                (branch_plan or task_description or f"robust {modality} machine learning")
+                (branch_plan or task_description or "robust machine learning method")
                 .replace("\n", " ")
                 .split()
             )[:240]
@@ -687,11 +679,13 @@ Decide: Output either one artifact_id from the list, or 'web_search'.
             print("Web search failed or blocked. Using LLM internal knowledge fallback...")
             search_results = (
                 "No web pages returned. Fallback to LLM internal knowledge base. "
-                f"Provide a robust, original {modality} ML technique script tailored to the planned technique."
+                "Provide a robust, original ML technique tailored to the "
+                "verified files and planned technique."
             )
 
         build_prompt_sys = (
-            f"You are the Technique Agent. Review the search results and outline ONE new reusable {modality} ML technique "
+            "You are the Technique Agent. Review the search results and outline "
+            "ONE new reusable ML technique "
             "we should implement. The technique MUST faithfully implement the Planned Technique below. "
             "Do not substitute a different model family merely because it appears in the search results; "
             "the search results are supporting evidence, not permission to replace the branch. "
@@ -712,6 +706,9 @@ Search Results:
 
 Task Description:
 {task_description}
+
+Verified Task Evidence:
+{self.task_evidence or '- No verified evidence was supplied.'}
 
 Planned Technique:
 {branch_plan}

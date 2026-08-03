@@ -19,50 +19,6 @@ from evaluation.metrics import (
 )
 
 
-_MODALITY_ALIASES = {
-    "images": "image",
-    "vision": "image",
-    "waveform": "audio",
-    "videos": "video",
-    "multi_modal": "multimodal",
-    "multi_modality": "multimodal",
-}
-_SUPPORTED_MODALITIES = {
-    "audio",
-    "image",
-    "multimodal",
-    "tabular",
-    "text",
-    "video",
-}
-_PROBLEM_TYPE_ALIASES = {
-    "binary_classification": "classification",
-    "clustering": "unsupervised_clustering",
-    "multiclass_classification": "classification",
-    "unsupervised": "unsupervised_clustering",
-}
-_SUPPORTED_PROBLEM_TYPES = {
-    "captioning",
-    "classification",
-    "detection",
-    "multilabel_classification",
-    "regression",
-    "retrieval",
-    "segmentation",
-    "supervised",
-    "temporal_localization",
-    "unsupervised_clustering",
-}
-_SUPPORTED_OUTPUT_TYPES = {
-    "boxes",
-    "class_probabilities",
-    "continuous",
-    "embeddings",
-    "labels",
-    "masks",
-    "ranked_items",
-    "text",
-}
 _SUPPORTED_DIRECTIONS = {"maximize", "minimize"}
 
 
@@ -74,26 +30,19 @@ def _normalized_identifier(value: object, field_name: str) -> str:
 
 
 def normalize_modality(value: object) -> str:
-    """Return a canonical modality name and reject unsupported values."""
+    """Return a stable data-description identifier.
+
+    The contract deliberately does not maintain an allowlist. Registered
+    adapters are an implementation detail, not a declaration of every kind of
+    data an ML task is allowed to contain.
+    """
     normalized = _normalized_identifier(value, "modality")
-    normalized = _MODALITY_ALIASES.get(normalized, normalized)
-    if normalized not in _SUPPORTED_MODALITIES:
-        raise ValueError(
-            "modality must be one of "
-            f"{sorted(_SUPPORTED_MODALITIES)}; got {value!r}"
-        )
     return normalized
 
 
 def normalize_problem_type(value: object) -> str:
-    """Return a canonical learning objective independent of modality."""
+    """Return a stable task-objective identifier without an allowlist."""
     normalized = _normalized_identifier(value, "problem_type")
-    normalized = _PROBLEM_TYPE_ALIASES.get(normalized, normalized)
-    if normalized not in _SUPPORTED_PROBLEM_TYPES:
-        raise ValueError(
-            "problem_type must be one of "
-            f"{sorted(_SUPPORTED_PROBLEM_TYPES)}; got {value!r}"
-        )
     return normalized
 
 
@@ -110,7 +59,9 @@ def _default_output_type(problem_type: str) -> str:
         return "ranked_items"
     if problem_type == "captioning":
         return "text"
-    return "class_probabilities"
+    if problem_type in {"classification", "multilabel_classification"}:
+        return "class_probabilities"
+    return "predictions"
 
 
 def _inferred_format(source: str) -> str:
@@ -209,15 +160,20 @@ class InputSpec:
 
 @dataclass(frozen=True)
 class TargetSpec:
-    """Target location and semantic type for a supervised task."""
+    """Optional target location, field, and task-native semantics."""
 
-    field: str
+    options: Mapping[str, object] = field(default_factory=dict)
+    field: str | None = None
     source: str | None = None
     type: str | None = None
 
     def __post_init__(self) -> None:
-        if not str(self.field).strip():
+        if self.field is not None and not str(self.field).strip():
             raise ValueError("target field must be non-empty")
+        if self.field is None and self.source is None:
+            raise ValueError("target must define a field or source")
+        if not isinstance(self.options, Mapping):
+            raise ValueError("target options must be an object")
 
     @classmethod
     def from_value(
@@ -233,18 +189,28 @@ class TargetSpec:
         if not isinstance(raw, Mapping):
             raise ValueError("target must be a field name or object")
         field_name = raw.get("field") or raw.get("column")
-        if field_name is None:
+        source = (
+            str(raw["source"])
+            if raw.get("source") is not None
+            else default_source
+        )
+        if field_name is None and source is None:
             return None
+        known = {"field", "column", "source", "type", "options"}
+        options = raw.get("options", {})
+        if not isinstance(options, Mapping):
+            raise ValueError("target options must be an object")
+        merged_options = dict(options)
+        merged_options.update(
+            {key: value for key, value in raw.items() if key not in known}
+        )
         return cls(
-            field=str(field_name),
-            source=(
-                str(raw["source"])
-                if raw.get("source") is not None
-                else default_source
-            ),
+            field=str(field_name) if field_name is not None else None,
+            source=source,
             type=(
                 str(raw["type"]) if raw.get("type") is not None else None
             ),
+            options=merged_options,
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -252,6 +218,7 @@ class TargetSpec:
             "field": self.field,
             "source": self.source,
             "type": self.type,
+            "options": dict(self.options),
         }
 
 
@@ -265,11 +232,6 @@ class OutputSpec:
 
     def __post_init__(self) -> None:
         normalized = _normalized_identifier(self.type, "output.type")
-        if normalized not in _SUPPORTED_OUTPUT_TYPES:
-            raise ValueError(
-                "output.type must be one of "
-                f"{sorted(_SUPPORTED_OUTPUT_TYPES)}; got {self.type!r}"
-            )
         object.__setattr__(self, "type", normalized)
         object.__setattr__(
             self, "class_names", tuple(str(item) for item in self.class_names)
@@ -501,19 +463,8 @@ class TaskSpec:
                     f"input key {name!r} does not match name "
                     f"{input_spec.name!r}"
                 )
-        if modality == "multimodal":
-            if len(self.inputs) < 2:
-                raise ValueError(
-                    "multimodal tasks require at least two named inputs"
-                )
-            if any(item == "multimodal" for item in components):
-                raise ValueError(
-                    "component_modalities must name concrete modalities"
-                )
-        elif any(item != modality for item in components):
-            raise ValueError(
-                "a unimodal task may only declare its own component modality"
-            )
+        if modality == "multimodal" and len(self.inputs) < 2:
+            raise ValueError("multimodal tasks require at least two named inputs")
         if not str(self.sample_id_field).strip():
             raise ValueError("sample_id_field must be non-empty")
         if not self.metrics:
@@ -525,18 +476,9 @@ class TaskSpec:
             raise ValueError(
                 f"primary_metric {self.primary_metric!r} is not in metrics"
             )
-        if (
-            problem_type != "unsupervised_clustering"
-            and self.target is None
-            and problem_type not in {"retrieval"}
-        ):
-            # Legacy tabular tasks sometimes rely on the generated loader to
-            # infer an ambiguous target. Preserve that behavior for schema v1,
-            # while resolved v2 contracts must be explicit.
-            if self.schema_version >= 2 and problem_type != "supervised":
-                raise ValueError(
-                    f"{problem_type} tasks must define a target"
-                )
+        # Target presence is a task fact, not something inferred from an
+        # objective allowlist. Some valid ML objectives are self-supervised,
+        # pairwise, simulation-driven, or evaluated without a scalar label.
 
     @property
     def metric_direction(self) -> str:
@@ -559,7 +501,34 @@ class TaskSpec:
         """Build a canonical task from v2 or legacy tabular configuration."""
         config = dict(raw or {})
         schema_version = int(config.get("schema_version", 1))
-        modality = normalize_modality(config.get("modality", "tabular"))
+        configured_inputs = config.get("inputs")
+        raw_modality = config.get("modality")
+        if raw_modality is None and isinstance(configured_inputs, Mapping):
+            observed = {
+                str(value.get("modality"))
+                for value in configured_inputs.values()
+                if isinstance(value, Mapping) and value.get("modality") is not None
+            }
+            if len(observed) == 1:
+                raw_modality = next(iter(observed))
+            elif len(observed) > 1:
+                raw_modality = "multimodal"
+            else:
+                raw_modality = "task_native"
+        legacy_keys_present = any(
+            config.get(key) is not None
+            for key in ("train_file", "test_file", "data_file", "target_column")
+        ) or bool(legacy_roles)
+        if raw_modality is None and legacy_keys_present:
+            raw_modality = "tabular"
+        if raw_modality is None and config:
+            raw_modality = "task_native"
+        if raw_modality is None:
+            raise ValueError(
+                "task contract does not describe its inputs; refusing to assume "
+                "a tabular task or a conventional train.csv file"
+            )
+        modality = normalize_modality(raw_modality)
         problem_type = normalize_problem_type(
             config.get("problem_type")
             or config.get("task_type")
@@ -567,7 +536,6 @@ class TaskSpec:
             or "supervised"
         )
 
-        configured_inputs = config.get("inputs")
         input_specs: dict[str, InputSpec] = {}
         if configured_inputs is not None:
             if not isinstance(configured_inputs, Mapping):
@@ -595,7 +563,7 @@ class TaskSpec:
             for name, source in roles.items():
                 input_specs[name] = InputSpec(
                     name=name,
-                    modality="tabular",
+                    modality=modality,
                     role=name,
                     source=str(source),
                     format=_inferred_format(str(source)),
@@ -603,13 +571,13 @@ class TaskSpec:
                     not in {"sample_submission", "test"},
                 )
             if not input_specs:
-                input_specs["train"] = InputSpec(
-                    name="train",
+                input_specs["task_directory"] = InputSpec(
+                    name="task_directory",
                     modality=modality,
-                    role="train",
-                    source="train.csv",
-                    format="csv",
-                    required=False,
+                    role="task_data",
+                    source=".",
+                    format="directory",
+                    required=True,
                 )
 
         default_target_source = (
@@ -708,7 +676,7 @@ class TaskSpec:
             sample_id_field=str(
                 config.get("sample_id_field")
                 or config.get("id_column")
-                or "row_id"
+                or "sample_id"
             ),
             entity_id_field=(
                 str(config["entity_id_field"])

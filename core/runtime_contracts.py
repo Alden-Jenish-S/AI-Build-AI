@@ -72,7 +72,7 @@ class DatasetBundle:
         sample_ids = [record.sample_id for record in all_records]
         if len(set(sample_ids)) != len(sample_ids):
             raise ValueError("sample IDs must be unique across train and test")
-        if self.task.problem_type != "unsupervised_clustering":
+        if self.task.target is not None:
             missing = [
                 record.sample_id
                 for record in self.train_records
@@ -205,7 +205,7 @@ class FidelityProfile:
                 raise ValueError(f"{field_name} must be positive")
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        values: dict[str, object] = {
             "name": self.name,
             "sample_fraction": self.sample_fraction,
             "folds": self.folds,
@@ -213,6 +213,11 @@ class FidelityProfile:
             "max_trials": self.max_trials,
             "early_stopping_patience": self.early_stopping_patience,
             "max_estimator_iterations": self.max_estimator_iterations,
+        }
+        # Retain old constructor fields for external API compatibility, but do
+        # not expose category-specific hints unless a caller explicitly set
+        # one from task evidence.
+        optional = {
             "spatial_size": (
                 list(self.spatial_size) if self.spatial_size else None
             ),
@@ -222,6 +227,10 @@ class FidelityProfile:
             "video_fps": self.video_fps,
             "clips_per_video": self.clips_per_video,
         }
+        values.update(
+            {key: value for key, value in optional.items() if value is not None}
+        )
+        return values
 
 
 @dataclass(frozen=True)

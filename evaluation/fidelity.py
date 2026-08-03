@@ -1,95 +1,45 @@
-"""Registered fidelity profiles for each modality."""
+"""Task-neutral experiment fidelity profiles."""
 
 from __future__ import annotations
 
-from core.contracts import normalize_modality
 from core.runtime_contracts import FidelityProfile
 
 
 _COMMON = {
     "screen": {
         "sample_fraction": 0.25,
-        "folds": 5,
-        "max_trials": 20,
-        "max_epochs": 20,
-        "early_stopping_patience": 5,
-        "max_estimator_iterations": 2000,
+        "folds": 2,
+        "max_trials": 8,
+        "max_epochs": 8,
+        "early_stopping_patience": 2,
+        "max_estimator_iterations": 500,
     },
     "medium": {
         "sample_fraction": 0.60,
-        "folds": 8,
-        "max_trials": 40,
-        "max_epochs": 40,
-        "early_stopping_patience": 7,
-        "max_estimator_iterations": 2500,
+        "folds": 3,
+        "max_trials": 20,
+        "max_epochs": 20,
+        "early_stopping_patience": 4,
+        "max_estimator_iterations": 1500,
     },
     "full": {
         "sample_fraction": 1.0,
-        "folds": 10,
-        "max_trials": 60,
-        "max_epochs": 60,
-        "early_stopping_patience": 10,
-        "max_estimator_iterations": 3000,
+        "folds": 5,
+        "max_trials": 40,
+        "max_epochs": 50,
+        "early_stopping_patience": 7,
+        "max_estimator_iterations": 4000,
     },
 }
-
-_OVERRIDES = {
-    "image": {
-        "screen": {"spatial_size": (128, 128)},
-        "medium": {"spatial_size": (224, 224)},
-        "full": {"spatial_size": (384, 384)},
-    },
-    "audio": {
-        "screen": {
-            "audio_sample_rate": 8000,
-            "max_audio_seconds": 10.0,
-        },
-        "medium": {
-            "audio_sample_rate": 16000,
-            "max_audio_seconds": 30.0,
-        },
-        "full": {
-            "audio_sample_rate": 32000,
-            "max_audio_seconds": None,
-        },
-    },
-    "video": {
-        "screen": {
-            "spatial_size": (112, 112),
-            "video_frames": 8,
-            "video_fps": 4.0,
-            "clips_per_video": 1,
-        },
-        "medium": {
-            "spatial_size": (160, 160),
-            "video_frames": 16,
-            "video_fps": 8.0,
-            "clips_per_video": 2,
-        },
-        "full": {
-            "spatial_size": (224, 224),
-            "video_frames": 32,
-            "video_fps": None,
-            "clips_per_video": 4,
-        },
-    },
-}
-
 
 def get_fidelity_profile(
     modality: str, name: str
 ) -> FidelityProfile:
-    """Resolve a fidelity without exposing modality conditionals to scheduling."""
-    normalized_modality = normalize_modality(modality)
+    """Resolve task-neutral limits; ``modality`` is retained for API compatibility."""
     normalized_name = str(name).strip().lower()
     if normalized_name not in _COMMON:
         raise ValueError(f"unknown fidelity: {name!r}")
     values = dict(_COMMON[normalized_name])
-    # Multimodal evaluation uses the common sample/fold/optimization limits.
-    # Each component adapter receives its own concrete fidelity when decoding.
-    values.update(
-        _OVERRIDES.get(normalized_modality, {}).get(normalized_name, {})
-    )
     return FidelityProfile(name=normalized_name, **values)
 
 

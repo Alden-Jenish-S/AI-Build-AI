@@ -77,26 +77,8 @@ def discover_dataset_layout(task_dir: Path) -> dict:
             )
         roles[role] = configured_path
 
-    # Conventional names are only one signal, not a requirement.
-    lowered = {path.name.lower(): path for path in tabular}
-    roles.setdefault("train", lowered.get("train.csv"))
-    roles.setdefault("test", lowered.get("test.csv"))
-    roles.setdefault(
-        "sample_submission", lowered.get("sample_submission.csv")
-    )
     roles = {role: path for role, path in roles.items() if path is not None}
-
     sample_path = roles.get("sample_submission")
-    if sample_path is None:
-        submission_candidates = [
-            path
-            for path in tabular
-            if "submission" in path.stem.lower()
-            or "prediction_template" in path.stem.lower()
-        ]
-        if len(submission_candidates) == 1:
-            sample_path = submission_candidates[0]
-            roles["sample_submission"] = sample_path
 
     task_type = infer_task_type(
         f"{task_dir.name}\n{description}",
@@ -110,8 +92,6 @@ def discover_dataset_layout(task_dir: Path) -> dict:
             ]
             if len(feature_candidates) == 1:
                 roles["data"] = feature_candidates[0]
-            elif "data.csv" in lowered:
-                roles["data"] = lowered["data.csv"]
     elif "train" not in roles:
         # Schema comparison handles nonstandard supervised names. The training
         # table is the table with one or more columns absent from a second table.
@@ -124,17 +104,98 @@ def discover_dataset_layout(task_dir: Path) -> dict:
                 )
             except Exception:
                 continue
+        def non_identifier_variability(path: Path) -> float:
+            separator = "\t" if path.suffix.lower() == ".tsv" else ","
+            try:
+                sample = pd.read_csv(path, sep=separator, nrows=10_000)
+            except Exception:
+                return 0.0
+            if sample.empty or len(sample.columns) < 2:
+                return 0.0
+            fractions = sorted(
+                (
+                    sample[column].nunique(dropna=True) / max(len(sample), 1)
+                    for column in sample.columns
+                ),
+                reverse=True,
+            )
+            # Drop one maximally unique identifier-like column without relying
+            # on its name, then measure how much observed feature information
+            # remains.
+            remaining = fractions[1:]
+            return float(sum(remaining) / len(remaining)) if remaining else 0.0
+
         pairs = [
-            (left, right, headers[left] - headers[right])
+            (
+                left,
+                right,
+                headers[left] - headers[right],
+                len(headers[left] & headers[right]),
+                len(headers[left] & headers[right])
+                / max(len(headers[left] | headers[right]), 1),
+                non_identifier_variability(right),
+            )
             for left in headers
             for right in headers
             if left != right and headers[left] - headers[right]
         ]
         if pairs:
-            left, right, _ = min(pairs, key=lambda item: len(item[2]))
+            left, right, _, _, _, _ = max(
+                pairs,
+                key=lambda item: (
+                    item[4],
+                    item[3],
+                    -len(item[2]),
+                    item[5],
+                ),
+            )
             roles["train"], roles["test"] = left, right
         elif len(unused) == 1:
             roles["train"] = unused[0]
+
+    # Resolve an output template from its values and row alignment with the
+    # discovered inference table. Its filename carries no semantic weight.
+    if sample_path is None and roles.get("test") is not None:
+        try:
+            test_path = roles["test"]
+            test_sep = "\t" if test_path.suffix.lower() == ".tsv" else ","
+            test_frame = pd.read_csv(test_path, sep=test_sep)
+            ranked_templates = []
+            for candidate in tabular:
+                if candidate in {roles.get("train"), test_path}:
+                    continue
+                separator = "\t" if candidate.suffix.lower() == ".tsv" else ","
+                frame = pd.read_csv(candidate, sep=separator)
+                if len(frame.columns) < 2 or frame.empty:
+                    continue
+                best_coverage = 0.0
+                for test_column in test_frame.columns:
+                    test_values = set(test_frame[test_column].dropna().astype(str))
+                    if not test_values:
+                        continue
+                    for candidate_column in frame.columns:
+                        candidate_values = set(
+                            frame[candidate_column].dropna().astype(str)
+                        )
+                        best_coverage = max(
+                            best_coverage,
+                            len(test_values & candidate_values) / len(test_values),
+                        )
+                if best_coverage >= 0.90:
+                    row_distance = abs(len(frame) - len(test_frame)) / max(
+                        len(test_frame), 1
+                    )
+                    ranked_templates.append(
+                        (best_coverage, -row_distance, candidate)
+                    )
+            if ranked_templates:
+                ranked_templates.sort(
+                    key=lambda item: (item[0], item[1]), reverse=True
+                )
+                sample_path = ranked_templates[0][2]
+                roles["sample_submission"] = sample_path
+        except Exception:
+            pass
 
     inventory = []
     for path in files:
@@ -215,12 +276,7 @@ def _resolved_target_field(task_dir: Path, layout: dict) -> str | None:
                 return str(train_only[0])
         except Exception:
             pass
-    common = [
-        column
-        for column in train_columns
-        if column.lower() in {"target", "label", "class", "cover_type"}
-    ]
-    return str(common[0]) if common else None
+    return None
 
 
 def infer_tabular_problem_type(
@@ -245,7 +301,7 @@ def infer_tabular_problem_type(
         task_dir, layout.get("roles", {}).get("train")
     )
     if target_field is None or train_path is None:
-        return "classification"
+        return "supervised"
 
     # A wide submission template is an unambiguous multiclass probability
     # contract even when a generated loader later integer-encodes the labels.
@@ -269,9 +325,9 @@ def infer_tabular_problem_type(
             nrows=100_000,
         )[target_field].dropna()
     except Exception:
-        return "classification"
+        return "supervised"
     if target.empty:
-        return "classification"
+        return "supervised"
     if (
         pd.api.types.is_bool_dtype(target.dtype)
         or pd.api.types.is_object_dtype(target.dtype)
@@ -429,16 +485,8 @@ def run_dataset_analysis(task_dir: Path) -> str:
                     if test_sample is not None
                     else []
                 )
-                common = [
-                    column
-                    for column in df.columns
-                    if column.lower()
-                    in {"target", "label", "class", "cover_type"}
-                ]
                 if len(train_only) == 1:
                     target_col = train_only[0]
-                elif common:
-                    target_col = common[0]
             if target_col in df.columns:
                 analysis_report.append(
                     f"Inferred Target Column: '{target_col}'"

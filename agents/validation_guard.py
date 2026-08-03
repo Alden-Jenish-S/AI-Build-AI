@@ -69,11 +69,9 @@ def inspect_generated_code(
     issues: List[str] = []
     task_spec = dict(task_spec or {})
     runtime_contract = dict(runtime_contract or {})
-    modality = str(task_spec.get("modality") or "tabular").lower()
     group_sensitive = bool(
         task_spec.get("group_id_field")
         or task_spec.get("entity_id_field")
-        or modality == "multimodal"
     )
     components = runtime_contract.get("components", {})
     flattened_components = {
@@ -276,7 +274,7 @@ def inspect_generated_code(
                     f"line {node.lineno}: do not resample harness-owned "
                     "evaluation rows or fold-training indices"
                 )
-        if modality in {"image", "audio", "video", "multimodal"} and (
+        if (
             "augment" in function_name or function_name.startswith("random_")
         ) and any(
             isinstance(child, ast.Name)

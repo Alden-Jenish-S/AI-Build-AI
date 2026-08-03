@@ -264,6 +264,29 @@ class MultimodalAdapter:
                 "auto_join": True,
                 "join_field": join_field,
             }
+            template_name = info["layout"].get("roles", {}).get(
+                "sample_submission"
+            )
+            source_root = (
+                Path(task_dir) / "input"
+                if (Path(task_dir) / "input").is_dir()
+                else Path(task_dir)
+            )
+            template_path = (
+                source_root / str(template_name)
+                if template_name is not None
+                else None
+            )
+            if template_path is not None and not template_path.is_file():
+                template_path = None
+            if template_path is not None:
+                inputs["output_template"] = {
+                    "modality": "tabular",
+                    "role": "sample_submission",
+                    "source": _task_relative(task_dir, template_path),
+                    "format": template_path.suffix.lower().lstrip("."),
+                    "required": False,
+                }
             component_modalities.append("tabular")
             config = {
                 "schema_version": 2,

@@ -415,9 +415,6 @@ class TaskDataLoader:
                 pd.api.types.is_numeric_dtype(X_full[column])
                 for column in X_full.columns
             ),
-            "task_type": task_spec["problem_type"],
-            "modality": task_spec["modality"],
-            "component_modalities": task_spec["component_modalities"],
             "output_type": task_spec["output"]["type"],
             "class_names": task_spec["output"].get("class_names", []),
             "dataset_fingerprint": index_manifest["dataset_fingerprint"],
@@ -523,9 +520,6 @@ class TaskDataLoader:
                 pd.api.types.is_numeric_dtype(X_full[column])
                 for column in X_full.columns
             ),
-            "task_type": task_spec["problem_type"],
-            "modality": task_spec["modality"],
-            "component_modalities": task_spec["component_modalities"],
             "output_type": task_spec["output"]["type"],
             "class_names": task_spec["output"].get("class_names", []),
             "dataset_fingerprint": index_manifest["dataset_fingerprint"],

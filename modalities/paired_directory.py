@@ -14,7 +14,9 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Iterable
 
+import numpy as np
 import pandas as pd
+from PIL import Image
 
 from core.contracts import TaskSpec
 from core.runtime_contracts import DatasetBundle, SampleRecord
@@ -34,56 +36,6 @@ _MEDIA_EXTENSIONS = {
     "video": frozenset(
         {".avi", ".m4v", ".mkv", ".mov", ".mp4", ".mpeg", ".mpg", ".webm"}
     ),
-}
-_MEDIA_DIRECTORY_NAMES = {
-    "audio": frozenset({"audio", "audios", "recordings", "sounds", "waveforms"}),
-    "image": frozenset({"image", "images", "imgs", "photos", "pictures"}),
-    "video": frozenset({"clips", "movies", "video", "videos"}),
-}
-_TRAIN_NAMES = frozenset({"train", "training"})
-_TEST_NAMES = frozenset({"eval", "evaluation", "inference", "predict", "test", "testing"})
-_TARGET_KINDS = {
-    "segmentation": {
-        "names": frozenset(
-            {
-                "mask",
-                "masks",
-                "segmentation",
-                "segmentations",
-                "semantic_masks",
-                "instance_masks",
-            }
-        ),
-        "extensions": _MEDIA_EXTENSIONS["image"],
-        "output_type": "masks",
-        "target_type": "mask_path",
-        "field": "mask_path",
-    },
-    "detection": {
-        "names": frozenset(
-            {"annotation", "annotations", "bbox", "bboxes", "box", "boxes"}
-        ),
-        "extensions": frozenset({".csv", ".json", ".jsonl", ".txt", ".xml"}),
-        "output_type": "boxes",
-        "target_type": "annotation_path",
-        "field": "annotation_path",
-    },
-    "captioning": {
-        "names": frozenset({"caption", "captions", "descriptions"}),
-        "extensions": frozenset({".json", ".jsonl", ".md", ".txt"}),
-        "output_type": "text",
-        "target_type": "text_path",
-        "field": "text_path",
-    },
-    "temporal_localization": {
-        "names": frozenset(
-            {"segments", "temporal_annotations", "timestamps", "time_spans"}
-        ),
-        "extensions": frozenset({".csv", ".json", ".jsonl", ".txt"}),
-        "output_type": "boxes",
-        "target_type": "temporal_annotation_path",
-        "field": "temporal_annotation_path",
-    },
 }
 _TABLE_EXTENSIONS = frozenset({".csv", ".tsv"})
 _ID_FIELDS = (
@@ -118,18 +70,6 @@ def _file_key(directory: Path, path: Path) -> str:
     return path.relative_to(directory).with_suffix("").as_posix()
 
 
-def _split_kind(path: Path, root: Path) -> str | None:
-    parts = {
-        part.lower().replace("-", "_")
-        for part in path.relative_to(root).parts[:-1]
-    }
-    if parts & _TRAIN_NAMES:
-        return "train"
-    if parts & _TEST_NAMES:
-        return "test"
-    return None
-
-
 def _candidate_directories(root: Path) -> tuple[Path, ...]:
     candidates = []
     for path in root.rglob("*"):
@@ -142,6 +82,92 @@ def _candidate_directories(root: Path) -> tuple[Path, ...]:
         if depth <= 4:
             candidates.append(path)
     return tuple(sorted(candidates))
+
+
+def _observed_directory_files(directory: Path) -> tuple[Path, ...]:
+    """Return one homogeneous leaf collection without interpreting its name."""
+    return tuple(path for path in sorted(directory.iterdir()) if path.is_file())
+
+
+def _storage_family(path: Path) -> str | None:
+    """Identify decodable storage from bytes/extensions, not directory labels."""
+    suffix = path.suffix.lower()
+    for family, extensions in _MEDIA_EXTENSIONS.items():
+        if suffix in extensions:
+            return family
+    if suffix in {".csv", ".json", ".jsonl", ".md", ".txt", ".tsv", ".xml"}:
+        return "structured_text"
+    return None
+
+
+def _directory_collection(
+    directory: Path,
+) -> tuple[str, dict[str, Path]] | None:
+    files = _observed_directory_files(directory)
+    if not files:
+        return None
+    sampled_families = [_storage_family(path) for path in files[:20]]
+    families = {family for family in sampled_families if family is not None}
+    if len(families) != 1 or any(family is None for family in sampled_families):
+        return None
+    family = next(iter(families))
+    mapping: dict[str, Path] = {}
+    for path in files:
+        if _storage_family(path) != family:
+            return None
+        key = _file_key(directory, path)
+        if key in mapping:
+            return None
+        mapping[key] = path
+    return family, mapping
+
+
+def _raster_target_score(paths: Iterable[Path]) -> float | None:
+    """Measure whether observed raster values look target-like.
+
+    A low score means few unique values relative to the array size. This is an
+    observation about the actual files and does not depend on directory names.
+    """
+    scores = []
+    for path in list(paths)[:8]:
+        try:
+            with Image.open(path) as image:
+                values = np.asarray(image)
+        except Exception:
+            continue
+        if values.size == 0:
+            continue
+        unique = np.unique(values.reshape(-1)[:100_000]).size
+        scores.append(unique / min(values.size, 100_000))
+    return float(np.median(scores)) if scores else None
+
+
+def _table_id_sets(root: Path) -> list[tuple[Path, str, set[str], tuple[str, ...]]]:
+    result = []
+    for path in sorted(root.rglob("*")):
+        if not path.is_file() or path.suffix.lower() not in _TABLE_EXTENSIONS:
+            continue
+        try:
+            frame = _table(path)
+        except Exception:
+            continue
+        columns = tuple(str(column) for column in frame.columns)
+        for column in columns:
+            values = {
+                Path(str(value).strip()).stem
+                for value in frame[column].dropna().tolist()
+                if str(value).strip()
+            }
+            if values:
+                result.append((path, column, values, columns))
+    return result
+
+
+def _name_tokens(value: object) -> set[str]:
+    normalized = str(value).lower().replace("-", "_").replace(" ", "_")
+    tokens = {token for token in normalized.split("_") if token}
+    tokens.update(token[:-1] for token in list(tokens) if token.endswith("s"))
+    return tokens
 
 
 def _unique_file_map(directory: Path, extensions: Iterable[str]) -> dict[str, Path] | None:
@@ -183,28 +209,34 @@ class PairedDirectoryLayout:
         return "multimodal" if self.metadata_path is not None else self.input_modality
 
 
-def _submission_schema(root: Path) -> tuple[str | None, tuple[str, ...]]:
-    candidates = sorted(
-        path
-        for path in root.rglob("*")
-        if path.is_file()
-        and path.suffix.lower() in _TABLE_EXTENSIONS
-        and "submission" in path.name.lower()
-    )
-    for path in candidates:
-        try:
-            frame = _table(path)
-        except Exception:
+def _submission_schema(
+    root: Path, test_keys: set[str]
+) -> tuple[str | None, tuple[str, ...], Path | None]:
+    """Find the output template by its alignment to observed inference IDs."""
+    ranked = []
+    if not test_keys:
+        return None, (), None
+    for path, field, values, columns in _table_id_sets(root):
+        if len(columns) < 2:
             continue
-        columns = tuple(str(column) for column in frame.columns)
-        if len(columns) >= 2:
-            return columns[0], columns
-    return None, ()
+        overlap = len(values & test_keys)
+        coverage = overlap / len(test_keys)
+        if coverage < 0.90:
+            continue
+        row_distance = abs(len(values) - len(test_keys)) / max(len(test_keys), 1)
+        ranked.append((coverage, -row_distance, path, field, columns))
+    if not ranked:
+        return None, (), None
+    ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    _, _, path, field, columns = ranked[0]
+    return field, columns, path
 
 
 def _metadata_table(
     root: Path,
     sample_keys: set[str],
+    *,
+    excluded_path: Path | None = None,
 ) -> tuple[Path, str, tuple[str, ...]] | None:
     """Find one unambiguous auxiliary table covering paired sample IDs."""
     best: tuple[float, Path, str, tuple[str, ...]] | None = None
@@ -213,7 +245,7 @@ def _metadata_table(
         if (
             not path.is_file()
             or path.suffix.lower() not in _TABLE_EXTENSIONS
-            or "submission" in path.name.lower()
+            or (excluded_path is not None and path == excluded_path)
         ):
             continue
         try:
@@ -250,96 +282,148 @@ def _metadata_table(
 
 @lru_cache(maxsize=64)
 def discover_paired_directory_layout(task_dir: Path) -> PairedDirectoryLayout | None:
-    """Discover a common paired-file supervised task with strict safeguards."""
+    """Discover paired supervision from content and filename-stem alignment.
+
+    Directory basenames are never assigned train/test/target semantics. The
+    resolver first observes homogeneous file collections, finds near-complete
+    stem pairing, distinguishes inputs from targets using decoded content, and
+    aligns the remaining collection to table IDs when one is present.
+    """
     task_dir = Path(task_dir)
     if (task_dir / "task_config.json").is_file():
         return None
     root = task_input_root(task_dir)
     directories = _candidate_directories(root)
-    media_candidates: list[tuple[str, Path, dict[str, Path]]] = []
-    target_candidates: list[tuple[str, Path, dict[str, Path]]] = []
+    collections: list[tuple[str, Path, dict[str, Path]]] = []
     for directory in directories:
-        name = _normalized_name(directory)
-        split = _split_kind(directory, root)
-        if split == "train":
-            for modality, names in _MEDIA_DIRECTORY_NAMES.items():
-                if name not in names:
-                    continue
-                mapping = _unique_file_map(directory, _MEDIA_EXTENSIONS[modality])
-                if mapping:
-                    media_candidates.append((modality, directory, mapping))
-            for problem_type, target_kind in _TARGET_KINDS.items():
-                if name not in target_kind["names"]:
-                    continue
-                mapping = _unique_file_map(directory, target_kind["extensions"])
-                if mapping:
-                    target_candidates.append((problem_type, directory, mapping))
+        observed = _directory_collection(directory)
+        if observed is not None:
+            family, mapping = observed
+            collections.append((family, directory, mapping))
 
-    matches: list[
-        tuple[float, int, str, str, Path, Path, dict[str, Path], dict[str, Path]]
-    ] = []
-    for modality, input_dir, inputs in media_candidates:
-        for problem_type, target_dir, targets in target_candidates:
-            shared = set(inputs) & set(targets)
-            coverage = len(shared) / max(len(inputs), 1)
-            reverse_coverage = len(shared) / max(len(targets), 1)
+    pair_candidates = []
+    for left_index, (left_family, left_dir, left_files) in enumerate(collections):
+        for right_family, right_dir, right_files in collections[left_index + 1 :]:
+            if left_family != right_family:
+                continue
+            if left_family != "image":
+                # Other paired target encodings require a generated task-native
+                # adapter; do not guess their semantics here.
+                continue
+            shared = set(left_files) & set(right_files)
+            coverage = len(shared) / max(len(left_files), 1)
+            reverse_coverage = len(shared) / max(len(right_files), 1)
             if len(shared) < 2 or coverage < 0.95 or reverse_coverage < 0.95:
                 continue
-            # Masks and boxes are meaningful for images/video; captions may
-            # pair with any media type.  Reject nonsensical combinations.
-            if problem_type in {"segmentation", "detection"} and modality not in {"image", "video"}:
-                continue
-            if problem_type == "temporal_localization" and modality not in {"audio", "video"}:
-                continue
-            matches.append(
+            left_score = _raster_target_score(left_files.values())
+            right_score = _raster_target_score(right_files.values())
+            pair_candidates.append(
                 (
                     min(coverage, reverse_coverage),
                     len(shared),
-                    modality,
-                    problem_type,
-                    input_dir,
-                    target_dir,
-                    inputs,
-                    targets,
+                    left_dir,
+                    right_dir,
+                    left_files,
+                    right_files,
+                    left_score,
+                    right_score,
                 )
             )
-    if not matches:
+    if not pair_candidates:
         return None
-    matches.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    best = matches[0]
-    if len(matches) > 1 and matches[1][:2] == best[:2] and matches[1][4:6] != best[4:6]:
+    pair_candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    best = pair_candidates[0]
+    if len(pair_candidates) > 1 and pair_candidates[1][:2] == best[:2]:
         return None
-    _, _, modality, problem_type, input_dir, target_dir, inputs, targets = best
+    (
+        _,
+        _,
+        left_dir,
+        right_dir,
+        left_files,
+        right_files,
+        left_score,
+        right_score,
+    ) = best
+
+    # Locate an inference collection from its lack of train-stem overlap and
+    # its alignment with any table column. This does not rely on split names.
+    table_sets = _table_id_sets(root)
+    inference_candidates = []
+    paired_stems = set(left_files) | set(right_files)
+    for family, directory, mapping in collections:
+        if directory in {left_dir, right_dir} or family != "image":
+            continue
+        keys = {Path(key).name for key in mapping}
+        overlap_with_pair = len(keys & {Path(key).name for key in paired_stems})
+        if overlap_with_pair / max(len(keys), 1) > 0.05:
+            continue
+        table_coverage = max(
+            (
+                len(keys & values) / max(len(keys), 1)
+                for _, _, values, _ in table_sets
+            ),
+            default=0.0,
+        )
+        inference_candidates.append((table_coverage, len(mapping), directory, mapping))
+    inference_candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    test_input_dir = inference_candidates[0][2] if inference_candidates else None
+    test_mapping = inference_candidates[0][3] if inference_candidates else {}
+    test_items = tuple(sorted(test_mapping.items()))
+    test_stems = {Path(key).name for key in test_mapping}
+    submission_id, submission_columns, submission_path = _submission_schema(
+        root, test_stems
+    )
+
+    # For raster/raster pairs, decoded value cardinality normally identifies the
+    # target. If tiny fixtures are indistinguishable, use vocabulary from the
+    # observed output template as a task-local tie breaker.
+    choose_left_target = False
+    choose_right_target = False
+    if left_score is not None and right_score is not None:
+        choose_left_target = left_score < right_score * 0.75
+        choose_right_target = right_score < left_score * 0.75
+    if not choose_left_target and not choose_right_target and submission_columns:
+        output_tokens = set().union(
+            *(_name_tokens(column) for column in submission_columns[1:])
+        )
+        left_overlap = len(_name_tokens(left_dir.name) & output_tokens)
+        right_overlap = len(_name_tokens(right_dir.name) & output_tokens)
+        choose_left_target = left_overlap > right_overlap
+        choose_right_target = right_overlap > left_overlap
+    if (
+        not choose_left_target
+        and not choose_right_target
+        and test_input_dir is not None
+    ):
+        # The inference collection must use the same representation as the
+        # training input. Compare observed path tokens symmetrically; no token
+        # is assigned a predefined meaning.
+        test_tokens = set(test_input_dir.relative_to(root).parts)
+        left_similarity = len(set(left_dir.relative_to(root).parts) & test_tokens)
+        right_similarity = len(set(right_dir.relative_to(root).parts) & test_tokens)
+        choose_left_target = right_similarity > left_similarity
+        choose_right_target = left_similarity > right_similarity
+    if choose_left_target == choose_right_target:
+        return None
+    if choose_left_target:
+        target_dir, targets = left_dir, left_files
+        input_dir, inputs = right_dir, right_files
+    else:
+        target_dir, targets = right_dir, right_files
+        input_dir, inputs = left_dir, left_files
+
     shared_keys = sorted(set(inputs) & set(targets))
-
-    test_candidates: list[tuple[float, Path, dict[str, Path]]] = []
-    for directory in directories:
-        if _split_kind(directory, root) != "test":
-            continue
-        if _normalized_name(directory) not in _MEDIA_DIRECTORY_NAMES[modality]:
-            continue
-        mapping = _unique_file_map(directory, _MEDIA_EXTENSIONS[modality])
-        if mapping:
-            name_match = float(_normalized_name(directory) == _normalized_name(input_dir))
-            test_candidates.append((name_match, directory, mapping))
-    test_input_dir = None
-    test_items: tuple[tuple[str, Path], ...] = ()
-    if test_candidates:
-        test_candidates.sort(key=lambda item: (item[0], len(item[2])), reverse=True)
-        _, test_input_dir, test_mapping = test_candidates[0]
-        test_items = tuple(sorted(test_mapping.items()))
-
-    all_stems = {Path(key).name for key in shared_keys}
-    all_stems.update(Path(key).name for key, _ in test_items)
-    metadata = _metadata_table(root, all_stems)
-    submission_id, submission_columns = _submission_schema(root)
-    kind = _TARGET_KINDS[problem_type]
+    all_stems = {Path(key).name for key in shared_keys} | test_stems
+    metadata = _metadata_table(
+        root, all_stems, excluded_path=submission_path
+    )
     return PairedDirectoryLayout(
-        input_modality=modality,
-        problem_type=problem_type,
-        output_type=str(kind["output_type"]),
-        target_type=str(kind["target_type"]),
-        target_field=str(kind["field"]),
+        input_modality="image",
+        problem_type="segmentation",
+        output_type="masks",
+        target_type="mask_path",
+        target_field="mask_path",
         train_input_dir=input_dir,
         target_dir=target_dir,
         test_input_dir=test_input_dir,

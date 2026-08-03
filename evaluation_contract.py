@@ -303,23 +303,24 @@ def prepare_evaluation_data(
     fraction = float(profile["data_fraction"])
     folds = int(profile["cv_folds"])
     selected = np.arange(len(X_full))
-    declared_task_type = str(train_data.get("task_type", "")).strip().lower()
-    if unsupervised or declared_task_type in {
-        "captioning",
-        "detection",
-        "regression",
-        "retrieval",
-        "segmentation",
-        "temporal_localization",
-    }:
-        classification = False
-    elif declared_task_type in {
-        "classification",
-        "multilabel_classification",
-    }:
+    target_type = str(train_data.get("target_type") or "").strip().lower()
+    declared_task_type = str(train_data.get("task_type") or "").strip().lower()
+    target_is_file_reference = target_type.endswith("_path") or target_type in {
+        "file_reference",
+        "file_references",
+    }
+    if declared_task_type in {"classification", "multilabel_classification"}:
         classification = True
+    elif declared_task_type in {"regression"}:
+        classification = False
     else:
-        classification = _is_classification(y_full)
+        classification = (
+            False
+            if unsupervised
+            or target_is_file_reference
+            or np.asarray(y_full).ndim != 1
+            else _is_classification(y_full)
+        )
     stratifiable_classification = (
         classification
         and not unsupervised
@@ -410,6 +411,7 @@ def prepare_evaluation_data(
     can_stratify_folds = (
         stratifiable_classification
         and not unsupervised
+        and np.asarray(y).ndim == 1
         and pd.Series(y).value_counts().min() >= folds
     )
     if split_group_ids is not None:
@@ -472,7 +474,7 @@ def prepare_evaluation_data(
         "classification": classification,
         "output_type": train_data.get(
             "output_type",
-            "class_probabilities" if classification else "continuous",
+            "predictions",
         ),
         "leakage_unit": (
             "group_or_entity" if group_ids is not None else "row_id"
@@ -480,11 +482,7 @@ def prepare_evaluation_data(
         "task_type": (
             "unsupervised_clustering"
             if unsupervised
-            else declared_task_type
-            if declared_task_type and declared_task_type != "supervised"
-            else "classification"
-            if classification
-            else "regression"
+            else declared_task_type or "observed_target"
         ),
         "fold_assignment_sha256": digest,
         "task_fingerprint": str(

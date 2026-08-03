@@ -45,15 +45,11 @@ def resolve_submission_template(
     inputs = spec.get("inputs", {})
     candidates: list[object] = []
     if isinstance(inputs, Mapping):
-        for name, raw in inputs.items():
+        for _, raw in inputs.items():
             if not isinstance(raw, Mapping):
                 continue
-            if (
-                str(name) == "sample_submission"
-                or str(raw.get("role", "")) == "sample_submission"
-            ):
+            if str(raw.get("role", "")) == "sample_submission":
                 candidates.append(raw.get("source"))
-    candidates.extend(("sample_submission.csv", "input/sample_submission.csv"))
     for source in candidates:
         path = _safe_task_file(root, source)
         if path is not None:
@@ -69,10 +65,10 @@ def task_requires_submission(task_dir: str | Path, task_spec: Any) -> bool:
     inputs = spec.get("inputs", {})
     if not isinstance(inputs, Mapping):
         return False
-    for name, raw in inputs.items():
+    for _, raw in inputs.items():
         if not isinstance(raw, Mapping):
             continue
-        if str(name) == "test" or str(raw.get("role", "")) == "test":
+        if str(raw.get("role", "")) == "test":
             return True
         options = raw.get("options", {})
         if isinstance(options, Mapping) and options.get("test_source"):
@@ -80,6 +76,45 @@ def task_requires_submission(task_dir: str | Path, task_spec: Any) -> bool:
         if raw.get("test_source"):
             return True
     return False
+
+
+def _discover_aligned_output_template(
+    task_dir: Path, generated_path: Path
+) -> Path | None:
+    """Find an undeclared template by exact observed ID/row alignment."""
+    try:
+        generated = pd.read_csv(generated_path)
+    except Exception:
+        return None
+    if generated.empty or len(generated.columns) < 2:
+        return None
+    generated_ids = set(generated.iloc[:, 0].dropna().astype(str))
+    candidates: list[tuple[int, Path]] = []
+    for path in sorted(Path(task_dir).rglob("*")):
+        if not path.is_file() or path.suffix.lower() not in {".csv", ".tsv"}:
+            continue
+        try:
+            frame = pd.read_csv(
+                path,
+                sep="\t" if path.suffix.lower() == ".tsv" else ",",
+            )
+        except Exception:
+            continue
+        if frame.empty or len(frame.columns) < 2 or len(frame) != len(generated):
+            continue
+        for column in frame.columns:
+            candidate_ids = set(frame[column].dropna().astype(str))
+            if candidate_ids == generated_ids and candidate_ids:
+                # Prefer a first-column identity match; the filename is never
+                # consulted.
+                candidates.append((int(column == frame.columns[0]), path))
+                break
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (item[0], str(item[1])), reverse=True)
+    best_score = candidates[0][0]
+    best = [path for score, path in candidates if score == best_score]
+    return best[0] if len(best) == 1 else None
 
 
 def _aligned_submission(
@@ -207,6 +242,10 @@ def validate_submission_file(
         == "run_length_encoding"
     )
     template_path = resolve_submission_template(task_dir, spec)
+    if template_path is None:
+        template_path = _discover_aligned_output_template(
+            Path(task_dir), path
+        )
     if template_path is not None:
         template_columns = pd.read_csv(template_path, nrows=0).columns
         if len(template_columns) < 2:

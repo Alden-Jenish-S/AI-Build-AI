@@ -234,12 +234,20 @@ def _target_topology(task: TaskSpec, values: pd.Series) -> dict[str, object]:
         )
         return result
 
-    is_regression = task.problem_type == "regression"
-    if is_regression:
-        numeric = pd.to_numeric(clean, errors="coerce").dropna().astype(float)
-        if numeric.empty:
-            result["reason"] = "regression target could not be converted to numeric"
-            return result
+    numeric = pd.to_numeric(clean, errors="coerce")
+    numeric_complete = bool(numeric.notna().all())
+    unique_count = int(clean.nunique(dropna=True))
+    numeric_is_repeated_discrete = False
+    if numeric_complete:
+        numeric_values = numeric.astype(float)
+        integer_like = bool(
+            np.allclose(numeric_values.to_numpy(), np.round(numeric_values.to_numpy()))
+        )
+        numeric_is_repeated_discrete = integer_like and (
+            unique_count <= 100 or unique_count / max(len(clean), 1) <= 0.20
+        )
+    if numeric_complete:
+        numeric = numeric.astype(float)
         quantiles = numeric.quantile(
             [0.0, 0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99, 1.0]
         )
@@ -250,7 +258,11 @@ def _target_topology(task: TaskSpec, values: pd.Series) -> dict[str, object]:
                 ("min", "q01", "q05", "q25", "median", "q75", "q95", "q99", "max")
             )
         }
+    if numeric_complete and not numeric_is_repeated_discrete:
         result["topology"] = "continuous"
+        result["topology_evidence"] = (
+            "all observed targets are numeric with predominantly distinct values"
+        )
         return result
 
     counts = clean.astype(str).value_counts(dropna=False)
@@ -259,6 +271,9 @@ def _target_topology(task: TaskSpec, values: pd.Series) -> dict[str, object]:
     result.update(
         {
             "topology": "categorical",
+            "topology_evidence": (
+                "observed targets are non-numeric or form a bounded repeated set"
+            ),
             "class_count": int(len(counts)),
             "class_distribution": {
                 str(label): int(count)
@@ -614,7 +629,7 @@ def _synthesize_directives(
             else "a leakage-safe Yeo-Johnson or robust target transformation"
         )
         directives.append(
-            f"The regression target is strongly skewed (skewness={skewness:.3f}); "
+            f"The numeric target is strongly skewed (skewness={skewness:.3f}); "
             f"evaluate {transform}, scoring predictions on the original target scale."
         )
 
@@ -759,10 +774,10 @@ def render_dataset_analysis_markdown(
     lines = [
         "# Dataset Analysis",
         "",
-        "## Task contract",
+        "## Verified runtime facts",
         "",
-        f"- Modality: `{task.modality}`",
-        f"- Problem type: `{task.problem_type}`",
+        f"- Inputs: `{[spec.source for spec in task.inputs.values()]}`",
+        f"- Target: `{task.target.to_dict() if task.target else None}`",
         f"- Output type: `{task.output.type}`",
         f"- Primary metric: `{task.primary_metric}` ({task.metric_direction})",
         "",

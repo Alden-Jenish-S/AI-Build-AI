@@ -37,7 +37,7 @@ from .modality_scaffold import (
     task_loader_source,
     write_runtime_data_contract,
 )
-from .prompt_context import modality_prompt_context
+from .prompt_context import task_prompt_context
 from .task_analyzer import TaskAnalyzer
 from .strategy_patterns import render_strategy_patterns
 from .validation_guard import inspect_generated_code
@@ -1375,9 +1375,16 @@ Current copied artifact:
                 f"Selected accelerator {accelerator!r} is not exposed by this run"
             )
         task_dir = Path(task_dir)
-        task_spec = TaskAnalyzer().resolve(task_dir)
+        task_analyzer = TaskAnalyzer(
+            model_name=self.model_name,
+            enable_agent_resolution=True,
+        )
+        task_spec = task_analyzer.resolve(
+            task_dir,
+            require_verification=enforce_evaluation_contract,
+        )
         require_submission = task_requires_submission(task_dir, task_spec)
-        modality_context = modality_prompt_context(task_spec, fidelity)
+        task_correctness_context = task_prompt_context(task_spec, fidelity)
         robust_strategy_context = render_strategy_patterns(
             task_spec.to_dict()
         )
@@ -1400,10 +1407,11 @@ Current copied artifact:
         )
 
         if task_assets_dir is None:
-            TaskAnalyzer().analyze(
+            task_analyzer.analyze(
                 task_dir,
                 output_dir=node_dir,
                 include_index=True,
+                require_verification=enforce_evaluation_contract,
             )
             (node_dir / "task_dataloader.py").write_text(
                 task_loader_source(), encoding="utf-8"
@@ -1603,11 +1611,39 @@ Current copied artifact:
                     analysis_report, encoding="utf-8"
                 )
                     
+            neutral_task_facts = {
+                "inputs": {
+                    name: {
+                        "role": spec.role,
+                        "source": spec.source,
+                        "format": spec.format,
+                        "id_field": spec.id_field,
+                        "required": spec.required,
+                        "options": dict(spec.options),
+                    }
+                    for name, spec in task_spec.inputs.items()
+                },
+                "target": (
+                    task_spec.target.to_dict()
+                    if task_spec.target is not None
+                    else None
+                ),
+                "output": task_spec.output.to_dict(),
+                "metrics": [metric.to_dict() for metric in task_spec.metrics],
+                "sample_id_field": task_spec.sample_id_field,
+                "entity_id_field": task_spec.entity_id_field,
+                "group_id_field": task_spec.group_id_field,
+                "time_field": task_spec.time_field,
+            }
             dataset_snapshot = (
                 "=== Dataset Analysis & Schema Report ===\n"
                 f"{analysis_report}\n"
-                "=== Canonical Task Contract ===\n"
-                f"{json.dumps(task_spec.to_dict(), indent=2)}\n"
+                "=== Neutral Task-Directory Inventory ===\n"
+                f"{json.dumps(task_profile.get('task_inventory', {}), indent=2)}\n"
+                "=== Pre-Planning Task Verification ===\n"
+                f"{json.dumps(task_profile.get('task_verification', {}), indent=2)}\n"
+                "=== Verified Runtime Task Facts ===\n"
+                f"{json.dumps(neutral_task_facts, indent=2)}\n"
                 "=== Concrete Runtime Data Contract ===\n"
                 f"{concrete_data_context}\n"
                 "========================================\n"
@@ -1860,7 +1896,7 @@ Current copied artifact:
             "statistics or fit preprocessing outside training folds.\n"
             f"{fine_tuning_instruction}"
             f"{deep_learning_instruction}"
-            f"Modality correctness contract:\n{modality_context}\n"
+            f"Verified task-evidence correctness contract:\n{task_correctness_context}\n"
             f"Execution accelerator: {accelerator}; available={sorted(exposed_accelerators)}. "
             "The subprocess also exposes this value as AIBUILDAI_ACCELERATOR. When the selected accelerator is "
             "CUDA or MPS, use the framework-native GPU/device option for every compatible training component "
@@ -2243,7 +2279,7 @@ Code:
                     "training or inference, then report it.\n"
                     f"{fine_tuning_instruction}"
                     f"{deep_learning_instruction}"
-                    f"Modality correctness contract:\n{modality_context}\n"
+                    f"Verified task-evidence correctness contract:\n{task_correctness_context}\n"
                     f"IMPORTANT: At the END of your script, write a JSON file 'result.json' in the current directory:\n"
                     f'  import json; json.dump({{"score": <float>, "metric": "{metric_name}", "direction": "{metric_direction}", '
                     f'{result_statistics_prompt}"fidelity": "{fidelity}", '

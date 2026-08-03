@@ -117,7 +117,11 @@ class ManagerAgent:
         self.task_dir = self.project_root / "tasks" / self.task_name
         if not self.task_dir.is_dir():
             raise FileNotFoundError(f"Task directory does not exist: {self.task_dir}")
-        self.task_spec = TaskAnalyzer().resolve(self.task_dir)
+        self.task_analyzer = TaskAnalyzer(
+            model_name=self.model_name,
+            enable_agent_resolution=True,
+        )
+        self.task_spec = self.task_analyzer.resolve(self.task_dir)
         self.modality = self.task_spec.modality
         self.component_modalities = self.task_spec.component_modalities
         self.output_type = self.task_spec.output.type
@@ -165,8 +169,8 @@ class ManagerAgent:
         self.uncertainty_weight = 1.0
         self.max_l1_categories = 8
         self.max_artifact_candidates = 5
-        self.max_fine_tune_rounds = 2
-        self.max_debug_attempts = 3
+        self.max_fine_tune_rounds = 3
+        self.max_debug_attempts = 5
         self.max_parallel_root_nodes = max(
             1, min(3, int(os.cpu_count() or 1))
         )
@@ -208,10 +212,10 @@ class ManagerAgent:
                     1, int(task_config.get("max_artifact_candidates", 5))
                 )
                 self.max_fine_tune_rounds = max(
-                    0, int(task_config.get("max_fine_tune_rounds", 2))
+                    0, int(task_config.get("max_fine_tune_rounds", 3))
                 )
                 self.max_debug_attempts = max(
-                    0, int(task_config.get("max_debug_attempts", 3))
+                    0, int(task_config.get("max_debug_attempts", 5))
                 )
                 self.max_parallel_root_nodes = max(
                     1,
@@ -284,11 +288,9 @@ class ManagerAgent:
             f"ram_gb={self.available_ram_gb:.1f}"
         )
         
-        # Load clean task description for web search queries (Bug 3: prevents branch bias leakage)
-        self.task_description = (
-            f"{self.modality} {self.task_spec.problem_type} ML task: "
-            f"{task_name}"
-        )
+        # Keep the task narrative unclassified. The verified file inventory is
+        # attached immediately before planning in run_tree_search().
+        self.task_description = f"Machine-learning task: {task_name}"
         desc_file = self.task_dir / "task_description.md"
         if desc_file.exists():
             try:
@@ -297,16 +299,6 @@ class ManagerAgent:
             except Exception:
                 pass
         self.task_type = self.task_spec.problem_type
-        self.task_description = (
-            "Canonical task context: "
-            f"modality={self.modality}; "
-            f"component_modalities={list(self.component_modalities)}; "
-            f"problem_type={self.task_type}; "
-            f"output_type={self.output_type}; "
-            f"primary_metric={self.metric_name} "
-            f"({self.metric_direction}).\n"
-            + self.task_description
-        )
                 
         print(
             "ManagerAgent initialized: "
@@ -486,7 +478,7 @@ class ManagerAgent:
             accelerator=self.preferred_accelerator,
             available_accelerators=set(self.available_accelerators),
             tuning_context=config.get("tuning_context"),
-            max_debug_attempts=getattr(self, "max_debug_attempts", 3),
+            max_debug_attempts=getattr(self, "max_debug_attempts", 5),
             metric_name=self.metric_name,
             evaluation_mode=config.get("evaluation_mode"),
             parallel_processes=max(
@@ -871,7 +863,7 @@ class ManagerAgent:
             "implementation_attempts": getattr(
                 self, "implementation_attempts", 0
             ),
-            "max_fine_tune_rounds": getattr(self, "max_fine_tune_rounds", 2),
+            "max_fine_tune_rounds": getattr(self, "max_fine_tune_rounds", 3),
             "best_node_id": getattr(self, "best_node_id", None),
             "final_submission_status": getattr(
                 self, "final_submission_status", "not_attempted"
@@ -978,17 +970,64 @@ class ManagerAgent:
         branches; no preliminary model is generated or executed.
         """
         self._prepare_run_root()
-        task_analysis = TaskAnalyzer().analyze(
+        task_analysis = self.task_analyzer.analyze(
             self.task_dir,
             output_dir=self.run_root,
             include_index=True,
         )
+        # Analysis is a hard gate: no root node exists yet, and analyze() raises
+        # if the resolved sources/targets omit substantial observed task data.
+        self.task_spec = task_analysis.task_spec
+        self.modality = self.task_spec.modality
+        self.component_modalities = self.task_spec.component_modalities
+        self.task_type = self.task_spec.problem_type
+        self.output_type = self.task_spec.output.type
+        self.metric_name = self.task_spec.primary_metric
+        self.metric_direction = self.task_spec.metric_direction
         diagnostics = task_analysis.profile.get("diagnostics", {})
         self.technique_agent.set_dataset_directives(
             diagnostics.get("synthesized_directives", [])
             if isinstance(diagnostics, dict)
             else []
         )
+        evidence = {
+            "task_narrative": self.task_description,
+            "observed_file_groups": (task_analysis.inventory or {}).get(
+                "file_groups", []
+            ),
+            "observed_tables": (task_analysis.inventory or {}).get(
+                "table_summaries", []
+            ),
+            "observed_documents": (task_analysis.inventory or {}).get(
+                "text_documents", []
+            ),
+            "observed_stem_relationships": (task_analysis.inventory or {}).get(
+                "stem_relationships", []
+            ),
+            "verification": dict(task_analysis.verification or {}),
+            "resolved_runtime_facts": {
+                "inputs": {
+                    name: {
+                        "role": spec.role,
+                        "source": spec.source,
+                        "format": spec.format,
+                        "id_field": spec.id_field,
+                        "required": spec.required,
+                        "options": dict(spec.options),
+                    }
+                    for name, spec in self.task_spec.inputs.items()
+                },
+                "target": (
+                    self.task_spec.target.to_dict()
+                    if self.task_spec.target is not None
+                    else None
+                ),
+                "output": self.task_spec.output.to_dict(),
+                "primary_metric": self.metric_name,
+                "metric_direction": self.metric_direction,
+            },
+        }
+        self.technique_agent.set_task_evidence(evidence)
         (self.run_root / "task_dataloader.py").write_text(
             task_loader_source(), encoding="utf-8"
         )
@@ -1511,9 +1550,9 @@ class ManagerAgent:
             fallback.get("candidate_artifact", {}).get("model_card")
         ) or {}
         artifact_id = card.get("artifact_id") or fallback.get("artifact_id")
-        modality = fallback.get("modality") or "tabular"
         original_plan = fallback.get(
-            "plan", f"Build a robust {modality} pipeline."
+            "plan",
+            "Build a robust pipeline from the verified task evidence.",
         )
         fallback["unavailable_artifact"] = {
             "artifact_id": artifact_id,
@@ -1604,7 +1643,7 @@ class ManagerAgent:
             and tuning_evidence.probability_material_improvement
             >= self.promotion_controller.boundary
             and fine_tune_depth
-            < getattr(self, "max_fine_tune_rounds", 2)
+            < getattr(self, "max_fine_tune_rounds", 3)
         )
         if tunable_parameters_declared and not tunable_parameters:
             tune_eligible = False

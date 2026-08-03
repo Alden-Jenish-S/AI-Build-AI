@@ -1,6 +1,6 @@
 # AIBuildAI: Evidence-Driven Autonomous Machine Learning Engine
 
-AIBuildAI is an autonomous, modality-neutral AutoML and research framework. It searches, evaluates, fine-tunes, and ensembles machine learning models across tabular, image, audio, video, and multimodal datasets.
+AIBuildAI is an autonomous, data-agnostic AutoML and research framework. It inspects the files supplied with each task, verifies a task-local runtime contract, and only then searches, evaluates, fine-tunes, and ensembles machine-learning methods.
 
 The engine uses statistical search policies, candidate lineage tracking, a verified memory pool of reusable templates, and harness-owned evaluation safety to build, optimize, and bundle deployable ensemble solutions.
 
@@ -8,11 +8,12 @@ The engine uses statistical search policies, candidate lineage tracking, a verif
 
 ## Key Features
 
-- **Modality-Neutral Architecture**: Native support for **tabular, image, audio, video, text**, and entity-aligned **multimodal** tasks (e.g., joint tabular and image classification/regression).
+- **Content-First Task Discovery**: Builds a neutral inventory from file signatures, bounded previews, directory collections, and cross-file identifier/stem alignment. No missing configuration silently defaults to a table or a conventional filename.
+- **Pre-Planning Verification Gate**: The method tree is created only after required sources and targets exist, indexed records align, and the resolved contract accounts for substantial observed data groups.
 - **Evidence-Driven Search Scheduler**: A lineage-aware scheduling tree that manages search and promotion budgets dynamically based on uncertainty-adjusted cross-validation performance.
 - **Harness-Owned Evaluation Protocol**: Enforces strict out-of-fold (OOF) cross-validation splits, leakage checks, and multi-fidelity runtime profiles (`screen`, `medium`, and `full`).
 - **Dynamic Ensembling & Stacking**: Automatically generates OOF-weighted cross-validated stacking combiners or structured output merges (embeddings, spatial logit maps, bounding boxes) without code fusion.
-- **Empirical Memory Pool**: Retrieves and ranks reusable templates and hyperparameter configurations from global tuning history based on modality, task profiles, and past performance.
+- **Empirical Memory Pool**: Retrieves reusable methods by branch intent and verified callable evidence; historical modality labels do not prefilter candidates.
 - **Sandbox Verification Runtime**: Runs and checks newly discovered models and pipelines within isolated, resource-limited subprocesses (`sandbox-exec` on macOS).
 
 ---
@@ -28,6 +29,7 @@ agent_system/
 │
 ├── modalities/
 │   ├── base.py                   # Protocols defining adapter interfaces
+│   ├── generic.py                # Contract-driven indexing for unseen task formats
 │   ├── media_base.py             # Shared manifest-driven media indexing logic
 │   ├── tabular.py                # Tabular indexing, profiling, and discovery
 │   ├── image.py                  # Image lazy loading, sizing, color modes
@@ -51,13 +53,14 @@ agent_system/
 │
 ├── agents/
 │   ├── task_analyzer.py          # Registry-driven task configuration analyzer
+│   ├── task_inventory.py         # Neutral file inspection and contract verification
 │   ├── data_analyzer.py          # Backward-compatible tabular analyzer facade
 │   ├── manager_agent.py          # Search orchestrator and merge builder
 │   ├── technique_agent.py        # Retrieves techniques and designs approaches
 │   ├── implementation_agent.py   # Generates and refines executable scripts
 │   ├── aggregator_agent.py       # Blends predictions using OOF weights
 │   ├── validation_guard.py       # General and modality-specific leakage guards
-│   ├── prompt_context.py         # Modality-specific generation constraints
+│   ├── prompt_context.py         # Evidence-derived generation constraints
 │   ├── modality_scaffold.py      # Scaffolds for media and multimodal data loading
 │   └── llm_utils.py              # Model providers and token tracking
 │
@@ -110,7 +113,8 @@ python eval/run_search.py playground-series-s6e2 --budget 6
 
 ### Output Artifacts
 Each search run generates a workspace directory structure under `runs/<task_name>/`:
-- `resolved_task_spec.json`, `dataset_profile.json`, `dataset_analysis.md`, and, for structured modalities, `dataset_index.jsonl`: Harness-generated task assets used by every root method. The profile owns index metadata and bounded diagnostics; the Markdown report supplies synthesized modeling directives without duplicating the full JSON contract.
+- `task_inventory.json` and `task_verification.json`: content-first observations and the verification decision made before planning.
+- `resolved_task_spec.json`, `dataset_profile.json`, `dataset_analysis.md`, and, when needed, `dataset_index.jsonl`: Harness-generated task assets used by every root method. The profile owns index metadata, the neutral inventory, verification evidence, and bounded diagnostics.
 - `node_<n>/`: Source code, execution logs, OOF predictions, and metrics for each search-tree node.
 - `ensemble_manifest.json`: Evaluated ensemble configurations and weights.
 - `submission.csv`: Final ensembled predictions ready for deployment.
@@ -120,41 +124,39 @@ Each search run generates a workspace directory structure under `runs/<task_name
 
 ## Configuration
 
-Tasks are described using a `task_config.json` file in the task's source directory (`tasks/<task_name>/task_config.json`):
+The engine first inspects every supplied task file. An optional `task_config.json` can state facts that cannot be established from the files themselves; it is not required to use conventional basenames or a closed list of task/data identifiers. Ambiguous evidence is rejected before search rather than filled with defaults.
 
 ```json
 {
   "schema_version": 2,
-  "modality": "multimodal",
-  "component_modalities": ["image", "tabular"],
-  "problem_type": "classification",
+  "modality": "task-native-records",
+  "problem_type": "next-state-utility",
   "inputs": {
-    "image": {
-      "modality": "image",
-      "source": "input/entities.csv",
-      "format": "file_manifest",
-      "path_field": "image_path"
+    "observed": {
+      "role": "train",
+      "source": "input/observed.jsonl",
+      "format": "jsonl",
+      "id_field": "entity_key"
     },
-    "metadata": {
-      "modality": "tabular",
-      "source": "input/entities.csv",
-      "format": "csv",
-      "feature_fields": ["age", "location", "device_type"]
+    "requested": {
+      "role": "test",
+      "source": "input/requested.jsonl",
+      "format": "jsonl",
+      "id_field": "entity_key"
     }
   },
-  "sample_id_field": "entity_id",
-  "entity_id_field": "entity_id",
+  "sample_id_field": "entity_key",
   "target": {
-    "source": "input/entities.csv",
-    "field": "label"
+    "source": "input/observed.jsonl",
+    "field": "utility"
   },
   "output": {
-    "type": "class_probabilities"
+    "type": "next-state-value"
   },
   "metrics": [
-    {"name": "roc_auc", "direction": "maximize"}
+    {"name": "absolute-utility-error", "direction": "minimize"}
   ],
-  "primary_metric": "roc_auc",
+  "primary_metric": "absolute-utility-error",
   "resource_limits": {
     "preferred_accelerator": "auto",
     "max_ram_gb": 32
@@ -162,13 +164,13 @@ Tasks are described using a `task_config.json` file in the task's source directo
 }
 ```
 
-`problem_type`, `output`, and `metrics` are independent of modality. If a
-legacy task omits its metric, the resolver chooses a concrete task-aware
-default (`accuracy`, `rmse`, `dice`, `box_iou`, `ndcg@10`, and so on);
-the legacy word `score` is not treated as an evaluator name. Mixed legacy
-datasets whose tabular IDs match image/audio/video filenames are indexed as
-multimodal automatically. Ambiguous media layouts should use the explicit
-schema-v2 form above.
+Task-kind, objective, output, and metric identifiers are open-ended. Registered
+adapters remain optimized decoders for explicitly established storage formats;
+unseen identifiers use the contract-driven generic indexer. With no complete
+contract, deterministic content and relationship checks run first, then the
+task-analysis agent may propose a contract. Every proposed source, target,
+coverage claim, and indexed record is checked against disk. Ambiguity stops the
+run before method-tree construction. Legacy configurations remain supported.
 
 ### Environment Settings
 Define your preferred LLM provider and credentials:
