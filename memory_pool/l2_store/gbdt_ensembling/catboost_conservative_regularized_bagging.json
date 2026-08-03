@@ -74,18 +74,5 @@
       "attempt": 1,
       "status": "verified"
     }
-  ],
-  "task_validations": [
-    {
-      "task_name": "playground-series-s6e2",
-      "node_id": "node_7",
-      "score": null,
-      "metric_direction": "maximize",
-      "status": "failed",
-      "reward": -1.0,
-      "fidelity": "screen",
-      "elapsed_seconds": 417.57310275000054,
-      "improved_over_baseline": null
-    }
   ]
 }

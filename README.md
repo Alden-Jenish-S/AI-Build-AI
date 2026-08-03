@@ -110,7 +110,7 @@ python eval/run_search.py playground-series-s6e2 --budget 6
 
 ### Output Artifacts
 Each search run generates a workspace directory structure under `runs/<task_name>/`:
-- `resolved_task_spec.json`, `dataset_profile.json`, and `dataset_index.jsonl`: Harness-generated task assets used by every root method.
+- `resolved_task_spec.json`, `dataset_profile.json`, `dataset_analysis.md`, and, for structured modalities, `dataset_index.jsonl`: Harness-generated task assets used by every root method. The profile owns index metadata and bounded diagnostics; the Markdown report supplies synthesized modeling directives without duplicating the full JSON contract.
 - `node_<n>/`: Source code, execution logs, OOF predictions, and metrics for each search-tree node.
 - `ensemble_manifest.json`: Evaluated ensemble configurations and weights.
 - `submission.csv`: Final ensembled predictions ready for deployment.

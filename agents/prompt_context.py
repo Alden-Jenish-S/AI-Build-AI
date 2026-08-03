@@ -42,8 +42,9 @@ def modality_prompt_context(task: TaskSpec, fidelity: str) -> str:
         detail = (
             "Keep all components for one entity in the same fold. Begin with "
             "late fusion: train component branches independently, produce "
-            "aligned OOF probabilities/embeddings, and let ManagerAgent fit the "
-            "combiner. Represent missing optional inputs with explicit masks; "
+            "aligned validation probabilities/embeddings using the evaluation "
+            "mode selected by the harness, and let ManagerAgent fit the combiner "
+            "only when compatible outputs exist. Represent missing optional inputs with explicit masks; "
             "do not discard or independently split modalities."
         )
     elif task.modality == "text":
@@ -60,5 +61,18 @@ def modality_prompt_context(task: TaskSpec, fidelity: str) -> str:
         detail = (
             f"Use fold-fitted {task.modality} preprocessing and preserve the current "
             "harness-owned sample/fold contract."
+        )
+    target_type = str(task.target.type or "") if task.target is not None else ""
+    if target_type.endswith("_path"):
+        detail += (
+            f" Targets use typed `{target_type}` task-relative file references. "
+            "The evaluation helper decodes selected targets after the harness "
+            "split; never encode target path strings as labels or features."
+        )
+    if task.problem_type == "segmentation":
+        detail += (
+            " Decode input images lazily, preserve mask spatial alignment, train "
+            "with mask tensors, restore predictions to the authoritative target "
+            "resolution, and emit one N-D mask prediction per sample."
         )
     return shared + "\n" + detail

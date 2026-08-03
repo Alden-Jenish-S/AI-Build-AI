@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import json
-import math
 import os
 import re
 from pathlib import Path
 from typing import List, Dict, Any
-from .llm_utils import call_llm
+from .llm_utils import call_llm, call_llm_json
 from .web_search import search_web
 from memory_pool.query_tool import artifact_compatibility, query
 from .strategy_patterns import render_strategy_patterns, strategy_patterns
@@ -21,6 +20,22 @@ class TechniqueAgent:
         self.model_name = model_name
         self.max_l1_categories = max(1, int(max_l1_categories))
         self.max_artifact_candidates = max(1, int(max_artifact_candidates))
+        self.dataset_directives: tuple[str, ...] = ()
+
+    def set_dataset_directives(self, directives: object) -> None:
+        """Set task-local, analyzer-derived evidence for planning prompts."""
+        if not isinstance(directives, (list, tuple)):
+            self.dataset_directives = ()
+            return
+        self.dataset_directives = tuple(
+            str(item).strip() for item in directives if str(item).strip()
+        )
+
+    def _dataset_directive_prompt(self) -> str:
+        directives = getattr(self, "dataset_directives", ())
+        if not directives:
+            return "- No synthesized dataset directive was available."
+        return "\n".join(f"- {item}" for item in directives)
 
     def generate_initial_approaches(
         self, task_description: str, count: int = 3
@@ -53,48 +68,55 @@ class TechniqueAgent:
             "Avoid superficial hyperparameter-only variants. Prefer complementary error profiles and robust pipeline controls.\n"
             "Reusable design principles:\n"
             f"{render_strategy_patterns({})}\n"
+            "AUTHORITATIVE DATASET-DIAGNOSTIC DIRECTIVES:\n"
+            f"{self._dataset_directive_prompt()}\n"
+            "Use these as evidence for branch design while keeping every "
+            "learned operation leakage-safe.\n"
             "Do not include any explanation or markdown formatting, just the raw JSON list."
         )
         user_prompt = (
             f"Task Description:\n{task_description}\n\n"
             f"Propose the {count} best approaches in JSON format."
         )
-        response = call_llm(system_prompt, user_prompt, model=self.model_name)
-
-        try:
-            return self._parse_initial_approaches(response, count)
-        except Exception as parse_error:
-            print(f"TechniqueAgent WARNING: Failed to parse initial approaches JSON: {parse_error}. Asking LLM to repair the response.")
-
-        repair_system = (
-            "You repair malformed JSON for an ML technique planner. "
-            f"Return ONLY a valid JSON list of exactly {count} dictionaries, each with non-empty 'name' and 'plan' strings. "
-            "Do not invent generic fallback branches; preserve and clean the task-specific ideas from the draft."
+        response = call_llm_json(
+            system_prompt,
+            user_prompt,
+            model=self.model_name,
+            schema_name="initial_pipeline_approaches",
+            schema={
+                "type": "array",
+                "minItems": count,
+                "maxItems": count,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["name", "plan"],
+                    "properties": {
+                        "name": {"type": "string"},
+                        "plan": {"type": "string"},
+                    },
+                },
+            },
         )
-        repair_user = f"""
-Task Description:
-{task_description}
-
-Malformed Draft:
-{response}
-
-Return repaired JSON only.
-"""
-        repaired_response = call_llm(repair_system, repair_user, model=self.model_name)
-        return self._parse_initial_approaches(repaired_response, count)
+        return self._parse_initial_approaches(response, count)
 
     def _parse_initial_approaches(
-        self, response: str, expected_count: int = 3
+        self, response: object, expected_count: int = 3
     ) -> List[Dict[str, str]]:
         """Parse and validate the LLM-authored initial branch ideas."""
-        if "```json" in response:
-            json_str = response.split("```json", 1)[1].split("```", 1)[0]
-        elif "```" in response:
-            json_str = response.split("```", 1)[1].split("```", 1)[0]
+        if isinstance(response, str) and "```json" in response:
+            payload = json.loads(
+                response.split("```json", 1)[1].split("```", 1)[0].strip()
+            )
+        elif isinstance(response, str) and "```" in response:
+            payload = json.loads(
+                response.split("```", 1)[1].split("```", 1)[0].strip()
+            )
+        elif isinstance(response, str):
+            payload = json.loads(response.strip())
         else:
-            json_str = response
-
-        approaches = json.loads(json_str.strip())
+            payload = response
+        approaches = payload
         if not isinstance(approaches, list) or len(approaches) != expected_count:
             raise ValueError(
                 f"expected a JSON list with exactly {expected_count} approaches"
@@ -157,18 +179,27 @@ Return repaired JSON only.
             f"{json.dumps(global_memory_context or {}, indent=2, default=str)}\n\n"
             f"Parent code:\n```python\n{parent_code}\n```\n"
         )
-        response = call_llm(
+        item = call_llm_json(
             "You are an ML search-policy agent. Materialize exactly one already-selected "
             "operator into a concrete task-specific experiment. Return ONLY one JSON object "
-            "with fields name, plan, operator, priority. Priority must be numeric in [-0.1, 0.1].",
+            "with fields name, plan, operator, priority. Priority must be numeric in [-0.1, 0.1].\n"
+            "AUTHORITATIVE DATASET-DIAGNOSTIC DIRECTIVES:\n"
+            f"{self._dataset_directive_prompt()}\n",
             user_prompt,
             model=self.model_name,
+            schema_name="follow_up_approach",
+            schema={
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["name", "plan", "operator", "priority"],
+                "properties": {
+                    "name": {"type": "string"},
+                    "plan": {"type": "string"},
+                    "operator": {"type": "string", "enum": [operator]},
+                    "priority": {"type": "number"},
+                },
+            },
         )
-        if "```json" in response:
-            response = response.split("```json", 1)[1].split("```", 1)[0]
-        elif "```" in response:
-            response = response.split("```", 1)[1].split("```", 1)[0]
-        item = json.loads(response.strip())
         if not isinstance(item, dict) or item.get("operator") != operator:
             raise ValueError("lazy proposal did not preserve the selected operator")
         name = re.sub(
@@ -211,10 +242,9 @@ Return repaired JSON only.
         self,
         candidate: dict,
         branch_plan: str,
-        total_runs: int,
         preferred_accelerator: str = "cpu",
     ) -> float:
-        """Combine lexical fit, empirical reward, and an exploration bonus."""
+        """Rank immutable strategy metadata without task-run evidence."""
         branch_terms = self._terms(branch_plan)
         artifact_terms = self._terms(
             " ".join(
@@ -227,11 +257,6 @@ Return repaired JSON only.
             ).replace("_", " ")
         )
         lexical = len(branch_terms & artifact_terms) / max(len(branch_terms), 1)
-        stats = candidate.get("validation_summary", {})
-        runs = max(0, int(stats.get("runs", 0) or 0))
-        mean_reward = float(stats.get("mean_reward", 0.0) or 0.0)
-        completion_rate = float(stats.get("completion_rate", 0.0) or 0.0)
-        exploration = math.sqrt(math.log(max(total_runs, 0) + 2.0) / (runs + 1.0))
         capabilities = candidate.get("capabilities") or {}
         raw_supported_accelerators = capabilities.get("supported_accelerators") or []
         if not isinstance(raw_supported_accelerators, (list, tuple, set)):
@@ -250,13 +275,7 @@ Return repaired JSON only.
             )
         ):
             gpu_bonus = 0.12
-        return (
-            lexical
-            + 0.35 * mean_reward
-            + 0.15 * completion_rate
-            + 0.08 * exploration
-            + gpu_bonus
-        )
+        return lexical + gpu_bonus
 
     def generate_follow_up_approaches(
         self,
@@ -275,7 +294,9 @@ Return repaired JSON only.
             "- diversify: target a complementary data representation or robustness hypothesis likely to reduce the parent's measured error buckets; changing only the model-family label is insufficient.\n"
             "PIPELINE EVIDENCE CONTRACT: Every refine/diversify plan must cite a concrete parent residual, confidence, class, or error bucket when error_analysis is available.\n"
             "Each item must have non-empty 'name', 'plan', 'operator', and numeric 'priority' in [-0.1, 0.1]. "
-            "Plans must be concrete, task-specific, leakage-safe, and directly executable."
+            "Plans must be concrete, task-specific, leakage-safe, and directly executable.\n"
+            "AUTHORITATIVE DATASET-DIAGNOSTIC DIRECTIVES:\n"
+            f"{self._dataset_directive_prompt()}\n"
         )
         user_prompt = f"""
 Task:
@@ -294,30 +315,47 @@ Parent code:
 
 Return the three child experiments as JSON only.
 """
-        response = call_llm(system_prompt, user_prompt, model=self.model_name)
-        try:
-            return self._parse_follow_up_approaches(response)
-        except Exception as parse_error:
-            print(
-                "TechniqueAgent WARNING: Failed to parse follow-up portfolio: "
-                f"{parse_error}. Asking LLM to repair it."
-            )
-        repair = call_llm(
-            "Repair the draft into ONLY a JSON list of exactly three dictionaries with unique "
-            "operators refine, tune, diversify and fields name, plan, operator, priority.",
-            response,
+        response = call_llm_json(
+            system_prompt,
+            user_prompt,
             model=self.model_name,
+            schema_name="follow_up_portfolio",
+            schema={
+                "type": "array",
+                "minItems": 3,
+                "maxItems": 3,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["name", "plan", "operator", "priority"],
+                    "properties": {
+                        "name": {"type": "string"},
+                        "plan": {"type": "string"},
+                        "operator": {
+                            "type": "string",
+                            "enum": ["refine", "tune", "diversify"],
+                        },
+                        "priority": {"type": "number"},
+                    },
+                },
+            },
         )
-        return self._parse_follow_up_approaches(repair)
+        return self._parse_follow_up_approaches(response)
 
-    def _parse_follow_up_approaches(self, response: str) -> List[Dict[str, Any]]:
-        if "```json" in response:
-            payload = response.split("```json", 1)[1].split("```", 1)[0]
-        elif "```" in response:
-            payload = response.split("```", 1)[1].split("```", 1)[0]
+    def _parse_follow_up_approaches(self, response: object) -> List[Dict[str, Any]]:
+        if isinstance(response, str) and "```json" in response:
+            payload = json.loads(
+                response.split("```json", 1)[1].split("```", 1)[0].strip()
+            )
+        elif isinstance(response, str) and "```" in response:
+            payload = json.loads(
+                response.split("```", 1)[1].split("```", 1)[0].strip()
+            )
+        elif isinstance(response, str):
+            payload = json.loads(response.strip())
         else:
             payload = response
-        approaches = json.loads(payload.strip())
+        approaches = payload
         if not isinstance(approaches, list) or len(approaches) != 3:
             raise ValueError("expected exactly three follow-up approaches")
         required_operators = {"refine", "tune", "diversify"}
@@ -506,15 +544,10 @@ Which 1-2 categories best match the strategic direction? Output a comma-separate
             ]
             l2_candidates.extend(verified_artifacts)
 
-        total_runs = sum(
-            int(item.get("validation_summary", {}).get("runs", 0) or 0)
-            for item in l2_candidates
-        )
         for candidate in l2_candidates:
             candidate["retrieval_prior"] = self._artifact_prior(
                 candidate,
                 branch_plan,
-                total_runs,
                 preferred_accelerator=preferred_accelerator,
             )
         l2_candidates.sort(
@@ -537,14 +570,12 @@ Which 1-2 categories best match the strategic direction? Output a comma-separate
         candidates_str = ""
         for cand in l2_candidates:
             if "error" not in cand:
-                empirical = cand.get("validation_summary", {})
                 candidates_str += (
                     f"- ID: {cand['artifact_id']} (Category: {cand['category']}): "
                     f"{cand['description']} | scope={cand.get('scope')} | "
                     f"retrieval_prior={cand.get('retrieval_prior', 0.0):.4f} | "
                     f"resources={json.dumps(cand.get('resource_profile', {}))} | "
                     f"capabilities={json.dumps(cand.get('capabilities', {}))} | "
-                    f"empirical_validation={json.dumps(empirical)} | "
                     f"pitfalls={cand.get('known_pitfalls', [])}\n"
                 )
         

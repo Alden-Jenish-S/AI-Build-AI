@@ -28,6 +28,10 @@ _EXPORTS = {
         ".prediction_io",
         "load_prediction_bundle",
     ),
+    "load_prediction_table": (
+        ".prediction_io",
+        "load_prediction_table",
+    ),
     "prepare_evaluation_bundle": (
         ".runner",
         "prepare_evaluation_bundle",
@@ -39,6 +43,10 @@ _EXPORTS = {
     "write_prediction_bundle": (
         ".prediction_io",
         "write_prediction_bundle",
+    ),
+    "write_prediction_table": (
+        ".prediction_io",
+        "write_prediction_table",
     ),
 }
 

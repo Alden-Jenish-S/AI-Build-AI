@@ -17,7 +17,13 @@ from evaluation.metrics import (
     resolve_metric_name,
 )
 from evaluation.policy import select_evaluation_policy
-from evaluation.prediction_io import write_prediction_bundle
+from evaluation.prediction_io import (
+    load_assignment_table,
+    load_prediction_table,
+    write_assignment_table,
+    write_prediction_bundle,
+    write_prediction_table,
+)
 from evaluation.runner import evaluate_prediction_bundle
 from evaluation_contract import (
     evaluate_clustering_predictions,
@@ -25,8 +31,12 @@ from evaluation_contract import (
     prepare_evaluation_data,
     prepare_holdout_evaluation_data,
     validate_evaluation_outputs,
+    write_structured_predictions,
 )
-from evaluation.submission import validate_node_submission
+from evaluation.submission import (
+    validate_node_submission,
+    validate_submission_file,
+)
 
 
 class MetricResolutionTests(unittest.TestCase):
@@ -45,6 +55,13 @@ class MetricResolutionTests(unittest.TestCase):
         )
         self.assertIsNone(
             infer_metric_from_description("Build the best possible model.")
+        )
+        self.assertEqual(
+            infer_metric_from_description(
+                "Segmentation masks are evaluated using mean average precision "
+                "at intersection over union (IoU) thresholds from 0.5 to 0.95."
+            ),
+            "segmentation_average_precision",
         )
 
     def test_placeholder_metrics_resolve_from_problem_and_output(self):
@@ -98,6 +115,44 @@ class MetricResolutionTests(unittest.TestCase):
 
 
 class EvaluationPolicyTests(unittest.TestCase):
+    def test_binary_prediction_and_assignment_tables_round_trip(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            write_prediction_table(
+                root / "oof_predictions.npz",
+                sample_ids=["a", "b"],
+                targets=np.asarray([0, 1]),
+                predictions=np.asarray([[0.8, 0.2], [0.1, 0.9]]),
+                fold_ids=np.asarray([0, 1]),
+                class_names=["no", "yes"],
+            )
+            write_assignment_table(
+                root / "fold_assignments.npz",
+                sample_ids=["a", "b"],
+                fold_ids=np.asarray([0, 1]),
+            )
+
+            predictions = load_prediction_table(
+                root / "oof_predictions"
+            )
+            assignments = load_assignment_table(
+                root / "fold_assignments"
+            )
+
+            self.assertEqual(
+                predictions.columns.tolist(),
+                [
+                    "row_id",
+                    "target",
+                    "prediction::no",
+                    "prediction::yes",
+                    "fold_id",
+                ],
+            )
+            self.assertEqual(assignments["row_id"].tolist(), ["a", "b"])
+            self.assertFalse((root / "oof_predictions.csv").exists())
+            self.assertFalse((root / "fold_assignments.csv").exists())
+
     @staticmethod
     def _task(problem_type="classification"):
         return TaskSpec.from_mapping(
@@ -225,7 +280,7 @@ class EvaluationPolicyTests(unittest.TestCase):
                 output_dir=temp_dir,
             )
             self.assertTrue(
-                (Path(temp_dir) / "validation_predictions.csv").is_file()
+                (Path(temp_dir) / "validation_predictions.npz").is_file()
             )
             self.assertFalse(
                 (Path(temp_dir) / "oof_predictions.csv").exists()
@@ -262,6 +317,18 @@ class OutputAwareMetricTests(unittest.TestCase):
         )
         mask = np.asarray([[[0, 1], [1, 0]]])
         self.assertEqual(metric_value("dice", mask, mask), 1.0)
+        self.assertEqual(
+            metric_value("segmentation_average_precision", mask, mask),
+            1.0,
+        )
+        self.assertEqual(
+            metric_value(
+                "segmentation_average_precision",
+                mask,
+                mask.astype(float)[:, None, :, :],
+            ),
+            1.0,
+        )
         self.assertEqual(
             metric_value(
                 "box_iou",
@@ -323,6 +390,32 @@ class OutputAwareMetricTests(unittest.TestCase):
             )
             self.assertEqual(result["metric"], "ndcg@10")
             self.assertEqual(result["folds"], 2)
+
+    def test_ranked_aggregation_preserves_best_structured_submission(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            for node_id, values in (
+                ("best", ["", "1 2"]),
+                ("other", ["3 1", ""]),
+            ):
+                submission_dir = root / node_id / "submission"
+                submission_dir.mkdir(parents=True)
+                pd.DataFrame(
+                    {"id": ["a", "b"], "rle_mask": values}
+                ).to_csv(submission_dir / "submission.csv", index=False)
+            destination = root / "ensemble.csv"
+            selected = AggregatorAgent().aggregate_ranked_candidates(
+                root,
+                [
+                    {"node_id": "best", "score": 0.9},
+                    {"node_id": "other", "score": 0.8},
+                ],
+                destination,
+                metric_name="segmentation_average_precision",
+            )
+            self.assertEqual(selected, ["best"])
+            copied = pd.read_csv(destination, keep_default_na=False)
+            self.assertEqual(copied["rle_mask"].tolist(), ["", "1 2"])
 
     def test_probability_matrix_oof_can_be_scored_and_blended(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -621,6 +714,63 @@ class LegacyInferenceAndValidationTests(unittest.TestCase):
             )
             self.assertEqual(final["id"].tolist(), [250000, 250001])
             self.assertEqual(final["loss"].tolist(), [1.0, 2.0])
+
+    def test_rle_submission_accepts_empty_masks_and_rejects_bad_runs(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            task_dir = root / "task"
+            task_dir.mkdir()
+            template = task_dir / "sample_submission.csv"
+            pd.DataFrame(
+                {"id": ["a", "b"], "rle_mask": ["", ""]}
+            ).to_csv(template, index=False)
+            spec = TaskSpec.from_mapping(
+                "segmentation",
+                {
+                    "schema_version": 2,
+                    "modality": "image",
+                    "problem_type": "segmentation",
+                    "inputs": {
+                        "image": {
+                            "modality": "image",
+                            "source": "train/images",
+                        },
+                        "sample_submission": {
+                            "modality": "image",
+                            "source": "sample_submission.csv",
+                            "required": False,
+                        },
+                    },
+                    "target": {
+                        "source": "train/masks",
+                        "field": "mask_path",
+                        "type": "mask_path",
+                    },
+                    "output": {
+                        "type": "masks",
+                        "options": {
+                            "submission_encoding": "run_length_encoding",
+                            "rle_index_base": 1,
+                        },
+                    },
+                    "metrics": ["dice"],
+                },
+            )
+            submission = root / "submission.csv"
+            pd.DataFrame(
+                {"id": ["b", "a"], "rle_mask": ["", "1 2 5 1"]}
+            ).to_csv(submission, index=False)
+            frame, _ = validate_submission_file(
+                submission, task_dir=task_dir, task_spec=spec
+            )
+            self.assertEqual(frame["rle_mask"].tolist(), ["1 2 5 1", ""])
+            pd.DataFrame(
+                {"id": ["a", "b"], "rle_mask": ["1 3 3 1", ""]}
+            ).to_csv(submission, index=False)
+            with self.assertRaisesRegex(ValueError, "non-overlapping"):
+                validate_submission_file(
+                    submission, task_dir=task_dir, task_spec=spec
+                )
 
     def test_legacy_oof_id_alias_is_canonicalized(self):
         with tempfile.TemporaryDirectory() as temp_dir:

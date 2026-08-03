@@ -17,6 +17,7 @@ from agents.implementation_agent import ImplementationAgent
 from agents.llm_utils import (
     _resolve_llm_config,
     call_llm,
+    call_llm_json,
     get_token_usage,
     reset_token_usage,
 )
@@ -276,6 +277,96 @@ class RuntimeSafetyTests(unittest.TestCase):
         self.assertNotIn("temperature", captured["request"])
         self.assertEqual(get_token_usage()["input_tokens"], 7)
         self.assertEqual(get_token_usage()["output_tokens"], 3)
+
+    def test_structured_llm_output_is_schema_constrained_and_cached(self):
+        captured = {"calls": 0}
+
+        class FakeOpenAI:
+            def __init__(self, **_kwargs):
+                def create(**request):
+                    captured["calls"] += 1
+                    captured["request"] = request
+                    return SimpleNamespace(
+                        choices=[
+                            SimpleNamespace(
+                                message=SimpleNamespace(
+                                    content='{"name":"robust_pipeline"}'
+                                )
+                            )
+                        ],
+                        usage={"input_tokens": 5, "output_tokens": 2},
+                    )
+
+                self.chat = SimpleNamespace(
+                    completions=SimpleNamespace(create=create)
+                )
+
+        schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["name"],
+            "properties": {"name": {"type": "string"}},
+        }
+        reset_token_usage()
+        with patch.dict(
+            os.environ,
+            {
+                "LLM_PROVIDER": "custom-gateway",
+                "LLM_API_KEY": "test-key",
+                "LLM_BASE_URL": "http://localhost:9000/v1",
+                "LLM_MODEL": "custom-model",
+                "LLM_SEND_PROMPT_CACHE_KEY": "0",
+            },
+            clear=True,
+        ), patch.dict(
+            sys.modules, {"openai": SimpleNamespace(OpenAI=FakeOpenAI)}
+        ):
+            first = call_llm_json(
+                "stable system",
+                "same request",
+                schema=schema,
+                schema_name="pipeline",
+            )
+            second = call_llm_json(
+                "stable system",
+                "same request",
+                schema=schema,
+                schema_name="pipeline",
+            )
+
+        self.assertEqual(first, {"name": "robust_pipeline"})
+        self.assertEqual(second, first)
+        self.assertEqual(captured["calls"], 1)
+        self.assertEqual(
+            captured["request"]["response_format"]["type"], "json_schema"
+        )
+        self.assertTrue(get_token_usage()["calls"][-1]["cache_hit"])
+
+    def test_structured_llm_preserves_outer_json_array(self):
+        schema = {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 2,
+            "items": {
+                "type": "object",
+                "required": ["name"],
+                "properties": {"name": {"type": "string"}},
+            },
+        }
+        with patch(
+            "agents.llm_utils.call_llm",
+            return_value='[{"name":"one"},{"name":"two"}]',
+        ):
+            payload = call_llm_json(
+                "system",
+                "user",
+                schema=schema,
+                schema_name="approach_array",
+            )
+
+        self.assertEqual(
+            payload, [{"name": "one"}, {"name": "two"}]
+        )
 
     def test_path_and_storage_identifiers_reject_traversal(self):
         for value in ("../outside", "a/b", ".."):
@@ -1020,6 +1111,7 @@ def run(X_train, X_test):
             (task_dir / "sample_submission.csv").write_text("id,target\n1,0\n")
             (task_dir / "submission.csv").write_text("id,target\n1,1\n")
             (task_dir / "dataset_analysis_report.txt").write_text("generated")
+            (task_dir / "dataset_analysis.md").write_text("generated")
 
             discovered = {path.name for path in task_data_files(task_dir)}
 
@@ -1235,41 +1327,26 @@ def run(X_train, X_test):
                 (archives[0] / "tree_state.json").read_text(), "stale"
             )
 
-    def test_task_validation_is_written_to_committed_model_card(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            project_root = Path(temp_dir)
-            category_dir = (
-                project_root / "memory_pool" / "l2_store" / "custom_models"
+    def test_manager_artifact_validation_cannot_mutate_global_pool(self):
+        manager = ManagerAgent.__new__(ManagerAgent)
+        with patch("agents.manager_agent.L2Builder") as builder:
+            result = manager._record_artifact_validation(
+                {
+                    "status": "pool_hit",
+                    "category": "custom_models",
+                    "artifact_id": "verified_model",
+                },
+                "node_4",
+                0.81,
+                "completed",
+                0.2,
+                "screen",
+                12.5,
             )
-            category_dir.mkdir(parents=True)
-            (project_root / "memory_pool" / "builder").mkdir()
-            (project_root / "memory_pool" / "l1_index.json").write_text("{}")
-            card_file = category_dir / "verified_model.json"
-            card_file.write_text(
-                json.dumps(
-                    {
-                        "artifact_id": "verified_model",
-                        "category": "custom_models",
-                        "verified": True,
-                    }
-                )
-            )
-            builder = L2Builder(project_root, venv_path=sys.executable)
-            validation = {
-                "task_name": "task_a",
-                "node_id": "node_4",
-                "score": 0.81,
-                "status": "completed",
-            }
-            self.assertTrue(
-                builder.record_task_validation(
-                    "custom_models", "verified_model", validation
-                )
-            )
-            saved_card = json.loads(card_file.read_text())
-            self.assertEqual(saved_card["task_validations"], [validation])
+        self.assertIsNone(result)
+        builder.assert_not_called()
 
-    def test_pool_summary_exposes_empirical_validation_history(self):
+    def test_pool_summary_does_not_expose_task_validation_history(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             pool = Path(temp_dir)
             category_dir = pool / "l2_store" / "models"
@@ -1300,10 +1377,10 @@ def run(X_train, X_test):
                 )
             )
             with patch("memory_pool.query_tool.BASE_DIR", pool):
-                summary = query_l1("models")["artifacts"][0]["validation_summary"]
-            self.assertEqual(summary["runs"], 2)
-            self.assertEqual(summary["failures"], 1)
-            self.assertEqual(summary["completion_rate"], 0.5)
+                summary = query_l1("models")["artifacts"][0]
+            self.assertNotIn("validation_summary", summary)
+            self.assertNotIn("recent_validations", summary)
+            self.assertNotIn("task_validations", summary)
 
     def test_validation_guard_detects_test_fitted_preprocessing(self):
         code = """
@@ -1514,7 +1591,7 @@ class SchedulerTests(unittest.TestCase):
             infer_artifact_scope({}, "blending_stacking"), "full_pipeline"
         )
 
-    def test_artifact_prior_uses_empirical_reward_not_only_llm_text(self):
+    def test_artifact_prior_ignores_legacy_task_validation_metrics(self):
         agent = TechniqueAgent()
         proven = {
             "artifact_id": "catboost_model",
@@ -1536,9 +1613,9 @@ class SchedulerTests(unittest.TestCase):
                 "completion_rate": None,
             },
         }
-        self.assertGreater(
-            agent._artifact_prior(proven, "catboost model", total_runs=5),
-            agent._artifact_prior(untested, "catboost model", total_runs=5),
+        self.assertEqual(
+            agent._artifact_prior(proven, "catboost model"),
+            agent._artifact_prior(untested, "catboost model"),
         )
 
     def test_artifact_prior_rewards_compatible_gpu_artifact(self):
@@ -1561,10 +1638,10 @@ class SchedulerTests(unittest.TestCase):
         }
         self.assertGreater(
             agent._artifact_prior(
-                candidate, "model", total_runs=0, preferred_accelerator="cuda"
+                candidate, "model", preferred_accelerator="cuda"
             ),
             agent._artifact_prior(
-                cpu_only, "model", total_runs=0, preferred_accelerator="cuda"
+                cpu_only, "model", preferred_accelerator="cuda"
             ),
         )
 
@@ -1612,7 +1689,9 @@ class SchedulerTests(unittest.TestCase):
         agent = TechniqueAgent()
         with patch("agents.technique_agent.query") as query_pool, patch(
             "agents.technique_agent.call_llm"
-        ) as llm, patch("agents.technique_agent.search_web") as web:
+        ) as llm, patch(
+            "agents.technique_agent.call_llm_json"
+        ) as json_llm, patch("agents.technique_agent.search_web") as web:
             result = agent.run(
                 "tabular regression",
                 "robust categorical representation with a strong baseline",
@@ -1629,6 +1708,7 @@ class SchedulerTests(unittest.TestCase):
         self.assertNotIn("model_card", result)
         query_pool.assert_not_called()
         llm.assert_not_called()
+        json_llm.assert_not_called()
         web.assert_not_called()
 
     def test_initial_branches_are_pipeline_hypotheses_not_model_names(self):
@@ -1636,28 +1716,32 @@ class SchedulerTests(unittest.TestCase):
 
         def fake_llm(system_prompt, user_prompt, **_kwargs):
             prompts.append((system_prompt, user_prompt))
-            return json.dumps(
-                [
-                    {
-                        "name": "robust_representation",
-                        "plan": (
-                            "Test rare-category grouping, frequency encoding, "
-                            "and missingness interactions with a regularized "
-                            "tree control."
-                        ),
-                    }
-                ]
-            )
+            return [
+                {
+                    "name": "robust_representation",
+                    "plan": (
+                        "Test rare-category grouping, frequency encoding, "
+                        "and missingness interactions with a regularized "
+                        "tree control."
+                    ),
+                }
+            ]
 
         with patch(
-            "agents.technique_agent.call_llm", side_effect=fake_llm
+            "agents.technique_agent.call_llm_json", side_effect=fake_llm
         ):
-            approaches = TechniqueAgent().generate_initial_approaches(
+            agent = TechniqueAgent()
+            agent.set_dataset_directives(
+                ["Use stratified validation for the imbalanced target."]
+            )
+            approaches = agent.generate_initial_approaches(
                 "tabular regression", count=1
             )
         self.assertEqual(len(approaches), 1)
         self.assertIn("PIPELINE-HYPOTHESIS", prompts[0][0])
         self.assertIn("representation", prompts[0][0])
+        self.assertIn("AUTHORITATIVE DATASET-DIAGNOSTIC", prompts[0][0])
+        self.assertIn("Use stratified validation", prompts[0][0])
         self.assertNotIn(
             "MUST use a completely distinct primary model family",
             prompts[0][0],
@@ -1914,24 +1998,6 @@ class SchedulerTests(unittest.TestCase):
                 "from locked_model import train_predict\nif False:\n    p = train_predict(X, T)\n    print(p)",
                 card,
             )
-        )
-
-    def test_local_artifact_variant_is_not_credited_to_global_card(self):
-        record = {
-            "status": "pool_hit",
-            "artifact_id": "global_model",
-            "category": "models",
-        }
-        variant = {
-            "artifact_id": "global_model",
-            "variant_id": "global_model@abc123",
-            "verified": True,
-        }
-        self.assertEqual(
-            ManagerAgent._artifact_validation_source(record, variant), {}
-        )
-        self.assertIs(
-            ManagerAgent._artifact_validation_source(record, None), record
         )
 
     def test_tuning_lock_rejects_new_model_family(self):
@@ -2328,6 +2394,10 @@ json.dump({'score': 0.7, 'metric': 'rmse', 'direction': 'minimize',
             result_json = json.loads((node_dir / "result.json").read_text())
             self.assertEqual(result_json["metric"], "rmse")
             self.assertIn('"metric": "rmse"', prompts[0][0])
+            self.assertIn(
+                "AUTHORITATIVE DATASET-DIAGNOSTIC DIRECTIVES",
+                prompts[0][0],
+            )
             self.assertIn(
                 "This is a root method; build the complete pipeline directly",
                 prompts[0][1],

@@ -67,30 +67,5 @@
       "attempt": 3,
       "status": "verified"
     }
-  ],
-  "task_validations": [
-    {
-      "task_name": "playground-series",
-      "node_id": "node_15",
-      "score": 7.909017556937547,
-      "metric_direction": "minimize",
-      "status": "completed",
-      "reward": 0.0033626177756613,
-      "fidelity": "screen",
-      "elapsed_seconds": 71.59533099998953,
-      "improved_over_baseline": true
-    },
-    {
-      "task_name": "playground-series",
-      "node_id": "node_13",
-      "score": 7.8757473967921205,
-      "metric_direction": "minimize",
-      "status": "completed",
-      "reward": -0.8874059104568088,
-      "fidelity": "screen",
-      "elapsed_seconds": 204.30468866601586,
-      "reference_score": 7.92202168075478,
-      "improved_over_reference": true
-    }
   ]
 }

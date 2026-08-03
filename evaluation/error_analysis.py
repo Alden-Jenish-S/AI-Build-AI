@@ -2,14 +2,22 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
-from .prediction_io import legacy_prediction_payload
+from .metrics import (
+    infer_metric_direction,
+    metric_value,
+    resolve_metric_name,
+)
+from .prediction_io import (
+    legacy_prediction_payload,
+    load_prediction_bundle,
+    load_prediction_table,
+)
 
 
 def _json_value(value: Any) -> Any:
@@ -22,25 +30,138 @@ def _json_value(value: Any) -> Any:
 
 def _evaluation_frame(root: Path, mode: str) -> pd.DataFrame | None:
     if mode == "cross_validation":
-        path = root / "oof_predictions.csv"
-        return pd.read_csv(path) if path.is_file() else None
-    path = root / "validation_predictions.csv"
-    if not path.is_file():
+        try:
+            return load_prediction_table(root / "oof_predictions")
+        except FileNotFoundError:
+            return None
+    try:
+        frame = load_prediction_table(root / "validation_predictions")
+    except FileNotFoundError:
         return None
-    frame = pd.read_csv(path, dtype={"row_id": str})
     if mode != "holdout":
         return frame
-    proof_path = root / ".evaluation_contract" / "validation_targets.json"
+    proof_path = root / ".evaluation_contract" / "validation_targets.npz"
     if not proof_path.is_file() or "row_id" not in frame.columns:
         return None
-    proof = json.loads(proof_path.read_text(encoding="utf-8"))
-    expected_ids = [str(item) for item in proof.get("row_ids", [])]
+    with np.load(proof_path, allow_pickle=False) as proof:
+        expected_ids = proof["row_ids"].astype(str).tolist()
+        targets = proof["targets"]
     aligned = frame.set_index("row_id").reindex(expected_ids).reset_index()
-    targets = proof.get("targets", [])
     if len(aligned) != len(targets):
         return None
     aligned["target"] = targets
     return aligned
+
+
+def _typed_evaluation_payload(
+    root: Path,
+    mode: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    manifest = root / "predictions" / "manifest.json"
+    if not manifest.is_file():
+        return None
+    try:
+        bundle, predictions, targets, _ = load_prediction_bundle(manifest)
+    except (FileNotFoundError, TypeError, ValueError):
+        return None
+    sample_ids = np.asarray(bundle.sample_ids, dtype=str)
+    if mode != "holdout":
+        if targets is None:
+            return None
+        return sample_ids, np.asarray(targets), np.asarray(predictions)
+    proof_path = root / ".evaluation_contract" / "validation_targets.npz"
+    if not proof_path.is_file():
+        return None
+    with np.load(proof_path, allow_pickle=False) as proof:
+        proof_ids = proof["row_ids"].astype(str)
+        proof_targets = proof["targets"]
+    positions = {sample_id: index for index, sample_id in enumerate(sample_ids)}
+    if set(positions) != set(proof_ids.tolist()):
+        return None
+    order = np.asarray([positions[sample_id] for sample_id in proof_ids], dtype=int)
+    return proof_ids, proof_targets, np.asarray(predictions)[order]
+
+
+def _structured_error_analysis(
+    sample_ids: np.ndarray,
+    targets: np.ndarray,
+    predictions: np.ndarray,
+    *,
+    metric_name: str,
+    problem_type: str,
+    max_examples: int,
+) -> dict[str, object]:
+    resolved_metric = resolve_metric_name(
+        metric_name or "score",
+        problem_type=problem_type,
+    )
+    sample_scores = []
+    invalid = 0
+    for index in range(len(sample_ids)):
+        try:
+            sample_scores.append(
+                float(
+                    metric_value(
+                        resolved_metric,
+                        targets[index : index + 1],
+                        predictions[index : index + 1],
+                    )
+                )
+            )
+        except (IndexError, TypeError, ValueError):
+            sample_scores.append(float("nan"))
+            invalid += 1
+    scores = np.asarray(sample_scores, dtype=float)
+    finite = np.isfinite(scores)
+    if not finite.any():
+        return {
+            "available": False,
+            "reason": "structured per-sample metrics could not be computed",
+        }
+    direction = infer_metric_direction(resolved_metric)
+    priority = np.where(
+        finite,
+        scores if direction == "minimize" else -scores,
+        -np.inf,
+    )
+    order = np.argsort(-priority)[: max(1, int(max_examples))]
+    details: dict[str, object] = {
+        "available": True,
+        "row_count": len(sample_ids),
+        "metric": resolved_metric,
+        "metric_direction": direction,
+        "invalid_sample_count": invalid,
+        "per_sample_score_quantiles": {
+            str(quantile): float(np.quantile(scores[finite], quantile))
+            for quantile in (0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0)
+        },
+        "worst_examples": [
+            {
+                "row_id": str(sample_ids[index]),
+                "sample_score": float(scores[index]),
+            }
+            for index in order
+            if np.isfinite(scores[index])
+        ],
+    }
+    if problem_type == "segmentation" and np.asarray(targets).ndim >= 3:
+        truth = np.asarray(targets) > 0
+        predicted = np.asarray(predictions)
+        if predicted.shape == truth.shape:
+            predicted = predicted >= 0.5 if np.issubdtype(
+                predicted.dtype, np.floating
+            ) else predicted > 0
+            spatial_axes = tuple(range(1, truth.ndim))
+            details["empty_target_fraction"] = float(
+                np.mean(~truth.any(axis=spatial_axes))
+            )
+            details["false_positive_pixel_rate"] = float(
+                np.mean(np.logical_and(~truth, predicted))
+            )
+            details["false_negative_pixel_rate"] = float(
+                np.mean(np.logical_and(truth, ~predicted))
+            )
+    return details
 
 
 def build_error_analysis(
@@ -48,10 +169,28 @@ def build_error_analysis(
     *,
     evaluation_mode: str,
     problem_type: str,
+    metric_name: str | None = None,
     max_examples: int = 20,
 ) -> dict[str, object]:
     """Summarize residual/error structure without reloading the dataset."""
     root = Path(node_dir)
+    typed = _typed_evaluation_payload(root, evaluation_mode)
+    if typed is not None:
+        sample_ids, targets, predictions = typed
+        structured = _structured_error_analysis(
+            sample_ids,
+            targets,
+            predictions,
+            metric_name=metric_name or "score",
+            problem_type=problem_type,
+            max_examples=max_examples,
+        )
+        return {
+            "analysis_version": 2,
+            "evaluation_mode": evaluation_mode,
+            "problem_type": problem_type,
+            **structured,
+        }
     frame = _evaluation_frame(root, evaluation_mode)
     base: dict[str, object] = {
         "analysis_version": 1,

@@ -1,6 +1,7 @@
 import json
 import math
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -220,7 +221,20 @@ class ProvenanceTests(unittest.TestCase):
 
 
 class TuningKnowledgeTests(unittest.TestCase):
-    def test_compatible_global_trials_are_reused_without_raw_score_pooling(self):
+    def test_manager_places_tuning_history_inside_run_root(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = ManagerAgent.__new__(ManagerAgent)
+            manager.run_root = Path(temp_dir) / "runs" / "example"
+            manager.run_root.mkdir(parents=True)
+
+            manager._ensure_search_services()
+
+            self.assertEqual(
+                manager.tuning_coordinator.knowledge_base.path,
+                manager.run_root / "tuning_history.jsonl",
+            )
+
+    def test_compatible_run_trials_are_reused_without_raw_score_pooling(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             knowledge = TuningKnowledgeBase(
                 Path(temp_dir) / "tuning_history.jsonl"
@@ -246,14 +260,14 @@ class TuningKnowledgeTests(unittest.TestCase):
                 )
             )
             context = coordinator.build_context(
-                task_name="task-b",
+                task_name="task-a",
                 model_family="gbdt",
                 tunable_parameters=["learning_rate", "max_depth"],
                 metric_name="roc_auc",
                 metric_direction="maximize",
                 dataset_fingerprint="dataset-b",
             )
-            self.assertTrue(context["global_trial_reuse"])
+            self.assertTrue(context["run_local_trial_reuse"])
             self.assertEqual(
                 context["suggested_initial_parameters"],
                 [{"learning_rate": 0.05, "max_depth": 6}],
@@ -263,6 +277,81 @@ class TuningKnowledgeTests(unittest.TestCase):
                 "normalized_improvement", context["reused_trials"][0]
             )
             self.assertNotIn("score", context["reused_trials"][0])
+
+
+class ParallelRootExecutionTests(unittest.TestCase):
+    def test_independent_cpu_roots_are_dispatched_concurrently(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = ManagerAgent.__new__(ManagerAgent)
+            manager.run_root = Path(temp_dir)
+            manager.total_budget = 2
+            manager.experiments_executed = 0
+            manager.implementation_attempts = 0
+            manager.max_parallel_root_nodes = 2
+            manager.preferred_accelerator = "cpu"
+            manager.available_accelerators = {"cpu"}
+            manager.available_ram_gb = 16.0
+            manager.all_nodes = {
+                "root": NodeState(
+                    "root", None, "technique", executed=True
+                ),
+                "node_1": NodeState(
+                    "node_1",
+                    "root",
+                    "implementation",
+                    operator="root",
+                    config={"technique_record": {}},
+                ),
+                "node_2": NodeState(
+                    "node_2",
+                    "root",
+                    "implementation",
+                    operator="root",
+                    config={"technique_record": {}},
+                ),
+            }
+            manager._trace_search = Mock()
+            manager._persist_tree_state = Mock()
+            barrier = threading.Barrier(2)
+            worker_threads = set()
+            worker_process_counts = set()
+
+            def run_payload(node):
+                worker_threads.add(threading.get_ident())
+                worker_process_counts.add(
+                    node.config.get("_parallel_root_workers")
+                )
+                barrier.wait(timeout=2)
+                return {"score": 0.5, "status": "completed"}
+
+            def finalize(node, *_args):
+                result = node.config.pop("_precomputed_result")
+                node.result = result
+                node.executed = True
+                return True
+
+            manager._run_implementation_payload = run_payload
+            manager._execute_node = Mock(side_effect=finalize)
+
+            completed = manager._execute_initial_root_batch(
+                "root", {}, Path(temp_dir) / "l1.json"
+            )
+
+            self.assertEqual(completed, 2)
+            self.assertEqual(manager.experiments_executed, 2)
+            self.assertEqual(len(worker_threads), 2)
+            self.assertEqual(worker_process_counts, {2})
+            self.assertNotIn(
+                "_parallel_root_workers",
+                manager.all_nodes["node_1"].config,
+            )
+
+    def test_single_accelerator_serializes_root_training(self):
+        manager = ManagerAgent.__new__(ManagerAgent)
+        manager.max_parallel_root_nodes = 4
+        manager.preferred_accelerator = "mps"
+        manager.available_ram_gb = 64.0
+        self.assertEqual(manager._root_parallel_capacity(), 1)
 
 
 class ManagerOwnedEnsembleTests(unittest.TestCase):
@@ -441,7 +530,7 @@ class ManagerOwnedEnsembleTests(unittest.TestCase):
             )
             self.assertTrue(merge.result["merge"]["manager_owned"])
             output = run_root / "merge"
-            self.assertTrue((output / "oof_predictions.csv").is_file())
+            self.assertTrue((output / "oof_predictions.npz").is_file())
             self.assertTrue(
                 (output / "submission" / "submission.csv").is_file()
             )

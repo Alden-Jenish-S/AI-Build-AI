@@ -190,6 +190,22 @@ def validate_submission_file(
     if not path.is_file():
         raise ValueError(f"generated submission is missing: {path}")
     spec = _task_mapping(task_spec)
+    output = spec.get("output", {})
+    output_type = (
+        str(output.get("type", ""))
+        if isinstance(output, Mapping)
+        else str(output)
+    )
+    output_options = (
+        output.get("options", {})
+        if isinstance(output, Mapping)
+        and isinstance(output.get("options", {}), Mapping)
+        else {}
+    )
+    rle_submission = (
+        output_options.get("submission_encoding")
+        == "run_length_encoding"
+    )
     template_path = resolve_submission_template(task_dir, spec)
     if template_path is not None:
         template_columns = pd.read_csv(template_path, nrows=0).columns
@@ -198,7 +214,9 @@ def validate_submission_file(
         template_id = str(template_columns[0])
         generated_columns = pd.read_csv(path, nrows=0).columns
         sample = pd.read_csv(
-            template_path, dtype={template_id: "string"}
+            template_path,
+            dtype={template_id: "string"},
+            keep_default_na=not rle_submission,
         )
         generated = pd.read_csv(
             path,
@@ -207,12 +225,13 @@ def validate_submission_file(
                 if template_id in generated_columns
                 else None
             ),
+            keep_default_na=not rle_submission,
         )
         frame, id_column, prediction_columns, schema_renames = _aligned_submission(
             generated, sample
         )
     else:
-        generated = pd.read_csv(path)
+        generated = pd.read_csv(path, keep_default_na=not rle_submission)
         if generated.empty or len(generated.columns) < 2:
             raise ValueError(
                 "submission must contain an ID column and at least one output column"
@@ -228,12 +247,6 @@ def validate_submission_file(
 
     if frame[prediction_columns].isnull().any().any():
         raise ValueError("generated submission contains missing predictions")
-    output = spec.get("output", {})
-    output_type = (
-        str(output.get("type", ""))
-        if isinstance(output, Mapping)
-        else str(output)
-    )
     problem_type = str(spec.get("problem_type", ""))
     normalization_applied = False
     if output_type in {"class_probabilities", "continuous"}:
@@ -264,6 +277,38 @@ def validate_submission_file(
                     values = values / row_sums
                     normalization_applied = True
             frame[prediction_columns] = values
+    elif rle_submission:
+        for column in prediction_columns:
+            for row_index, raw_value in enumerate(frame[column].tolist()):
+                text = str(raw_value or "").strip()
+                if not text:
+                    continue
+                try:
+                    encoded = [int(item) for item in text.split()]
+                except ValueError as exc:
+                    raise ValueError(
+                        f"RLE column {column!r} row {row_index} contains "
+                        "non-integer tokens"
+                    ) from exc
+                if len(encoded) % 2:
+                    raise ValueError(
+                        f"RLE column {column!r} row {row_index} must contain "
+                        "start/length pairs"
+                    )
+                previous_end = 0
+                index_base = int(output_options.get("rle_index_base", 1))
+                for start, length in zip(encoded[::2], encoded[1::2]):
+                    if start < index_base:
+                        raise ValueError(
+                            f"RLE start is below the configured index base in "
+                            f"column {column!r} row {row_index}"
+                        )
+                    if length <= 0 or start <= previous_end:
+                        raise ValueError(
+                            "RLE runs must be positive, sorted, and "
+                            f"non-overlapping in column {column!r} row {row_index}"
+                        )
+                    previous_end = start + length - 1
 
     return frame, {
         "submission_path": str(path),

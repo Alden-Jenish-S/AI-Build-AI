@@ -46,15 +46,17 @@ class ImageAdapter(ManifestMediaAdapter):
                     corrupt.append(record.sample_id)
         except ImportError:
             modes["metadata_unavailable_without_pillow"] = 1
-        return {
+        profile = {
             **bundle.to_index_dict(),
             "sampled_dimensions": dict(sizes),
             "sampled_color_modes": dict(modes),
             "sampled_corrupt_ids": corrupt,
-            "target_distribution": dict(
-                Counter(
-                    str(record.target)
-                    for record in bundle.train_records
-                )
-            ),
         }
+        if task_spec.target and str(task_spec.target.type or "").endswith("_path"):
+            profile["structured_target_references"] = len(bundle.train_records)
+            profile["target_storage"] = task_spec.target.type
+        else:
+            profile["target_distribution"] = dict(
+                Counter(str(record.target) for record in bundle.train_records)
+            )
+        return profile

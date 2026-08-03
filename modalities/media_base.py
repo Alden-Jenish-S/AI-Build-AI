@@ -18,6 +18,11 @@ from .common import (
     resolve_task_source,
     row_split,
 )
+from .paired_directory import (
+    build_paired_directory_bundle,
+    discover_paired_directory_layout,
+    paired_layout_config,
+)
 
 
 class ManifestMediaAdapter:
@@ -30,9 +35,14 @@ class ManifestMediaAdapter:
     def discover(self, task_dir: Path) -> TaskSpec:
         config = read_task_config(task_dir)
         if not config:
-            raise ValueError(
-                f"{self.name} tasks require task_config.json schema_version 2"
-            )
+            paired = discover_paired_directory_layout(task_dir)
+            if paired is None or paired.modality != self.name:
+                raise ValueError(
+                    f"{self.name} tasks require task_config.json schema_version 2 "
+                    "unless a high-confidence train/input/target directory "
+                    "pair can be discovered"
+                )
+            config = paired_layout_config(task_dir, paired)
         configured = str(config.get("modality", "")).strip().lower()
         if configured != self.name:
             raise ValueError(
@@ -131,6 +141,8 @@ class ManifestMediaAdapter:
         self, task_dir: Path, task_spec: TaskSpec
     ) -> DatasetBundle:
         input_spec = self._input_spec(task_spec)
+        if bool(input_spec.options.get("auto_paired_target")):
+            return build_paired_directory_bundle(task_dir, task_spec)
         frame, source = self._manifest_for(
             task_dir, task_spec, input_spec
         )

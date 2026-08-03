@@ -44,7 +44,7 @@ class TrialRecord:
 
 
 class TuningKnowledgeBase:
-    """JSONL-backed global store with strict semantic compatibility checks."""
+    """JSONL-backed run-local store with semantic compatibility checks."""
 
     def __init__(self, path: str | Path):
         self.path = Path(path)
@@ -189,7 +189,7 @@ class TuningCoordinator:
         ]
         return {
             "search_space_version": version,
-            "global_trial_reuse": True,
+            "run_local_trial_reuse": True,
             "compatibility_signature": {
                 "modality": modality,
                 "problem_type": problem_type,

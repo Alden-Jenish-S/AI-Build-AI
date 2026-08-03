@@ -61,13 +61,11 @@
   "verification_level": "mixed-missing-contract-mock-data",
   "verification_isolation": "resource-limited-subprocess",
   "provenance": {
-    "source_type": "dynamic_web_bootstrap_repaired",
-    "source_url_or_run_id": "runs/playground-series/complete_system/node_8"
+    "source_type": "dynamic_web_bootstrap_repaired"
   },
   "known_pitfalls": [
     "Regression-only artifact; do not use for classification targets.",
     "Training cost grows with feature count and transformer width; honor fidelity epoch ceilings.",
     "Categorical mappings and numeric normalization must be fitted on training-fold data only."
-  ],
-  "task_validations": []
+  ]
 }

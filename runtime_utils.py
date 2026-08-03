@@ -73,7 +73,13 @@ _TASK_DATA_SUFFIXES = {
     ".webp",
 }
 _TASK_DATA_EXCLUSIONS = {
+    "dataset_analysis.md",
     "dataset_analysis_report.txt",
+    "dataset_index.jsonl",
+    "dataset_index_manifest.json",
+    "dataset_profile.json",
+    "resolved_task_spec.json",
+    "runtime_data_contract.json",
     "task_dataloader.py",
     "submission.csv",
     "task_config.json",

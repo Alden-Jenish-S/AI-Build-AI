@@ -18,6 +18,11 @@ from evaluation.metrics import (
 )
 from modalities import build_default_registry
 from modalities.base import ModalityAdapter
+from modalities.paired_directory import discover_paired_directory_layout
+from .dataset_diagnostics import (
+    build_dataset_diagnostics,
+    render_dataset_analysis_markdown,
+)
 
 
 @dataclass(frozen=True)
@@ -52,16 +57,21 @@ class TaskAnalyzer:
     def _adapter_for(self, task_dir: Path) -> ModalityAdapter:
         config = _read_task_config(task_dir)
         if not config:
-            multimodal = self.registry.get("multimodal")
-            if (
-                hasattr(multimodal, "can_auto_discover")
-                and multimodal.can_auto_discover(task_dir)
-            ):
-                adapter = multimodal
-                modality = "multimodal"
-            else:
-                modality = "tabular"
+            paired = discover_paired_directory_layout(task_dir)
+            if paired is not None:
+                modality = paired.modality
                 adapter = self.registry.get(modality)
+            else:
+                multimodal = self.registry.get("multimodal")
+                if (
+                    hasattr(multimodal, "can_auto_discover")
+                    and multimodal.can_auto_discover(task_dir)
+                ):
+                    adapter = multimodal
+                    modality = "multimodal"
+                else:
+                    modality = "tabular"
+                    adapter = self.registry.get(modality)
         else:
             modality = normalize_modality(config.get("modality", "tabular"))
             adapter = self.registry.get(modality)
@@ -305,7 +315,7 @@ class TaskAnalyzer:
                 f"{task_spec.modality!r}"
             )
         profile = dict(adapter.profile(task_dir, task_spec))
-        report = adapter.render_report(task_dir, task_spec)
+        profile["profile_schema_version"] = 2
         # Tabular data already has an efficient columnar source (CSV/TSV).
         # Expanding every row into JSONL duplicates the complete dataset and
         # can add hundreds of megabytes before the first experiment starts.
@@ -317,6 +327,57 @@ class TaskAnalyzer:
             if include_index and not direct_tabular
             else None
         )
+        profile["diagnostics"] = build_dataset_diagnostics(
+            task_dir, task_spec, bundle=bundle
+        )
+
+        index_metadata: dict[str, object] | None = None
+        if bundle is not None:
+            index_metadata = {
+                **bundle.to_index_dict(),
+                "storage": "jsonl_index",
+                "row_index_materialized": True,
+            }
+        elif direct_tabular:
+            source_metadata = []
+            for input_spec in task_spec.inputs.values():
+                source_path = self._safe_task_path(
+                    task_dir, input_spec.source
+                )
+                if source_path is None:
+                    continue
+                stat = source_path.stat()
+                source_metadata.append(
+                    {
+                        "name": input_spec.name,
+                        "role": input_spec.role,
+                        "source": input_spec.source,
+                        "size_bytes": int(stat.st_size),
+                        "mtime_ns": int(stat.st_mtime_ns),
+                    }
+                )
+            fingerprint_payload = {
+                "task": task_spec.to_dict(),
+                "sources": source_metadata,
+            }
+            index_metadata = {
+                "schema_version": 2,
+                "storage": "direct_tabular",
+                "dataset_fingerprint": hashlib.sha256(
+                    json.dumps(
+                        fingerprint_payload,
+                        sort_keys=True,
+                        default=str,
+                    ).encode("utf-8")
+                ).hexdigest(),
+                "sources": source_metadata,
+                "row_index_materialized": False,
+            }
+        if index_metadata is not None:
+            # The runtime index contract is part of the canonical machine
+            # profile; a separate manifest duplicated task and source metadata.
+            profile["dataset_index"] = index_metadata
+        report = render_dataset_analysis_markdown(task_spec, profile)
         analysis = TaskAnalysis(
             task_spec=task_spec,
             profile=profile,
@@ -336,19 +397,10 @@ class TaskAnalyzer:
                 json.dumps(profile, indent=2, sort_keys=True) + "\n",
                 encoding="utf-8",
             )
-            (output_dir / "dataset_analysis_report.txt").write_text(
+            (output_dir / "dataset_analysis.md").write_text(
                 report, encoding="utf-8"
             )
             if bundle is not None:
-                (output_dir / "dataset_index_manifest.json").write_text(
-                    json.dumps(
-                        bundle.to_index_dict(),
-                        indent=2,
-                        sort_keys=True,
-                    )
-                    + "\n",
-                    encoding="utf-8",
-                )
                 with open(
                     output_dir / "dataset_index.jsonl",
                     "w",
@@ -361,48 +413,4 @@ class TaskAnalyzer:
                         stream.write(
                             json.dumps(record.to_dict(), default=str) + "\n"
                         )
-            elif direct_tabular:
-                source_metadata = []
-                for input_spec in task_spec.inputs.values():
-                    source_path = self._safe_task_path(
-                        task_dir, input_spec.source
-                    )
-                    if source_path is None:
-                        continue
-                    stat = source_path.stat()
-                    source_metadata.append(
-                        {
-                            "name": input_spec.name,
-                            "role": input_spec.role,
-                            "source": input_spec.source,
-                            "size_bytes": int(stat.st_size),
-                            "mtime_ns": int(stat.st_mtime_ns),
-                        }
-                    )
-                fingerprint_payload = {
-                    "task": task_spec.to_dict(),
-                    "sources": source_metadata,
-                }
-                fingerprint = hashlib.sha256(
-                    json.dumps(
-                        fingerprint_payload,
-                        sort_keys=True,
-                        default=str,
-                    ).encode("utf-8")
-                ).hexdigest()
-                (output_dir / "dataset_index_manifest.json").write_text(
-                    json.dumps(
-                        {
-                            "schema_version": 2,
-                            "storage": "direct_tabular",
-                            "dataset_fingerprint": fingerprint,
-                            "sources": source_metadata,
-                            "row_index_materialized": False,
-                        },
-                        indent=2,
-                        sort_keys=True,
-                    )
-                    + "\n",
-                    encoding="utf-8",
-                )
         return analysis

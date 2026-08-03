@@ -222,7 +222,7 @@ class TabularAdapterTests(unittest.TestCase):
             }
 
             analysis = TaskAnalyzer().analyze(
-                task_dir, output_dir=output_dir
+                task_dir, output_dir=output_dir, include_index=True
             )
 
             self.assertEqual(analysis.task_spec.modality, "tabular")
@@ -242,8 +242,98 @@ class TabularAdapterTests(unittest.TestCase):
                 (output_dir / "dataset_profile.json").is_file()
             )
             self.assertTrue(
-                (output_dir / "dataset_analysis_report.txt").is_file()
+                (output_dir / "dataset_analysis.md").is_file()
             )
+            self.assertFalse(
+                (output_dir / "dataset_analysis_report.txt").exists()
+            )
+            self.assertFalse(
+                (output_dir / "dataset_index_manifest.json").exists()
+            )
+            self.assertEqual(
+                analysis.profile["dataset_index"]["storage"],
+                "direct_tabular",
+            )
+            diagnostics = analysis.profile["diagnostics"]
+            self.assertIn("target_topology", diagnostics)
+            self.assertIn("data_quality_and_drift", diagnostics)
+            self.assertIn("complexity_metrics", diagnostics)
+            self.assertTrue(diagnostics["synthesized_directives"])
+            self.assertEqual(
+                diagnostics["target_topology"]["quantiles"]["min"],
+                100.0,
+            )
+            self.assertEqual(
+                diagnostics["target_topology"]["quantiles"]["max"],
+                130.0,
+            )
+            self.assertIsNotNone(
+                diagnostics["complexity_metrics"][
+                    "feature_to_sample_ratio"
+                ]
+            )
+
+    def test_task_analyzer_detects_imbalance_drift_and_collinearity(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            task_dir = root / "task"
+            output_dir = root / "run"
+            task_dir.mkdir()
+            train = pd.DataFrame(
+                {
+                    "id": range(100),
+                    "x": range(100),
+                    "x_duplicate": [2 * value for value in range(100)],
+                    "partly_missing": [None] * 20 + list(range(80)),
+                    "label": [0] * 95 + [1] * 5,
+                }
+            )
+            test = pd.DataFrame(
+                {
+                    "id": range(100, 140),
+                    "x": range(300, 340),
+                    "x_duplicate": [2 * value for value in range(300, 340)],
+                    "partly_missing": list(range(40)),
+                }
+            )
+            train.to_csv(task_dir / "train.csv", index=False)
+            test.to_csv(task_dir / "test.csv", index=False)
+            (task_dir / "task_config.json").write_text(
+                json.dumps(
+                    {
+                        "task_type": "classification",
+                        "target_column": "label",
+                        "sample_id_field": "id",
+                        "train_file": "train.csv",
+                        "test_file": "test.csv",
+                    }
+                )
+            )
+
+            diagnostics = TaskAnalyzer().analyze(
+                task_dir, output_dir=output_dir, include_index=True
+            ).profile["diagnostics"]
+
+            target = diagnostics["target_topology"]
+            self.assertAlmostEqual(
+                target["minority_to_majority_ratio"], 5 / 95
+            )
+            quality = diagnostics["data_quality_and_drift"]
+            self.assertEqual(
+                quality["missingness_percentages"]["partly_missing"]["train"],
+                20.0,
+            )
+            self.assertIn(
+                "x", quality["train_test_ks_drift"]["drifted_features"]
+            )
+            collinearity = diagnostics["complexity_metrics"][
+                "high_collinearity"
+            ]
+            self.assertGreaterEqual(collinearity["pair_count"], 1)
+            directives = "\n".join(diagnostics["synthesized_directives"])
+            self.assertIn("class imbalance", directives)
+            self.assertIn("numeric drift", directives)
+            self.assertIn("collinear", directives)
 
     def test_task_analyzer_rejects_output_inside_read_only_task(self):
         with tempfile.TemporaryDirectory() as temp_dir:

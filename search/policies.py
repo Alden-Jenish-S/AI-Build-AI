@@ -7,9 +7,11 @@ from pathlib import Path
 from typing import Any, Mapping
 
 import numpy as np
-import pandas as pd
 
-from evaluation.prediction_io import legacy_prediction_payload
+from evaluation.prediction_io import (
+    legacy_prediction_payload,
+    load_prediction_table,
+)
 from .evidence import EvidenceEstimate
 
 
@@ -203,10 +205,12 @@ class DiversityController:
     ] | None:
         frames = []
         for node_id in (first_node_id, second_node_id):
-            path = run_root / node_id / "oof_predictions.csv"
-            if not path.is_file():
+            try:
+                frame = load_prediction_table(
+                    run_root / node_id / "oof_predictions"
+                )
+            except FileNotFoundError:
                 return None
-            frame = pd.read_csv(path)
             required = {"row_id", "target"}
             if (
                 not required.issubset(frame.columns)

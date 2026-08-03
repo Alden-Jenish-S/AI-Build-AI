@@ -6,11 +6,13 @@ import json
 import math
 import shutil
 import hashlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Any, List
 from packaging.requirements import Requirement
 from evaluation.metrics import default_metric_for_problem
+from evaluation.prediction_io import load_prediction_table
 from evaluation.submission import validate_submission_file
 from tree.node import NodeState
 from tree.scheduler import UCB1Scheduler
@@ -142,7 +144,7 @@ class ManagerAgent:
         )
         self.tuning_coordinator = TuningCoordinator(
             TuningKnowledgeBase(
-                self.project_root / "memory_pool" / "tuning_history.jsonl"
+                self.run_root / "tuning_history.jsonl"
             )
         )
         self._scheduled_merge_pairs: set[tuple[str, str]] = set()
@@ -165,6 +167,9 @@ class ManagerAgent:
         self.max_artifact_candidates = 5
         self.max_fine_tune_rounds = 2
         self.max_debug_attempts = 3
+        self.max_parallel_root_nodes = max(
+            1, min(3, int(os.cpu_count() or 1))
+        )
         self.enforce_evaluation_contract = True
         self.enable_executable_artifacts = (
             os.environ.get(
@@ -207,6 +212,15 @@ class ManagerAgent:
                 )
                 self.max_debug_attempts = max(
                     0, int(task_config.get("max_debug_attempts", 3))
+                )
+                self.max_parallel_root_nodes = max(
+                    1,
+                    int(
+                        task_config.get(
+                            "max_parallel_root_nodes",
+                            self.max_parallel_root_nodes,
+                        )
+                    ),
                 )
                 self.enable_executable_artifacts = bool(
                     task_config.get(
@@ -425,14 +439,163 @@ class ManagerAgent:
                 Path(self.run_root) / "provenance_graph.json"
             )
         if not hasattr(self, "tuning_coordinator"):
-            project_root = getattr(self, "project_root", Path(self.run_root))
             self.tuning_coordinator = TuningCoordinator(
                 TuningKnowledgeBase(
-                    Path(project_root) / "memory_pool" / "tuning_history.jsonl"
+                    Path(self.run_root) / "tuning_history.jsonl"
                 )
             )
         if not hasattr(self, "_scheduled_merge_pairs"):
             self._scheduled_merge_pairs = set()
+
+    def _root_parallel_capacity(self) -> int:
+        """Return a conservative process count for independent root runs."""
+        requested = max(
+            1, int(getattr(self, "max_parallel_root_nodes", 1))
+        )
+        # A single logical CUDA/MPS accelerator must not receive concurrent
+        # training jobs. The resource detector currently reports accelerator
+        # classes, not distinct device IDs, so serialize accelerator work.
+        if getattr(self, "preferred_accelerator", "cpu") != "cpu":
+            return 1
+        cpu_capacity = max(1, int(os.cpu_count() or 1))
+        ram_gb = float(getattr(self, "available_ram_gb", 0.0) or 0.0)
+        ram_capacity = max(1, int(ram_gb // 4.0)) if ram_gb else 1
+        return max(1, min(requested, cpu_capacity, ram_capacity))
+
+    def _run_implementation_payload(self, node: NodeState) -> dict:
+        """Run one implementation without mutating ManagerAgent search state."""
+        node_dir = self.run_root / node.node_id
+        node_dir.mkdir(parents=True, exist_ok=True)
+        config = node.config or {}
+        return self.implementation_agent.run(
+            node_dir,
+            config.get("technique_record", {}),
+            self.task_dir,
+            task_assets_dir=self.run_root,
+            stall_seconds=self.progress_stall_seconds,
+            metric_direction=self.metric_direction,
+            base_algorithm_path=config.get("base_code_path"),
+            parent_node_dir=(
+                self.run_root / config["base_node_id"]
+                if config.get("base_node_id")
+                else None
+            ),
+            fidelity=node.fidelity,
+            operator=node.operator,
+            enforce_evaluation_contract=True,
+            accelerator=self.preferred_accelerator,
+            available_accelerators=set(self.available_accelerators),
+            tuning_context=config.get("tuning_context"),
+            max_debug_attempts=getattr(self, "max_debug_attempts", 3),
+            metric_name=self.metric_name,
+            evaluation_mode=config.get("evaluation_mode"),
+            parallel_processes=max(
+                1, int(config.get("_parallel_root_workers", 1))
+            ),
+        )
+
+    def _execute_initial_root_batch(
+        self,
+        root_id: str,
+        l1_index: dict,
+        l1_path: Path,
+    ) -> int:
+        """Resolve initial techniques, then run eligible CPU roots concurrently."""
+        technique_ids = [
+            node_id
+            for node_id, state in list(self.all_nodes.items())
+            if state.parent_id == root_id
+            and state.node_type == "technique"
+            and not state.executed
+        ]
+        for node_id in technique_ids:
+            self._execute_node(
+                self.all_nodes[node_id], node_id, root_id, l1_index, l1_path
+            )
+
+        remaining_budget = max(
+            0, self.total_budget - self.experiments_executed
+        )
+        candidates = [
+            state
+            for state in self.all_nodes.values()
+            if state.node_type == "implementation"
+            and state.operator == "root"
+            and not state.executed
+            and not (
+                (state.config or {}).get("technique_record", {}).get(
+                    "model_card"
+                )
+            )
+        ][:remaining_budget]
+        workers = min(self._root_parallel_capacity(), len(candidates))
+        if workers < 2:
+            return 0
+
+        batch_ids = [node.node_id for node in candidates]
+        self._trace_search(
+            {
+                "event": "parallel_root_batch_started",
+                "node_ids": batch_ids,
+                "workers": workers,
+                "accelerator": self.preferred_accelerator,
+            }
+        )
+        results: dict[str, dict] = {}
+        for node in candidates:
+            node.config = dict(node.config or {})
+            node.config["_parallel_root_workers"] = workers
+        with ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix="root-experiment",
+        ) as executor:
+            future_nodes = {}
+            for node in candidates:
+                self.implementation_attempts = (
+                    getattr(self, "implementation_attempts", 0) + 1
+                )
+                self._trace_search(
+                    {
+                        "event": "implementation_attempt_started",
+                        "node_id": node.node_id,
+                        "implementation_attempt": self.implementation_attempts,
+                        "fidelity": node.fidelity,
+                        "parallel_root_batch": True,
+                    }
+                )
+                future_nodes[
+                    executor.submit(self._run_implementation_payload, node)
+                ] = node.node_id
+            for future in as_completed(future_nodes):
+                node_id = future_nodes[future]
+                try:
+                    results[node_id] = future.result()
+                except Exception as exc:
+                    results[node_id] = {
+                        "score": None,
+                        "status": "failed",
+                        "diagnostics": f"Parallel root exception: {exc}",
+                    }
+
+        completed = 0
+        for node in candidates:
+            node.config = dict(node.config or {})
+            node.config.pop("_parallel_root_workers", None)
+            node.config["_precomputed_result"] = results[node.node_id]
+            if self._execute_node(
+                node, node.node_id, root_id, l1_index, l1_path
+            ):
+                self.experiments_executed += 1
+                completed += 1
+        self._trace_search(
+            {
+                "event": "parallel_root_batch_completed",
+                "node_ids": batch_ids,
+                "completed_experiments": completed,
+            }
+        )
+        self._persist_tree_state()
+        return completed
 
     def get_new_node_id(self) -> str:
         self.node_counter += 1
@@ -569,11 +732,30 @@ class ManagerAgent:
             and state.result.get("status") == "completed"
         )
         candidate_ids = list(dict.fromkeys(candidate_ids))
-        child_oof = node_dir / "oof_predictions.csv"
+        child_oof = next(
+            (
+                path
+                for path in (
+                    node_dir / "oof_predictions.npz",
+                    node_dir / "oof_predictions.csv",
+                )
+                if path.is_file()
+            ),
+            node_dir / "oof_predictions.npz",
+        )
         child_hash = self._sha256_file(child_oof)
         for candidate_id in candidate_ids:
-            candidate_oof = (
-                self.run_root / candidate_id / "oof_predictions.csv"
+            candidate_root = self.run_root / candidate_id
+            candidate_oof = next(
+                (
+                    path
+                    for path in (
+                        candidate_root / "oof_predictions.npz",
+                        candidate_root / "oof_predictions.csv",
+                    )
+                    if path.is_file()
+                ),
+                candidate_root / "oof_predictions.npz",
             )
             candidate_hash = self._sha256_file(candidate_oof)
             if child_hash and child_hash == candidate_hash:
@@ -583,14 +765,18 @@ class ManagerAgent:
                 )
         try:
             import numpy as np
-            import pandas as pd
             from evaluation.prediction_io import legacy_prediction_payload
 
             def same_oof(reference_path: Path, measured_path: Path) -> bool:
-                if not reference_path.is_file() or not measured_path.is_file():
+                try:
+                    reference = load_prediction_table(
+                        reference_path.with_suffix("")
+                    )
+                    measured = load_prediction_table(
+                        measured_path.with_suffix("")
+                    )
+                except FileNotFoundError:
                     return False
-                reference = pd.read_csv(reference_path)
-                measured = pd.read_csv(measured_path)
                 if (
                     "row_id" not in reference
                     or "row_id" not in measured
@@ -619,7 +805,7 @@ class ManagerAgent:
 
             for candidate_id in candidate_ids:
                 if same_oof(
-                    self.run_root / candidate_id / "oof_predictions.csv",
+                    self.run_root / candidate_id / "oof_predictions",
                     child_oof,
                 ):
                     return (
@@ -637,6 +823,7 @@ class ManagerAgent:
             return []
         parent_dir = self.run_root / base_node_id
         relative_paths = (
+            Path("oof_predictions.npz"),
             Path("oof_predictions.csv"),
             Path("submission") / "submission.csv",
         )
@@ -791,10 +978,16 @@ class ManagerAgent:
         branches; no preliminary model is generated or executed.
         """
         self._prepare_run_root()
-        TaskAnalyzer().analyze(
+        task_analysis = TaskAnalyzer().analyze(
             self.task_dir,
             output_dir=self.run_root,
             include_index=True,
+        )
+        diagnostics = task_analysis.profile.get("diagnostics", {})
+        self.technique_agent.set_dataset_directives(
+            diagnostics.get("synthesized_directives", [])
+            if isinstance(diagnostics, dict)
+            else []
         )
         (self.run_root / "task_dataloader.py").write_text(
             task_loader_source(), encoding="utf-8"
@@ -859,6 +1052,13 @@ class ManagerAgent:
                 l1_index = json.load(f)
         else:
             l1_index = {}
+
+        # Resolve the forced initial coverage before adaptive UCB expansion.
+        # Independent, self-contained CPU roots launch their model subprocesses
+        # concurrently; result integration remains serialized in the manager.
+        self._execute_initial_root_batch(
+            root_id, l1_index, l1_path
+        )
             
         # 3. Main search loop. Planning and broken generated scripts do not
         # consume scientific budget; completed evaluation runs do.
@@ -1103,7 +1303,7 @@ class ManagerAgent:
         )
 
     def _record_tuning_history(self, node: NodeState) -> None:
-        """Persist a completed tuning result for same-task and global reuse."""
+        """Persist completed tuning evidence inside the current run only."""
         if node.operator != "tune" or not node.result:
             return
         tuning = node.result.get("tuning") or {}
@@ -1295,54 +1495,13 @@ class ManagerAgent:
         fidelity: str,
         elapsed_seconds: Any = None,
     ) -> None:
-        category = tech_record.get("category")
-        artifact_id = tech_record.get("artifact_id")
-        if not category or not artifact_id or tech_record.get("status") not in {
-            "pool_hit", "pool_added"
-        }:
-            return
-        node = self.all_nodes.get(node_id)
-        reference = (
-            self._reference_result_for_node(node) if node is not None else None
-        )
-        reference_score = (
-            reference.get("score") if reference is not None else None
-        )
-        L2Builder(
-            project_root=self.project_root,
-            model_name=self.model_name,
-            venv_path=self.venv_path,
-        ).record_task_validation(
-            category,
-            artifact_id,
-            {
-                "task_name": self.task_name,
-                "node_id": node_id,
-                "score": score,
-                "metric_direction": self.metric_direction,
-                "status": status,
-                "reward": reward,
-                "fidelity": fidelity,
-                "elapsed_seconds": elapsed_seconds,
-                "reference_score": reference_score,
-                "improved_over_reference": (
-                    None
-                    if score is None or reference_score is None
-                    else (
-                        score > reference_score
-                        if self.metric_direction == "maximize"
-                        else score < reference_score
-                    )
-                ),
-            },
-        )
+        """Compatibility no-op: run evidence belongs only to the run root.
 
-    @staticmethod
-    def _artifact_validation_source(
-        tech_record: dict, artifact_variant: dict | None
-    ) -> dict:
-        """Do not credit a node-local code revision to the unchanged L2 card."""
-        return {} if artifact_variant else tech_record
+        Node results are already persisted in ``tree_state.json`` and
+        ``search_trace.jsonl``.  Never attach task names, node IDs, scores, or
+        timings to shared strategy cards under ``memory_pool/l2_store``.
+        """
+        return
 
     @staticmethod
     def _dependency_fallback_record(tech_record: dict, error: object) -> dict:
@@ -1971,24 +2130,8 @@ class ManagerAgent:
                     tech_record["plan"] = f"Import and use local bootstrapped artifact {artifact_id} from category {category}."
                     tech_record["status"] = "local_verified"
 
-                    # A verified reusable method belongs in the memory pool before
-                    # task-specific performance is known. Evaluation evidence is
-                    # recorded separately after implementation.
-                    use_pool = os.environ.get("METHOD_TREE_USE_POOL", "1") != "0"
-                    if use_pool:
-                        committed = builder.commit_artifact(
-                            category=category,
-                            artifact_id=artifact_id,
-                            local_code_file=node_dir / f"{artifact_id}.py",
-                            local_card_file=node_dir / f"{artifact_id}.json",
-                        )
-                        tech_record["pool_committed"] = committed
-                        if committed:
-                            tech_record["status"] = "pool_added"
-                            print(
-                                f"ManagerAgent: Added verified web artifact {artifact_id} "
-                                "to the global memory pool."
-                            )
+                    # Keep dynamically generated artifacts node-local. A task
+                    # execution must never mutate the shared global pool.
                 else:
                     tech_record["status"] = "bootstrap_failed"
                     tech_record["candidate_artifact"] = {
@@ -2074,7 +2217,11 @@ class ManagerAgent:
             
         elif node.node_type == "implementation":
             print(f"ManagerAgent: Running Implementation Agent on {selected_id}...")
-            tech_record = (node.config or {}).get("technique_record", {})
+            node.config = dict(node.config or {})
+            precomputed_result = node.config.pop(
+                "_precomputed_result", None
+            )
+            tech_record = node.config.get("technique_record", {})
             
             # Install dependencies via Setup Agent
             model_card = tech_record.get("model_card")
@@ -2177,43 +2324,21 @@ class ManagerAgent:
             # Run implementation script in its own run folder
             node_dir = self.run_root / selected_id
             node_dir.mkdir(parents=True, exist_ok=True)
-            self.implementation_attempts = (
-                getattr(self, "implementation_attempts", 0) + 1
-            )
-            self._trace_search(
-                {
-                    "event": "implementation_attempt_started",
-                    "node_id": selected_id,
-                    "implementation_attempt": self.implementation_attempts,
-                    "fidelity": node.fidelity,
-                }
-            )
-            
-            res = self.implementation_agent.run(
-                node_dir,
-                tech_record,
-                self.task_dir,
-                task_assets_dir=self.run_root,
-                stall_seconds=self.progress_stall_seconds,
-                metric_direction=self.metric_direction,
-                base_algorithm_path=(node.config or {}).get("base_code_path"),
-                parent_node_dir=(
-                    self.run_root / node.config["base_node_id"]
-                    if (node.config or {}).get("base_node_id")
-                    else None
-                ),
-                fidelity=node.fidelity,
-                operator=node.operator,
-                enforce_evaluation_contract=True,
-                accelerator=self.preferred_accelerator,
-                available_accelerators=set(self.available_accelerators),
-                tuning_context=(node.config or {}).get("tuning_context"),
-                max_debug_attempts=getattr(self, "max_debug_attempts", 3),
-                metric_name=self.metric_name,
-                evaluation_mode=(node.config or {}).get(
-                    "evaluation_mode"
-                ),
-            )
+            if precomputed_result is None:
+                self.implementation_attempts = (
+                    getattr(self, "implementation_attempts", 0) + 1
+                )
+                self._trace_search(
+                    {
+                        "event": "implementation_attempt_started",
+                        "node_id": selected_id,
+                        "implementation_attempt": self.implementation_attempts,
+                        "fidelity": node.fidelity,
+                    }
+                )
+                res = self._run_implementation_payload(node)
+            else:
+                res = precomputed_result
             
             # Bug 1 fix: Handle execution failures properly
             score = res.get("score")  # Will be None on failure
@@ -2227,9 +2352,6 @@ class ManagerAgent:
             if artifact_variant:
                 node.config = dict(node.config or {})
                 node.config["artifact_variant"] = artifact_variant
-            validation_tech_record = self._artifact_validation_source(
-                tech_record, artifact_variant
-            )
             
             # Record result to NodeState
             node.code = res.get("code_path")
@@ -2314,15 +2436,6 @@ class ManagerAgent:
             
             if status == "failed":
                 print(f"ManagerAgent: Implementation Node {selected_id} FAILED. No score produced.")
-                self._record_artifact_validation(
-                    validation_tech_record,
-                    selected_id,
-                    None,
-                    "failed",
-                    -1.0,
-                    node.fidelity,
-                    res.get("elapsed_seconds"),
-                )
                 # Record failure to global memory
                 self.global_memory.record_implementation(selected_id, {"node_id": selected_id}, 0.0, "failed")
                 # Backpropagate zero reward
@@ -2356,15 +2469,6 @@ class ManagerAgent:
                         "deduplicated_outputs": deduplicated_outputs,
                     }
                 )
-                self._record_artifact_validation(
-                    validation_tech_record,
-                    selected_id,
-                    score,
-                    status,
-                    reward,
-                    node.fidelity,
-                    res.get("elapsed_seconds"),
-                )
                 self.global_memory.record_implementation(
                     selected_id,
                     {"node_id": selected_id, "reason": no_effect_reason},
@@ -2387,16 +2491,6 @@ class ManagerAgent:
             if deduplicated_outputs:
                 node.result["deduplicated_outputs"] = deduplicated_outputs
 
-            self._record_artifact_validation(
-                validation_tech_record,
-                selected_id,
-                score,
-                status,
-                reward,
-                node.fidelity,
-                res.get("elapsed_seconds"),
-            )
-            
             # Record to global memory
             self.global_memory.record_implementation(
                 selected_id,

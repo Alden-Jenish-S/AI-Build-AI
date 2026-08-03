@@ -115,6 +115,13 @@ def build_runtime_data_contract(
         return _direct_tabular_runtime_contract(
             Path(task_spec_path), Path(task_dir)
         )
+    task_spec: dict[str, Any] = {}
+    if task_spec_path is not None and Path(task_spec_path).is_file():
+        loaded_spec = json.loads(
+            Path(task_spec_path).read_text(encoding="utf-8")
+        )
+        if isinstance(loaded_spec, dict):
+            task_spec = loaded_spec
     examples: dict[str, dict[str, Any]] = {}
     with Path(index_path).open(encoding="utf-8") as stream:
         for line in stream:
@@ -152,12 +159,43 @@ def build_runtime_data_contract(
                 "columns": [name],
             }
 
+    target_spec = task_spec.get("target") or {}
+    output_spec = task_spec.get("output") or {}
+    target_type = (
+        target_spec.get("type")
+        if isinstance(target_spec, Mapping)
+        else None
+    )
     return {
         "schema_version": 1,
         "feature_container": "pandas.DataFrame",
         "feature_variables": ["X_eval", "X_test"],
         "feature_columns": list(flat_row),
         "components": components,
+        "target": {
+            "field": (
+                target_spec.get("field")
+                if isinstance(target_spec, Mapping)
+                else None
+            ),
+            "type": target_type,
+            "storage": (
+                "task_relative_file_reference"
+                if str(target_type or "").endswith("_path")
+                else "inline_array"
+            ),
+            "decode_stage": (
+                "after_harness_split"
+                if str(target_type or "").endswith("_path")
+                else "already_materialized"
+            ),
+            "options": (
+                dict(output_spec.get("options", {}))
+                if isinstance(output_spec, Mapping)
+                and isinstance(output_spec.get("options", {}), Mapping)
+                else {}
+            ),
+        },
         "array_variables": {
             "y_eval": "numpy.ndarray",
             "row_ids": "numpy.ndarray",
@@ -383,6 +421,10 @@ class TaskDataLoader:
             "output_type": task_spec["output"]["type"],
             "class_names": task_spec["output"].get("class_names", []),
             "dataset_fingerprint": index_manifest["dataset_fingerprint"],
+            "target_type": target_spec.get("type"),
+            "target_source": target_spec.get("source"),
+            "target_options": task_spec.get("output", {}).get("options", {}),
+            "input_root": str((root / "input").resolve()),
         }
         self._test_data = {
             "X_test": X_test,
@@ -401,11 +443,23 @@ class TaskDataLoader:
                 encoding="utf-8"
             )
         )
-        index_manifest = json.loads(
-            (assets_root / "dataset_index_manifest.json").read_text(
+        dataset_profile = json.loads(
+            (assets_root / "dataset_profile.json").read_text(
                 encoding="utf-8"
             )
         )
+        index_manifest = dataset_profile.get("dataset_index")
+        if not isinstance(index_manifest, dict):
+            # Read-only compatibility with runs created before the consolidated
+            # profile contract. New runs never create this legacy file.
+            legacy_manifest = assets_root / "dataset_index_manifest.json"
+            if not legacy_manifest.is_file():
+                raise ValueError(
+                    "dataset_profile.json is missing its dataset_index contract"
+                )
+            index_manifest = json.loads(
+                legacy_manifest.read_text(encoding="utf-8")
+            )
         if index_manifest.get("storage") == "direct_tabular":
             self._load_direct_tabular(root, task_spec, index_manifest)
             return
@@ -475,6 +529,10 @@ class TaskDataLoader:
             "output_type": task_spec["output"]["type"],
             "class_names": task_spec["output"].get("class_names", []),
             "dataset_fingerprint": index_manifest["dataset_fingerprint"],
+            "target_type": (task_spec.get("target") or {}).get("type"),
+            "target_source": (task_spec.get("target") or {}).get("source"),
+            "target_options": task_spec.get("output", {}).get("options", {}),
+            "input_root": str((root / "input").resolve()),
         }
         self._test_data = {
             "X_test": X_test,

@@ -6,12 +6,11 @@ import json
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 
 from core.runtime_contracts import DatasetBundle, PredictionBundle, SplitPlan
 from .fidelity import get_fidelity_profile
 from .metrics import metric_value, resolve_metric_name
-from .prediction_io import load_prediction_bundle
+from .prediction_io import load_prediction_bundle, write_assignment_table
 from .splitters import create_split_plan
 
 
@@ -27,15 +26,14 @@ def prepare_evaluation_bundle(
     records, plan = create_split_plan(bundle, profile, seed=seed)
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
-    assignments = pd.DataFrame(
-        {
-            "sample_id": [record.sample_id for record in records],
-            "fold_id": [
-                plan.assignments[record.sample_id] for record in records
-            ],
-        }
+    write_assignment_table(
+        output / "fold_assignments.npz",
+        sample_ids=[record.sample_id for record in records],
+        fold_ids=np.asarray(
+            [plan.assignments[record.sample_id] for record in records],
+            dtype=np.int16,
+        ),
     )
-    assignments.to_csv(output / "fold_assignments.csv", index=False)
     manifest = {
         "protocol_version": 2,
         "task_id": bundle.task.task_id,

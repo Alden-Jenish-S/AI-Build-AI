@@ -141,7 +141,6 @@ def _write_results(
 def run_method_tree(task_name: str, budget: int) -> dict[str, Any]:
     """Run search immediately, select the best method, and emit a submission."""
     reset_token_usage()
-    os.environ["METHOD_TREE_USE_POOL"] = "1"
     manager = ManagerAgent(task_name=task_name, total_budget=budget)
     started = time.time()
     best_node_id = None

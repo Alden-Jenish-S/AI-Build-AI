@@ -206,19 +206,6 @@ def query_l1(category: str) -> dict:
                     continue
                 if card.get("artifact_id") != artifact_id or card.get("category") != category:
                     raise ValueError("Model-card identity does not match its L1 pointer")
-                validations = card.get("task_validations", [])
-                if not isinstance(validations, list):
-                    validations = []
-                completed = [
-                    item
-                    for item in validations
-                    if item.get("status") == "completed" and item.get("score") is not None
-                ]
-                rewards = [
-                    float(item["reward"])
-                    for item in completed
-                    if isinstance(item.get("reward"), (int, float))
-                ]
                 # Keep only search/selection metadata, drop the source code or heavy details
                 summary = {
                     "artifact_id": card["artifact_id"],
@@ -231,18 +218,6 @@ def query_l1(category: str) -> dict:
                     "scope": infer_artifact_scope(card, category),
                     "resource_profile": normalize_resource_profile(card),
                     "known_pitfalls": card.get("known_pitfalls", []),
-                    "validation_summary": {
-                        "runs": len(validations),
-                        "completed": len(completed),
-                        "failures": len(validations) - len(completed),
-                        "completion_rate": (
-                            len(completed) / len(validations)
-                            if validations
-                            else None
-                        ),
-                        "mean_reward": sum(rewards) / len(rewards) if rewards else None,
-                    },
-                    "recent_validations": validations[-3:],
                 }
                 l2_summaries.append(summary)
             except Exception as e:

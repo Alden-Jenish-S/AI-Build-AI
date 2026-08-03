@@ -8,6 +8,7 @@ import math
 import subprocess
 import shutil
 import time
+import threading
 from pathlib import Path
 from typing import Dict, Any, Optional
 from packaging.requirements import Requirement
@@ -21,6 +22,9 @@ from evaluation.policy import (
 )
 from evaluation.prediction_io import (
     legacy_prediction_payload,
+    load_assignment_table,
+    load_prediction_bundle,
+    load_prediction_table,
     write_prediction_bundle,
 )
 from evaluation.submission import (
@@ -48,6 +52,8 @@ from runtime_utils import (
 )
 
 class ImplementationAgent:
+    _candidate_registry_lock = threading.Lock()
+
     def __init__(
         self,
         venv_python_path: str | None = None,
@@ -111,8 +117,9 @@ class ImplementationAgent:
             ).encode("utf-8")
         ).hexdigest()
 
-    @staticmethod
+    @classmethod
     def _register_candidate_fingerprint(
+        cls,
         registry_root: Path,
         *,
         fingerprint: str,
@@ -120,23 +127,24 @@ class ImplementationAgent:
     ) -> str | None:
         """Return the prior node for a duplicate, otherwise register it."""
         registry_path = Path(registry_root) / "candidate_fingerprints.json"
-        try:
-            registry = json.loads(
-                registry_path.read_text(encoding="utf-8")
+        with cls._candidate_registry_lock:
+            try:
+                registry = json.loads(
+                    registry_path.read_text(encoding="utf-8")
+                )
+            except FileNotFoundError:
+                registry = {}
+            except (OSError, ValueError, TypeError):
+                registry = {}
+            previous = registry.get(fingerprint)
+            if previous and previous != node_id:
+                return str(previous)
+            registry[fingerprint] = node_id
+            registry_path.write_text(
+                json.dumps(registry, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
             )
-        except FileNotFoundError:
-            registry = {}
-        except (OSError, ValueError, TypeError):
-            registry = {}
-        previous = registry.get(fingerprint)
-        if previous and previous != node_id:
-            return str(previous)
-        registry[fingerprint] = node_id
-        registry_path.write_text(
-            json.dumps(registry, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-        return None
+            return None
 
     @staticmethod
     def _looks_like_deep_learning(code: str) -> bool:
@@ -161,12 +169,9 @@ class ImplementationAgent:
         result_data: dict,
         algorithm_path: Path,
     ) -> dict[str, object]:
-        """Create typed prediction/model bundles from validated legacy files."""
-        import pandas as pd
-
+        """Create typed prediction/model bundles from validated outputs."""
         artifacts: dict[str, object] = {}
         evaluation_path = node_dir / "evaluation_manifest.json"
-        oof_path = node_dir / "oof_predictions.csv"
         task_fingerprint = hashlib.sha256(
             json.dumps(
                 task_spec.to_dict(), sort_keys=True, default=str
@@ -183,8 +188,11 @@ class ImplementationAgent:
             )
         else:
             evaluation = {}
-        if oof_path.is_file():
-            frame = pd.read_csv(oof_path)
+        try:
+            frame = load_prediction_table(node_dir / "oof_predictions")
+        except FileNotFoundError:
+            frame = None
+        if frame is not None:
             required = {"row_id"}
             if required.issubset(frame.columns):
                 predictions, inferred_class_names = (
@@ -193,14 +201,9 @@ class ImplementationAgent:
                 if "fold_id" in frame.columns:
                     fold_ids = frame["fold_id"].to_numpy(dtype=int)
                 else:
-                    assignments_path = node_dir / "fold_assignments.csv"
-                    assignments = pd.read_csv(assignments_path).set_index(
-                        assignments_path.is_file()
-                        and pd.read_csv(
-                            assignments_path, nrows=0
-                        ).columns[0]
-                        or "row_id"
-                    )
+                    assignments = load_assignment_table(
+                        node_dir / "fold_assignments"
+                    ).set_index("row_id")
                     fold_ids = (
                         assignments.reindex(frame["row_id"])["fold_id"]
                         .to_numpy(dtype=int)
@@ -254,6 +257,11 @@ class ImplementationAgent:
                 artifacts["compatibility_key"] = (
                     prediction_bundle.compatibility_key
                 )
+        typed_manifest = node_dir / "predictions" / "manifest.json"
+        if typed_manifest.is_file() and "prediction_bundle" not in artifacts:
+            typed_bundle, _, _, _ = load_prediction_bundle(typed_manifest)
+            artifacts["prediction_bundle"] = str(typed_manifest)
+            artifacts["compatibility_key"] = typed_bundle.compatibility_key
 
         checkpoint_suffixes = {
             ".bin",
@@ -410,13 +418,13 @@ class ImplementationAgent:
             elif evaluation_mode == "holdout":
                 guidance.append(
                     "Evaluation repair: preserve the harness train/validation "
-                    "split, train once, write validation_predictions.csv for "
+                    "split, train once, write validation_predictions.npz for "
                     "validation_row_ids, and do not create OOF output."
                 )
             else:
                 guidance.append(
                     "Evaluation repair: preserve task-native validation rows, "
-                    "write validation_predictions.csv, and do not create "
+                    "write validation_predictions.npz, and do not create "
                     "supervised OOF output."
                 )
         if cls._looks_like_deep_learning(code):
@@ -1223,10 +1231,14 @@ Current copied artifact:
             "node_state.json",
             "technique_record.json",
             "error.log",
+            "oof_predictions.npz",
             "oof_predictions.csv",
+            "validation_predictions.npz",
             "validation_predictions.csv",
             "evaluation_manifest.json",
+            "fold_assignments.npz",
             "fold_assignments.csv",
+            "validation_assignments.npz",
             "validation_assignments.csv",
             "evaluation_policy.json",
             "execution_resource.json",
@@ -1290,6 +1302,7 @@ Current copied artifact:
         metric_name: Optional[str] = None,
         task_assets_dir: Optional[Path] = None,
         evaluation_mode: Optional[str] = None,
+        parallel_processes: int = 1,
     ) -> Dict[str, Any]:
         """
         1. Reads immutable task inputs and harness-generated task metadata.
@@ -1313,6 +1326,9 @@ Current copied artifact:
                 use the canonical task contract.
             evaluation_mode: Optional manager-selected validation protocol.
                 When omitted, the model-aware evaluation policy selects it.
+            parallel_processes: Number of independent training subprocesses in
+                the current root batch. CPU thread pools are divided across
+                them to avoid oversubscription.
         """
         if timeout is not None and (
             not isinstance(timeout, (int, float))
@@ -1341,6 +1357,12 @@ Current copied artifact:
             raise ValueError("max_debug_attempts must be a non-negative integer")
         if tuning_context is not None and not isinstance(tuning_context, dict):
             raise ValueError("tuning_context must be a dictionary when provided")
+        if (
+            not isinstance(parallel_processes, int)
+            or isinstance(parallel_processes, bool)
+            or parallel_processes < 1
+        ):
+            raise ValueError("parallel_processes must be a positive integer")
         accelerator = str(accelerator).lower()
         if accelerator not in {"cpu", "cuda", "mps"}:
             raise ValueError(f"Unsupported accelerator: {accelerator!r}")
@@ -1398,15 +1420,35 @@ Current copied artifact:
                 "task_dataloader.py",
                 "resolved_task_spec.json",
                 "dataset_profile.json",
-                "dataset_analysis_report.txt",
-                "dataset_index_manifest.json",
                 "runtime_data_contract.json",
             ]
-            index_manifest = json.loads(
-                (
-                    task_assets_source / "dataset_index_manifest.json"
-                ).read_text(encoding="utf-8")
+            analysis_asset = (
+                "dataset_analysis.md"
+                if (task_assets_source / "dataset_analysis.md").is_file()
+                else "dataset_analysis_report.txt"
             )
+            required_task_assets.append(analysis_asset)
+            task_profile = json.loads(
+                (task_assets_source / "dataset_profile.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            index_manifest = task_profile.get("dataset_index")
+            if not isinstance(index_manifest, dict):
+                legacy_manifest = (
+                    task_assets_source / "dataset_index_manifest.json"
+                )
+                if legacy_manifest.is_file():
+                    index_manifest = json.loads(
+                        legacy_manifest.read_text(encoding="utf-8")
+                    )
+                    required_task_assets.append(
+                        "dataset_index_manifest.json"
+                    )
+                else:
+                    raise ValueError(
+                        "dataset_profile.json is missing its dataset_index contract"
+                    )
             if index_manifest.get("storage") != "direct_tabular":
                 required_task_assets.append("dataset_index.jsonl")
             missing = [
@@ -1528,8 +1570,28 @@ Current copied artifact:
             
         # Get dataset analysis report to pass to LLM
         dataset_snapshot = ""
-        report_file = node_dir / "dataset_analysis_report.txt"
+        diagnostic_directive_context = ""
+        report_file = node_dir / "dataset_analysis.md"
+        if not report_file.is_file():
+            legacy_report = node_dir / "dataset_analysis_report.txt"
+            if legacy_report.is_file():
+                report_file = legacy_report
         try:
+            task_profile = json.loads(
+                (node_dir / "dataset_profile.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            diagnostics = task_profile.get("diagnostics", {})
+            directives = (
+                diagnostics.get("synthesized_directives", [])
+                if isinstance(diagnostics, dict)
+                else []
+            )
+            if isinstance(directives, list):
+                diagnostic_directive_context = "\n".join(
+                    f"- {str(item)}" for item in directives if str(item).strip()
+                )
             if report_file.exists():
                 with open(report_file, 'r', encoding='utf-8') as f:
                     analysis_report = f.read()
@@ -1537,7 +1599,9 @@ Current copied artifact:
                 from .data_analyzer import run_dataset_analysis
                 print(f"ImplementationAgent: Checking/running dataset analysis fallback for {task_dir.name}...")
                 analysis_report = run_dataset_analysis(task_dir)
-                report_file.write_text(analysis_report, encoding="utf-8")
+                (node_dir / "dataset_analysis.md").write_text(
+                    analysis_report, encoding="utf-8"
+                )
                     
             dataset_snapshot = (
                 "=== Dataset Analysis & Schema Report ===\n"
@@ -1649,7 +1713,32 @@ Current copied artifact:
             if operator == "tune" and tuning_context
             else ""
         )
+        structured_prediction_output = task_spec.output.type in {
+            "boxes",
+            "embeddings",
+            "masks",
+            "ranked_items",
+            "text",
+        }
         if evaluation_mode == "cross_validation":
+            prediction_artifact_instruction = (
+                "Import `write_structured_predictions` from the local "
+                "`evaluation_contract` module and call it with output_dir='.', "
+                "sample_ids=row_ids, predictions=<aligned N-D or structured "
+                "predictions>, targets=y_eval, fold_ids=fold_ids, "
+                "evaluation_meta=evaluation_meta, and "
+                f"output_type={task_spec.output.type!r}. This must create "
+                "`predictions/manifest.json`; do not flatten masks, boxes, text, "
+                "or ranked outputs into a scalar table."
+                if structured_prediction_output
+                else
+                "Import `write_prediction_table` from "
+                "`evaluation.prediction_io` and save every scheduled row to "
+                "`oof_predictions.npz`, passing sample_ids=row_ids, "
+                "targets=y_eval, predictions, fold_ids, and stable class_names "
+                "for class-probability output. Do not serialize evaluation "
+                "arrays through pandas CSV."
+            )
             evaluation_contract_prompt = (
                 "SELECTED EVALUATION MODE: cross_validation. OOF is required "
                 "because this model was classified as fold-independent and "
@@ -1663,14 +1752,11 @@ Current copied artifact:
                 "use the supplied fold_ids exactly. The harness has already "
                 "applied fidelity sampling: never subsample these rows or "
                 "create an independent split. Fit learned preprocessing on "
-                "each fold's training rows only. Save one prediction for "
-                "every scheduled row to `oof_predictions.csv`. Scalar output "
-                "uses row_id,target,prediction,fold_id. Class probabilities "
-                "use row_id,target,fold_id and one numeric "
-                "`prediction::<class_name>` column per class in stable order.\n"
+                "each fold's training rows only. "
+                f"{prediction_artifact_instruction}\n"
             )
             evaluation_output_prompt = (
-                "Persist the complete OOF output described above so the "
+                "Persist the complete aligned evaluation output described above so the "
                 "harness can independently recompute every fold metric."
             )
             result_statistics_prompt = (
@@ -1679,10 +1765,28 @@ Current copied artifact:
             )
             progress_unit = "fold"
         elif evaluation_mode == "holdout":
+            prediction_artifact_instruction = (
+                "Import `write_structured_predictions` from the local "
+                "`evaluation_contract` module and call it with output_dir='.', "
+                "sample_ids=validation_row_ids, predictions=<aligned N-D or "
+                "structured predictions>, targets=y_valid, "
+                "evaluation_meta=evaluation_meta, and "
+                f"output_type={task_spec.output.type!r}. This must create "
+                "`predictions/manifest.json`; do not flatten structured outputs "
+                "into a scalar table."
+                if structured_prediction_output
+                else
+                "Import `write_prediction_table` from "
+                "`evaluation.prediction_io` and write "
+                "`validation_predictions.npz` for exactly the validation rows, "
+                "passing sample_ids=validation_row_ids, targets=y_valid, "
+                "predictions, and stable class_names for probability output. "
+                "Do not serialize evaluation arrays through pandas CSV."
+            )
             evaluation_contract_prompt = (
                 "SELECTED EVALUATION MODE: holdout. OOF IS NOT REQUIRED for "
                 "this model. Do not create a CV loop and do not write "
-                "`oof_predictions.csv`.\n"
+                "`oof_predictions.npz`.\n"
                 "Import `prepare_holdout_evaluation_data` from the local "
                 "`evaluation_contract` module and call:\n"
                 f"  X_train, y_train, X_valid, y_valid, "
@@ -1692,15 +1796,17 @@ Current copied artifact:
                 "Fit all preprocessing only on X_train and use X_valid only "
                 "for evaluation, early stopping, and model selection. The "
                 "split is harness-owned; never call train_test_split or make "
-                "another split. Write `validation_predictions.csv` for exactly "
-                "the validation rows. Scalar output uses "
-                "row_id,target,prediction. Class probabilities use "
-                "row_id,target and one numeric `prediction::<class_name>` "
-                "column per class in stable model.classes_ order.\n"
+                f"another split. {prediction_artifact_instruction}\n"
             )
             evaluation_output_prompt = (
-                "Persist `validation_predictions.csv`; OOF files are not part "
-                "of this node's contract."
+                (
+                    "Persist `predictions/manifest.json`; OOF files are not part "
+                    "of this node's contract."
+                    if structured_prediction_output
+                    else
+                    "Persist `validation_predictions.npz`; OOF files are not part "
+                    "of this node's contract."
+                )
             )
             result_statistics_prompt = (
                 f'"evaluation_mode": "holdout", '
@@ -1711,7 +1817,7 @@ Current copied artifact:
             evaluation_contract_prompt = (
                 "SELECTED EVALUATION MODE: task_native. OOF IS NOT REQUIRED "
                 "because this task has no supervised fold target. Do not write "
-                "`oof_predictions.csv`.\n"
+                "`oof_predictions.npz`.\n"
                 "Import `prepare_evaluation_data` and "
                 "`evaluate_clustering_predictions` from the local "
                 "`evaluation_contract` module. Call:\n"
@@ -1721,7 +1827,7 @@ Current copied artifact:
                 "Fit the unsupervised method once on X_eval, then call "
                 "`evaluate_clustering_predictions(X_eval, labels, row_ids, "
                 "fold_ids, fidelity=evaluation_meta['fidelity'])`. The helper "
-                "writes `validation_predictions.csv` and computes the bounded "
+                "writes `validation_predictions.npz` and computes the bounded "
                 "task-native validation proxy. The fold IDs are scoring "
                 "partitions only; do not train one model per fold.\n"
             )
@@ -1748,6 +1854,10 @@ Current copied artifact:
             "- If an optional package is unavailable, implement the intended mechanism self-contained with importable project libraries.\n"
             "ROBUST PIPELINE DESIGN PRINCIPLES (apply only when supported by dataset diagnostics):\n"
             f"{robust_strategy_context}\n"
+            "AUTHORITATIVE DATASET-DIAGNOSTIC DIRECTIVES:\n"
+            f"{diagnostic_directive_context or '- No synthesized directive was available.'}\n"
+            "Use these directives as evidence, not as permission to leak test "
+            "statistics or fit preprocessing outside training folds.\n"
             f"{fine_tuning_instruction}"
             f"{deep_learning_instruction}"
             f"Modality correctness contract:\n{modality_context}\n"
@@ -1791,7 +1901,10 @@ Current copied artifact:
                 "without both `final_training_manifest.json` and the submission file. "
                 "`prepare_final_training_data` owns the manifest; NEVER create, overwrite, "
                 "or append to that file yourself. The exact submission ID and prediction "
-                "column names are listed in resolved_task_spec.json under output.options.\n"
+                "column names are listed in resolved_task_spec.json under output.options. "
+                "For structured outputs, obey submission_encoding, rle_flatten_order, "
+                "rle_index_base, and rle_pair_format exactly; encode each prediction "
+                "rather than writing an array or Python representation into a CSV cell.\n"
                 if require_submission
                 else ""
             )
@@ -2220,10 +2333,17 @@ Code:
             for stale_output in (
                 result_json_path,
                 submission_path,
+                node_dir / "oof_predictions.npz",
                 node_dir / "oof_predictions.csv",
+                node_dir / "validation_predictions.npz",
                 node_dir / "validation_predictions.csv",
+                node_dir / "predictions" / "manifest.json",
+                node_dir / "predictions" / "payload.npz",
+                node_dir / "predictions" / "payload.json",
                 node_dir / "evaluation_manifest.json",
+                node_dir / "fold_assignments.npz",
                 node_dir / "fold_assignments.csv",
+                node_dir / "validation_assignments.npz",
                 node_dir / "validation_assignments.csv",
                 node_dir / "error_analysis.json",
                 node_dir / "final_training_manifest.json",
@@ -2232,12 +2352,32 @@ Code:
                 / "final_training_manifest.json",
                 node_dir
                 / ".evaluation_contract"
+                / "validation_targets.npz",
+                node_dir
+                / ".evaluation_contract"
                 / "validation_targets.json",
+                node_dir
+                / ".evaluation_contract"
+                / "evaluation_targets.npz",
             ):
                 if stale_output.exists() or stale_output.is_symlink():
                     stale_output.unlink()
             
             child_env = accelerator_subprocess_env(accelerator)
+            if accelerator == "cpu" and parallel_processes > 1:
+                thread_limit = max(
+                    1, int(os.cpu_count() or 1) // parallel_processes
+                )
+                for variable in (
+                    "OMP_NUM_THREADS",
+                    "MKL_NUM_THREADS",
+                    "OPENBLAS_NUM_THREADS",
+                    "NUMEXPR_NUM_THREADS",
+                ):
+                    child_env[variable] = str(thread_limit)
+                child_env["AIBUILDAI_PARALLEL_ROOT_PROCESSES"] = str(
+                    parallel_processes
+                )
             child_env.update(
                 {
                     "AIBUILDAI_TASK_ASSETS_DIR": str(
@@ -2415,6 +2555,7 @@ Code:
                                 node_dir,
                                 evaluation_mode=evaluation_mode,
                                 problem_type=task_spec.problem_type,
+                                metric_name=metric_name,
                             )
                             result_data["error_analysis"] = error_analysis
                             (node_dir / "error_analysis.json").write_text(
@@ -2625,13 +2766,23 @@ Code:
                 if result_data.get(key) is not None
             },
             "oof_path": (
-                str(node_dir / "oof_predictions.csv")
+                str(node_dir / "oof_predictions.npz")
+                if (node_dir / "oof_predictions.npz").is_file()
+                else str(node_dir / "oof_predictions.csv")
                 if (node_dir / "oof_predictions.csv").is_file()
+                else str(node_dir / "predictions" / "manifest.json")
+                if evaluation_mode == "cross_validation"
+                and (node_dir / "predictions" / "manifest.json").is_file()
                 else None
             ),
             "validation_path": (
-                str(node_dir / "validation_predictions.csv")
+                str(node_dir / "validation_predictions.npz")
+                if (node_dir / "validation_predictions.npz").is_file()
+                else str(node_dir / "validation_predictions.csv")
                 if (node_dir / "validation_predictions.csv").is_file()
+                else str(node_dir / "predictions" / "manifest.json")
+                if evaluation_mode == "holdout"
+                and (node_dir / "predictions" / "manifest.json").is_file()
                 else None
             ),
             **contract_artifacts,

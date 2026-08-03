@@ -23,6 +23,11 @@ from .common import (
     row_split,
 )
 from .tabular import TabularAdapter, discover_dataset_layout
+from .paired_directory import (
+    build_paired_directory_bundle,
+    discover_paired_directory_layout,
+    paired_layout_config,
+)
 
 
 _PATH_FIELDS = {
@@ -181,11 +186,27 @@ class MultimodalAdapter:
     @classmethod
     def can_auto_discover(cls, task_dir: Path) -> bool:
         """Return whether a config-less mixed task has a safe entity join."""
-        return cls._legacy_join_info(task_dir) is not None
+        paired = discover_paired_directory_layout(task_dir)
+        if paired is not None and paired.modality == "multimodal":
+            return True
+        info = cls._legacy_join_info(task_dir)
+        if info is None:
+            return False
+        # A table/media join is not enough to prove that a supervised target
+        # exists.  Targetless metadata tables previously became invalid schema
+        # v2 classification contracts.
+        try:
+            return TabularAdapter().discover(task_dir).target is not None
+        except (FileNotFoundError, TypeError, ValueError):
+            return False
 
     def discover(self, task_dir: Path) -> TaskSpec:
         config = read_task_config(task_dir)
         if not config:
+            paired = discover_paired_directory_layout(task_dir)
+            if paired is not None and paired.modality == "multimodal":
+                config = paired_layout_config(task_dir, paired)
+                return TaskSpec.from_mapping(Path(task_dir).name, config)
             info = self._legacy_join_info(task_dir)
             if info is None:
                 raise ValueError(
@@ -478,6 +499,11 @@ class MultimodalAdapter:
         self, task_dir: Path, task_spec: TaskSpec
     ) -> DatasetBundle:
         if any(
+            bool(input_spec.options.get("auto_paired_target"))
+            for input_spec in task_spec.inputs.values()
+        ):
+            return build_paired_directory_bundle(task_dir, task_spec)
+        if any(
             bool(input_spec.options.get("auto_join"))
             for input_spec in task_spec.inputs.values()
         ):
@@ -592,20 +618,22 @@ class MultimodalAdapter:
             )
             for name in task_spec.inputs
         }
-        return {
+        profile = {
             **bundle.to_index_dict(),
             "component_modalities": list(
                 task_spec.component_modalities
             ),
             "missing_components": missing,
-            "target_distribution": dict(
-                Counter(
-                    str(record.target)
-                    for record in bundle.train_records
-                )
-            ),
             "split_unit": "entity_id",
         }
+        if task_spec.target and str(task_spec.target.type or "").endswith("_path"):
+            profile["structured_target_references"] = len(bundle.train_records)
+            profile["target_storage"] = task_spec.target.type
+        else:
+            profile["target_distribution"] = dict(
+                Counter(str(record.target) for record in bundle.train_records)
+            )
+        return profile
 
     def render_report(
         self, task_dir: Path, task_spec: TaskSpec | None = None

@@ -28,7 +28,16 @@ from evaluation.runner import (
     evaluate_prediction_bundle,
     prepare_evaluation_bundle,
 )
-from evaluation.prediction_io import legacy_prediction_payload
+from evaluation.prediction_io import (
+    legacy_prediction_payload,
+    load_assignment_table,
+    load_prediction_bundle,
+    load_prediction_table,
+    write_assignment_table,
+    write_prediction_bundle,
+    write_prediction_table,
+)
+from core.runtime_contracts import SplitPlan
 
 FIDELITY_PROFILES = legacy_profiles()
 CONTRACT_STATE_DIR = ".evaluation_contract"
@@ -48,6 +57,15 @@ def _array(value: Any) -> np.ndarray:
     if isinstance(value, pd.Series):
         return value.to_numpy()
     return np.asarray(value)
+
+
+def _canonical_row_id(value: object) -> str:
+    if isinstance(value, (int, np.integer)):
+        return str(int(value))
+    if isinstance(value, (float, np.floating)) and np.isfinite(value):
+        if float(value).is_integer():
+            return str(int(value))
+    return str(value)
 
 
 def _full_training_data(
@@ -98,6 +116,82 @@ def _full_training_data(
     return X, y, row_ids
 
 
+def _structured_target_path(reference: object, train_data: dict) -> Path:
+    """Resolve one loader-issued target reference inside the node input root."""
+    input_root = Path(str(train_data.get("input_root") or "input")).resolve()
+    raw = Path(str(reference))
+    if raw.is_absolute() or ".." in raw.parts:
+        raise ValueError(f"unsafe structured target reference: {reference!r}")
+    parts = raw.parts[1:] if raw.parts and raw.parts[0] == "input" else raw.parts
+    candidate = input_root.joinpath(*parts)
+    resolved_parent = candidate.parent.resolve()
+    if resolved_parent != input_root and input_root not in resolved_parent.parents:
+        raise ValueError(f"structured target escapes the input root: {reference!r}")
+    if not candidate.is_file():
+        raise FileNotFoundError(
+            f"structured target is not linked into the node: {reference!r}"
+        )
+    return candidate
+
+
+def _decode_structured_targets(
+    targets: np.ndarray | None,
+    train_data: dict,
+) -> np.ndarray | None:
+    """Decode typed target references after sampling and split selection."""
+    if targets is None:
+        return None
+    target_type = str(train_data.get("target_type") or "").strip().lower()
+    if not target_type.endswith("_path"):
+        return np.asarray(targets)
+    values = np.asarray(targets, dtype=object).reshape(-1)
+    options = train_data.get("target_options") or {}
+    decoded: list[object] = []
+    for reference in values:
+        path = _structured_target_path(reference, train_data)
+        if target_type == "mask_path":
+            try:
+                from PIL import Image
+            except ImportError as exc:
+                raise RuntimeError(
+                    "Pillow is required to decode mask_path targets"
+                ) from exc
+            with Image.open(path) as image:
+                array = np.asarray(image.convert("L")).copy()
+            if bool(options.get("binary", True)):
+                threshold = float(options.get("target_threshold", 0))
+                array = (array > threshold).astype(np.uint8)
+            decoded.append(array)
+        elif target_type == "text_path":
+            decoded.append(path.read_text(encoding="utf-8"))
+        elif target_type in {
+            "annotation_path",
+            "temporal_annotation_path",
+        }:
+            if path.suffix.lower() in {".json", ".jsonl"}:
+                loaded = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    for key in ("boxes", "bbox", "segments", "annotations"):
+                        if key in loaded:
+                            loaded = loaded[key]
+                            break
+                decoded.append(np.asarray(loaded))
+            else:
+                decoded.append(np.loadtxt(path, delimiter="," if path.suffix.lower() == ".csv" else None))
+        else:
+            raise ValueError(
+                f"unsupported structured target type: {target_type!r}"
+            )
+    if target_type == "text_path":
+        return np.asarray(decoded, dtype=str)
+    try:
+        return np.stack([np.asarray(item) for item in decoded], axis=0)
+    except ValueError:
+        result = np.empty(len(decoded), dtype=object)
+        result[:] = decoded
+        return result
+
+
 def prepare_final_training_data(
     train_data: dict,
     test_data: dict,
@@ -106,6 +200,7 @@ def prepare_final_training_data(
 ) -> tuple[pd.DataFrame, np.ndarray | None, pd.DataFrame, np.ndarray]:
     """Return full training and test rows and persist a refit audit manifest."""
     X_full, y_full, row_ids_full = _full_training_data(train_data)
+    y_full = _decode_structured_targets(y_full, train_data)
     if test_data.get("X_test") is None:
         raise ValueError("test_data must provide X_test for final prediction")
     X_test = pd.DataFrame(test_data["X_test"]).reset_index(drop=True)
@@ -209,7 +304,14 @@ def prepare_evaluation_data(
     folds = int(profile["cv_folds"])
     selected = np.arange(len(X_full))
     declared_task_type = str(train_data.get("task_type", "")).strip().lower()
-    if unsupervised or declared_task_type == "regression":
+    if unsupervised or declared_task_type in {
+        "captioning",
+        "detection",
+        "regression",
+        "retrieval",
+        "segmentation",
+        "temporal_localization",
+    }:
         classification = False
     elif declared_task_type in {
         "classification",
@@ -293,7 +395,11 @@ def prepare_evaluation_data(
                 rng.choice(len(X_full), size=max(2, int(len(X_full) * fraction)), replace=False)
             )
     X = X_full.iloc[selected].reset_index(drop=True)
-    y = None if unsupervised else y_full[selected]
+    y = (
+        None
+        if unsupervised
+        else _decode_structured_targets(y_full[selected], train_data)
+    )
     row_ids = row_ids_full[selected]
     group_ids = (
         group_ids_full[selected]
@@ -329,9 +435,9 @@ def prepare_evaluation_data(
         split_iterator = splitter.split(X, y, split_group_ids)
     else:
         split_iterator = (
-            splitter.split(X)
-            if unsupervised
-            else splitter.split(X, y)
+            splitter.split(X, y)
+            if can_stratify_folds
+            else splitter.split(X)
         )
     for fold, (_, validation_indices) in enumerate(split_iterator):
         fold_ids[validation_indices] = fold
@@ -381,29 +487,108 @@ def prepare_evaluation_data(
             else "regression"
         ),
         "fold_assignment_sha256": digest,
+        "task_fingerprint": str(
+            train_data.get("dataset_fingerprint") or "unknown_task"
+        ),
+        "split_fingerprint": digest,
     }
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
-    assignments.to_csv(output / "fold_assignments.csv", index=False)
+    write_assignment_table(
+        output / "fold_assignments.npz",
+        sample_ids=row_ids,
+        fold_ids=fold_ids,
+    )
+    if y is not None:
+        proof_targets = np.asarray(y)
+        if proof_targets.dtype == object and all(
+            isinstance(item, (str, bytes, bool, int, float, np.generic))
+            or item is None
+            for item in proof_targets.reshape(-1).tolist()
+        ):
+            proof_targets = np.asarray(
+                ["" if item is None else str(item) for item in proof_targets.reshape(-1)],
+                dtype=str,
+            ).reshape(proof_targets.shape)
+        if proof_targets.dtype != object:
+            proof_dir = output / CONTRACT_STATE_DIR
+            proof_dir.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(
+                proof_dir / "evaluation_targets.npz",
+                row_ids=np.asarray([str(item) for item in row_ids], dtype=str),
+                targets=proof_targets,
+            )
     (output / "evaluation_manifest.json").write_text(
         json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
     )
     return X, y, row_ids, fold_ids, metadata
 
 
-def _json_compatible(value: Any) -> Any:
-    if isinstance(value, np.generic):
-        return value.item()
-    if isinstance(value, np.ndarray):
-        return value.tolist()
-    if isinstance(value, (list, tuple)):
-        return [_json_compatible(item) for item in value]
-    if isinstance(value, dict):
-        return {
-            str(key): _json_compatible(item)
-            for key, item in value.items()
-        }
-    return value
+def write_structured_predictions(
+    output_dir: str | Path,
+    *,
+    sample_ids: Any,
+    predictions: Any,
+    targets: Any,
+    evaluation_meta: dict,
+    fold_ids: Any | None = None,
+    output_type: str | None = None,
+) -> Path:
+    """Persist N-D or ragged validation predictions with a typed manifest.
+
+    Generated implementations use this facade instead of constructing runtime
+    fingerprint objects themselves.  The harness still independently validates
+    IDs, folds, and holdout targets.
+    """
+    ids = tuple(str(item) for item in np.asarray(sample_ids).reshape(-1))
+    if not ids:
+        raise ValueError("structured predictions require sample IDs")
+    folds = (
+        np.zeros(len(ids), dtype=np.int16)
+        if fold_ids is None
+        else np.asarray(fold_ids, dtype=np.int16).reshape(-1)
+    )
+    if len(folds) != len(ids):
+        raise ValueError("structured fold IDs must align with sample IDs")
+    split_plan = SplitPlan(
+        assignments={
+            sample_id: int(fold)
+            for sample_id, fold in zip(ids, folds)
+        },
+        strategy=str(
+            evaluation_meta.get("evaluation_mode") or "harness_split"
+        ),
+        seed=int(evaluation_meta.get("seed", 42)),
+        leakage_unit=str(
+            evaluation_meta.get("leakage_unit") or "row_id"
+        ),
+        split_fingerprint=str(
+            evaluation_meta.get("split_fingerprint")
+            or evaluation_meta.get("fold_assignment_sha256")
+            or ""
+        ),
+    )
+    write_prediction_bundle(
+        output_dir,
+        task_fingerprint=str(
+            evaluation_meta.get("task_fingerprint") or "unknown_task"
+        ),
+        split_plan=split_plan,
+        output_type=str(
+            output_type
+            or evaluation_meta.get("output_type")
+            or "continuous"
+        ),
+        sample_ids=ids,
+        predictions=np.asarray(predictions),
+        targets=np.asarray(targets),
+        fold_ids=folds,
+        metadata={
+            "problem_type": evaluation_meta.get("task_type"),
+            "evaluation_mode": evaluation_meta.get("evaluation_mode"),
+        },
+    )
+    return Path(output_dir) / "predictions" / "manifest.json"
 
 
 def prepare_holdout_evaluation_data(
@@ -454,21 +639,23 @@ def prepare_holdout_evaluation_data(
     validation_row_ids = _array(row_ids)[validation_mask]
 
     output = Path(output_dir)
-    assignments = pd.DataFrame({"row_id": validation_row_ids})
-    assignments.to_csv(
-        output / "validation_assignments.csv", index=False
+    write_assignment_table(
+        output / "validation_assignments.npz",
+        sample_ids=validation_row_ids,
     )
     proof_dir = output / CONTRACT_STATE_DIR
     proof_dir.mkdir(parents=True, exist_ok=True)
-    target_proof = {
-        "row_ids": [str(item) for item in validation_row_ids],
-        "targets": [
-            _json_compatible(item) for item in y_validation
-        ],
-    }
-    (proof_dir / "validation_targets.json").write_text(
-        json.dumps(target_proof, ensure_ascii=False) + "\n",
-        encoding="utf-8",
+    proof_targets = np.asarray(y_validation)
+    if proof_targets.dtype == object:
+        proof_targets = np.asarray(
+            [str(item) for item in proof_targets], dtype=str
+        )
+    np.savez_compressed(
+        proof_dir / "validation_targets.npz",
+        row_ids=np.asarray(
+            [str(item) for item in validation_row_ids], dtype=str
+        ),
+        targets=proof_targets,
     )
     metadata.update(
         {
@@ -561,13 +748,12 @@ def evaluate_clustering_predictions(
 
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(
-        {
-            "row_id": ids,
-            "prediction": codes.astype(np.int64),
-            "fold_id": folds.astype(np.int64),
-        }
-    ).to_csv(output / "validation_predictions.csv", index=False)
+    write_prediction_table(
+        output / "validation_predictions.npz",
+        sample_ids=ids,
+        predictions=codes.astype(np.int64),
+        fold_ids=folds.astype(np.int64),
+    )
 
     rng = np.random.default_rng(seed)
     sample_parts = []
@@ -620,6 +806,117 @@ def evaluate_clustering_predictions(
 
 def _metric_value(metric_name: str, target: np.ndarray, prediction: np.ndarray) -> float:
     return metric_value(metric_name, target, prediction)
+
+
+def _arrays_equal(left: np.ndarray, right: np.ndarray) -> bool:
+    if left.shape != right.shape:
+        return False
+    if np.issubdtype(left.dtype, np.number) and np.issubdtype(
+        right.dtype, np.number
+    ):
+        return bool(np.allclose(left, right, rtol=0.0, atol=0.0))
+    return bool(np.array_equal(left.astype(str), right.astype(str)))
+
+
+def _validate_typed_holdout_outputs(
+    root: Path,
+    manifest: dict,
+    fidelity: str,
+    metric_name: str,
+    expected_class_names: tuple[str, ...],
+) -> dict:
+    bundle, predictions, reported_targets, fold_ids = load_prediction_bundle(
+        root / "predictions" / "manifest.json"
+    )
+    assignments = load_assignment_table(root / "validation_assignments")
+    expected_ids = assignments["row_id"].astype(str).tolist()
+    position = {sample_id: index for index, sample_id in enumerate(bundle.sample_ids)}
+    if len(position) != len(expected_ids) or set(position) != set(expected_ids):
+        raise ValueError(
+            "typed holdout predictions do not cover the harness validation IDs"
+        )
+    order = np.asarray([position[sample_id] for sample_id in expected_ids], dtype=int)
+    predictions = np.asarray(predictions)[order]
+    fold_ids = np.asarray(fold_ids)[order]
+    if (fold_ids != 0).any():
+        raise ValueError("typed holdout prediction folds must all be zero")
+    with np.load(
+        root / CONTRACT_STATE_DIR / "validation_targets.npz",
+        allow_pickle=False,
+    ) as proof:
+        proof_ids = proof["row_ids"].astype(str).tolist()
+        authoritative_target = proof["targets"]
+    if proof_ids != expected_ids:
+        raise ValueError("validation targets differ from the harness assignment")
+    if reported_targets is not None:
+        aligned_reported = np.asarray(reported_targets)[order]
+        if not _arrays_equal(aligned_reported, authoritative_target):
+            raise ValueError(
+                "typed holdout targets differ from the harness target proof"
+            )
+    if expected_class_names and tuple(bundle.class_names) != tuple(
+        expected_class_names
+    ):
+        raise ValueError(
+            "typed holdout class columns differ from the task output contract"
+        )
+    expected_output = str(manifest.get("output_type") or "")
+    if expected_output and bundle.output_type != expected_output:
+        raise ValueError(
+            "typed holdout output type differs from the task contract"
+        )
+    if np.issubdtype(predictions.dtype, np.number) and not np.isfinite(
+        predictions.astype(float, copy=False)
+    ).all():
+        raise ValueError("holdout predictions contain non-finite values")
+    resolved_metric = resolve_metric_name(
+        metric_name,
+        problem_type=manifest.get("task_type"),
+        output_type=manifest.get("output_type"),
+    )
+    score = float(
+        metric_value(
+            resolved_metric,
+            authoritative_target,
+            predictions,
+            class_names=bundle.class_names,
+        )
+    )
+    bootstrap_scores = []
+    if len(predictions) >= 2:
+        rng = np.random.default_rng(int(manifest.get("seed", 42)))
+        for _ in range(64):
+            sample = rng.integers(0, len(predictions), len(predictions))
+            try:
+                value = float(
+                    metric_value(
+                        resolved_metric,
+                        authoritative_target[sample],
+                        predictions[sample],
+                        class_names=bundle.class_names,
+                    )
+                )
+            except (TypeError, ValueError, IndexError):
+                continue
+            if np.isfinite(value):
+                bootstrap_scores.append(value)
+    score_std = float(np.std(bootstrap_scores)) if bootstrap_scores else 0.0
+    return {
+        "score": score,
+        "validation_score": score,
+        "score_std": score_std,
+        "evaluation_mode": "holdout",
+        "folds": 1,
+        "fold_scores": [score],
+        "seed": int(manifest["seed"]),
+        "fidelity": fidelity,
+        "row_count": len(predictions),
+        "validation_row_count": len(predictions),
+        "source_row_count": int(manifest["source_row_count"]),
+        "fold_assignment_sha256": manifest["fold_assignment_sha256"],
+        "metric": resolved_metric,
+        "direction": infer_metric_direction(resolved_metric),
+    }
 
 
 def validate_evaluation_outputs(
@@ -687,13 +984,23 @@ def validate_evaluation_outputs(
             )
 
     if evaluation_mode == "holdout":
-        validation_path = root / "validation_predictions.csv"
-        if not validation_path.is_file():
+        if (root / "predictions" / "manifest.json").is_file():
+            return _validate_typed_holdout_outputs(
+                root,
+                manifest,
+                fidelity,
+                metric_name,
+                expected_class_names,
+            )
+        try:
+            frame = load_prediction_table(root / "validation_predictions")
+        except FileNotFoundError:
             raise ValueError(
-                "holdout evaluation requires validation_predictions.csv; "
+                "holdout evaluation requires validation_predictions.npz "
+                "(or legacy CSV); "
                 "OOF output is neither required nor accepted"
             )
-        frame = pd.read_csv(validation_path, dtype={"row_id": str})
+        renamed_id_alias = False
         if "row_id" not in frame.columns:
             aliases = [
                 alias for alias in ("sample_id", "id")
@@ -701,6 +1008,13 @@ def validate_evaluation_outputs(
             ]
             if len(aliases) == 1:
                 frame = frame.rename(columns={aliases[0]: "row_id"})
+                renamed_id_alias = True
+        if "row_id" in frame.columns:
+            frame["row_id"] = (
+                frame["row_id"].map(_canonical_row_id)
+                if renamed_id_alias
+                else frame["row_id"].astype(str)
+            )
         required = {"row_id"}
         if not required.issubset(frame.columns):
             raise ValueError(
@@ -708,9 +1022,8 @@ def validate_evaluation_outputs(
             )
         if frame["row_id"].duplicated().any():
             raise ValueError("holdout prediction row IDs are duplicated")
-        assignments = pd.read_csv(
-            root / "validation_assignments.csv",
-            dtype={"row_id": str},
+        assignments = load_assignment_table(
+            root / "validation_assignments"
         )
         if assignments["row_id"].duplicated().any():
             raise ValueError("validation assignment row IDs are duplicated")
@@ -723,19 +1036,16 @@ def validate_evaluation_outputs(
             raise ValueError(
                 "holdout prediction IDs differ from the harness validation split"
             )
-        proof = json.loads(
-            (
-                root
-                / CONTRACT_STATE_DIR
-                / "validation_targets.json"
-            ).read_text(encoding="utf-8")
-        )
-        expected_ids = [str(item) for item in proof.get("row_ids", [])]
+        with np.load(
+            root / CONTRACT_STATE_DIR / "validation_targets.npz",
+            allow_pickle=False,
+        ) as proof:
+            expected_ids = proof["row_ids"].astype(str).tolist()
+            authoritative_target = proof["targets"]
         if expected_ids != assignments["row_id"].astype(str).tolist():
             raise ValueError(
                 "validation targets differ from the harness assignment"
             )
-        authoritative_target = np.asarray(proof.get("targets", []))
         if len(authoritative_target) != len(aligned):
             raise ValueError("validation target proof has the wrong length")
         aligned = aligned.reset_index()
@@ -809,8 +1119,10 @@ def validate_evaluation_outputs(
 
     typed_manifest = root / "predictions" / "manifest.json"
     legacy_oof = root / "oof_predictions.csv"
+    binary_oof = root / "oof_predictions.npz"
     if typed_manifest.is_file() and (
-        protocol_version >= 2 or not legacy_oof.is_file()
+        protocol_version >= 2
+        or not (legacy_oof.is_file() or binary_oof.is_file())
     ):
         resolved_metric = resolve_metric_name(
             metric_name,
@@ -825,9 +1137,32 @@ def validate_evaluation_outputs(
         )
         from evaluation.prediction_io import load_prediction_bundle
 
-        bundle, predictions, _, fold_ids = load_prediction_bundle(
+        bundle, predictions, reported_targets, fold_ids = load_prediction_bundle(
             typed_manifest
         )
+        proof_path = root / CONTRACT_STATE_DIR / "evaluation_targets.npz"
+        if proof_path.is_file():
+            with np.load(proof_path, allow_pickle=False) as proof:
+                proof_ids = proof["row_ids"].astype(str).tolist()
+                proof_targets = proof["targets"]
+            proof_position = {
+                sample_id: index for index, sample_id in enumerate(proof_ids)
+            }
+            if set(bundle.sample_ids) != set(proof_position):
+                raise ValueError(
+                    "typed prediction IDs differ from the harness target proof"
+                )
+            proof_order = np.asarray(
+                [proof_position[sample_id] for sample_id in bundle.sample_ids],
+                dtype=int,
+            )
+            authoritative_targets = proof_targets[proof_order]
+            if reported_targets is None or not _arrays_equal(
+                np.asarray(reported_targets), authoritative_targets
+            ):
+                raise ValueError(
+                    "typed prediction targets differ from the harness target proof"
+                )
         if expected_class_names and tuple(bundle.class_names) != tuple(
             expected_class_names
         ):
@@ -845,7 +1180,7 @@ def validate_evaluation_outputs(
             raise ValueError(
                 "typed predictions use a different harness split"
             )
-        assignments = pd.read_csv(root / "fold_assignments.csv")
+        assignments = load_assignment_table(root / "fold_assignments")
         id_column = (
             "sample_id"
             if "sample_id" in assignments.columns
@@ -879,12 +1214,13 @@ def validate_evaluation_outputs(
             "task_type": manifest.get("problem_type"),
         }
 
-    evaluation_output = (
-        root / "validation_predictions.csv"
+    evaluation_stem = (
+        root / "validation_predictions"
         if evaluation_mode == "task_native"
-        else legacy_oof
+        else root / "oof_predictions"
     )
-    oof = pd.read_csv(evaluation_output)
+    oof = load_prediction_table(evaluation_stem)
+    renamed_id_alias = False
     if "row_id" not in oof.columns:
         aliases = [
             alias
@@ -903,9 +1239,18 @@ def validate_evaluation_outputs(
             )
         ):
             oof = oof.rename(columns={aliases[0]: "row_id"})
+            renamed_id_alias = True
             # Persist the canonical form so pruning and diversity policies see
             # the same schema that the evaluator accepted.
-            oof.to_csv(evaluation_output, index=False)
+            legacy_output = evaluation_stem.with_suffix(".csv")
+            if legacy_output.is_file():
+                oof.to_csv(legacy_output, index=False)
+    if "row_id" in oof.columns:
+        oof["row_id"] = (
+            oof["row_id"].map(_canonical_row_id)
+            if renamed_id_alias
+            else oof["row_id"].astype(str)
+        )
     if manifest.get("task_type") == "unsupervised_clustering":
         required = {"row_id", "prediction", "fold_id"}
         if not required.issubset(oof.columns):
@@ -917,7 +1262,7 @@ def validate_evaluation_outputs(
             raise ValueError(
                 "clustering output does not cover every scheduled row exactly once"
             )
-        assignments = pd.read_csv(root / "fold_assignments.csv").rename(
+        assignments = load_assignment_table(root / "fold_assignments").rename(
             columns={"fold_id": "expected_fold_id"}
         )
         merged = oof.merge(
@@ -993,7 +1338,7 @@ def validate_evaluation_outputs(
         raise ValueError(f"OOF output is missing columns: {sorted(required - set(oof.columns))}")
     if len(oof) != int(manifest["row_count"]) or oof["row_id"].duplicated().any():
         raise ValueError("OOF output does not cover each scheduled evaluation row exactly once")
-    assignments = pd.read_csv(root / "fold_assignments.csv")
+    assignments = load_assignment_table(root / "fold_assignments")
     if assignments["row_id"].duplicated().any():
         raise ValueError("fold assignment row IDs are duplicated")
     assignments = assignments.rename(columns={"fold_id": "expected_fold_id"})

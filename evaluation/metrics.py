@@ -48,6 +48,8 @@ _ALIASES = {
     "map": "mean_average_precision",
     "mean_ap": "mean_average_precision",
     "mean_average_precision_score": "mean_average_precision",
+    "mask_average_precision": "segmentation_average_precision",
+    "segmentation_map": "segmentation_average_precision",
     "mean_squared_error": "mse",
     "mean_absolute_error": "mae",
     "mrr": "mean_reciprocal_rank",
@@ -176,6 +178,16 @@ def infer_metric_from_description(description: object) -> str | None:
     text = str(description or "")
     if not text.strip():
         return None
+    normalized = text.lower()
+    if (
+        ("average precision" in normalized or "mean ap" in normalized)
+        and (
+            "iou threshold" in normalized
+            or "intersection over union" in normalized
+        )
+        and any(token in normalized for token in ("mask", "pixel", "segment"))
+    ):
+        return "segmentation_average_precision"
     for pattern, metric_template in _DESCRIPTION_METRIC_PATTERNS:
         match = re.search(pattern, text, flags=re.IGNORECASE)
         if not match:
@@ -484,8 +496,22 @@ def _mask_labels(predicted: np.ndarray, truth: np.ndarray) -> np.ndarray:
     ):
         # Support both channel-first and channel-last spatial logits.
         if values.shape[2:] == truth.shape[1:]:
+            if values.shape[1] == 1:
+                squeezed = values[:, 0]
+                return (
+                    (squeezed >= 0.5).astype(int)
+                    if np.issubdtype(squeezed.dtype, np.floating)
+                    else squeezed
+                )
             return np.argmax(values, axis=1)
         if values.shape[1:-1] == truth.shape[1:]:
+            if values.shape[-1] == 1:
+                squeezed = values[..., 0]
+                return (
+                    (squeezed >= 0.5).astype(int)
+                    if np.issubdtype(squeezed.dtype, np.floating)
+                    else squeezed
+                )
             return np.argmax(values, axis=-1)
     raise ValueError("segmentation predictions do not align with target masks")
 
@@ -513,6 +539,48 @@ def _overlap_score(
             union = int(np.logical_or(target_mask, prediction_mask).sum())
             per_class.append(1.0 if union == 0 else intersection / union)
     return float(np.mean(per_class)) if per_class else 1.0
+
+
+def _segmentation_average_precision(
+    truth: np.ndarray,
+    predicted: np.ndarray,
+    *,
+    thresholds: Sequence[float] | None = None,
+) -> float:
+    """Mean per-image precision across binary-mask IoU thresholds.
+
+    This is the common competition segmentation metric in which an image is a
+    hit at a threshold only when its foreground IoU is strictly greater than
+    that threshold.  Empty/empty masks are perfect matches; a one-sided empty
+    mask scores zero.
+    """
+    target = np.asarray(truth)
+    labels = _mask_labels(np.asarray(predicted), target)
+    if target.shape != labels.shape or target.ndim < 2:
+        raise ValueError(
+            "segmentation average precision requires aligned mask arrays"
+        )
+    cutoffs = np.asarray(
+        tuple(thresholds)
+        if thresholds is not None
+        else tuple(np.arange(0.50, 1.00, 0.05)),
+        dtype=float,
+    )
+    if cutoffs.ndim != 1 or not len(cutoffs) or (
+        (cutoffs < 0.0).any() or (cutoffs > 1.0).any()
+    ):
+        raise ValueError("segmentation IoU thresholds must be within [0, 1]")
+    values = []
+    for target_mask, predicted_mask in zip(target, labels):
+        target_positive = np.asarray(target_mask) > 0
+        predicted_positive = np.asarray(predicted_mask) > 0
+        intersection = int(
+            np.logical_and(target_positive, predicted_positive).sum()
+        )
+        union = int(np.logical_or(target_positive, predicted_positive).sum())
+        iou = 1.0 if union == 0 else intersection / union
+        values.append(float(np.mean(iou > cutoffs)))
+    return float(np.mean(values)) if values else 0.0
 
 
 def _box_iou(target: np.ndarray, prediction: np.ndarray) -> float:
@@ -638,6 +706,12 @@ def metric_value(
         return float(roc_auc_score(truth.reshape(-1), scores))
     if metric == "average_precision":
         return float(average_precision_score(truth, predicted))
+    if metric == "segmentation_average_precision":
+        return _segmentation_average_precision(
+            truth,
+            predicted,
+            thresholds=options.get("thresholds"),
+        )
     if metric in {"log_loss", "cross_entropy"}:
         probabilities = np.asarray(predicted, dtype=float)
         tolerance = 1e-12

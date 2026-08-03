@@ -130,10 +130,15 @@ Metric direction comes from the registered metric definition.
 
 - `resolved_task_spec.json`
 - `dataset_profile.json`
-- `dataset_analysis_report.txt`
-- `dataset_index_manifest.json`
+- `dataset_analysis.md`
 - `dataset_index.jsonl`
 - `task_dataloader.py`
+
+`dataset_profile.json` contains the runtime dataset-index contract plus bounded,
+modality-neutral diagnostics for target topology, missingness, train/test KS
+drift, dimensionality, and collinearity. `dataset_analysis.md` turns those
+signals into concise modeling directives for the planning and implementation
+agents. Direct tabular sources do not materialize `dataset_index.jsonl`.
 
 It then asks `TechniqueAgent` for distinct root approaches. Each selected root
 approach becomes an implementation node. `ImplementationAgent` receives no
@@ -205,8 +210,7 @@ allowlist.
 runs/<task>/
 ├── resolved_task_spec.json
 ├── dataset_profile.json
-├── dataset_analysis_report.txt
-├── dataset_index_manifest.json
+├── dataset_analysis.md
 ├── dataset_index.jsonl
 ├── task_dataloader.py
 ├── tree_state.json

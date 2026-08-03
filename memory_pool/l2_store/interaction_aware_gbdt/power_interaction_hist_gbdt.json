@@ -52,19 +52,5 @@
   "verification_log": "Passed subprocess verification at 2026-07-19 19:49:12.\nOutput:\nFunction returned type: ndarray\nReturned tabular lengths: [30]\nSUCCESS\n\n<HOME>/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/.venv/lib/python3.11/site-packages/joblib/externals/loky/backend/context.py:131: UserWarning: Could not find the number of physical cores for the following reason:\ninvalid literal for int() with base 10: ''\nReturning the number of logical cores instead. You can silence this warning by setting LOKY_MAX_CPU_COUNT to the number of cores you want to use.\n  warnings.warn(\n  File \"<HOME>/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/.venv/lib/python3.11/site-packages/joblib/externals/loky/backend/context.py\", line 249, in _count_physical_cores\n    cpu_count_physical = _count_physical_cores_darwin()\n                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"<HOME>/Desktop/Openclaw_workspace/AIBuildAI_UCSD/agent_system/.venv/lib/python3.11/site-packages/joblib/externals/loky/backend/context.py\", line 318, in _count_physical_cores_darwin\n    return int(cpu_info)\n           ^^^^^^^^^^^^^",
   "code_path": "power_interaction_hist_gbdt.py",
   "verification_level": "contract-mock-data",
-  "verification_isolation": "resource-limited-subprocess",
-  "task_validations": [
-    {
-      "task_name": "playground-series",
-      "node_id": "node_21",
-      "score": 7.923023312380641,
-      "metric_direction": "minimize",
-      "status": "completed",
-      "reward": 0.0015988878422252943,
-      "fidelity": "screen",
-      "elapsed_seconds": 36.06193604199507,
-      "improved_over_baseline": true,
-      "provenance": "post_run_extraction_of_executed_methodology"
-    }
-  ]
+  "verification_isolation": "resource-limited-subprocess"
 }

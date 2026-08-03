@@ -1,15 +1,21 @@
 import base64
+import importlib.util
 import json
+import os
 import tempfile
 import unittest
 import wave
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
 
 from agents.task_analyzer import TaskAnalyzer
-from agents.modality_scaffold import build_runtime_data_contract
+from agents.modality_scaffold import (
+    build_runtime_data_contract,
+    task_loader_source,
+)
 from agents.validation_guard import inspect_generated_code
 from core.runtime_contracts import FidelityProfile
 from evaluation.prediction_io import (
@@ -17,6 +23,12 @@ from evaluation.prediction_io import (
     write_prediction_bundle,
 )
 from evaluation.runner import evaluate_prediction_bundle
+from evaluation.error_analysis import build_error_analysis
+from evaluation_contract import (
+    prepare_holdout_evaluation_data,
+    validate_evaluation_outputs,
+    write_structured_predictions,
+)
 from evaluation.splitters import create_split_plan
 from memory_pool.builder.verification_runtime import (
     _build_arguments,
@@ -299,6 +311,144 @@ metadata = X_train["metadata"]
 
 
 class MultimodalEvaluationTests(unittest.TestCase):
+    def test_configless_paired_masks_resolve_and_score_as_segmentation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            task_dir = root / "paired_segmentation"
+            train_images = task_dir / "train" / "images"
+            train_masks = task_dir / "train" / "masks"
+            test_images = task_dir / "test" / "images"
+            train_images.mkdir(parents=True)
+            train_masks.mkdir(parents=True)
+            test_images.mkdir(parents=True)
+            rows = []
+            for index in range(12):
+                sample_id = f"train_{index:02d}"
+                (train_images / f"{sample_id}.png").write_bytes(_PNG_1X1)
+                (train_masks / f"{sample_id}.png").write_bytes(_PNG_1X1)
+                rows.append({"id": sample_id, "depth": 100 + index})
+            test_ids = []
+            for index in range(3):
+                sample_id = f"test_{index:02d}"
+                test_ids.append(sample_id)
+                (test_images / f"{sample_id}.png").write_bytes(_PNG_1X1)
+                rows.append({"id": sample_id, "depth": 200 + index})
+            pd.DataFrame(rows).to_csv(task_dir / "depths.csv", index=False)
+            pd.DataFrame(
+                {"id": test_ids, "rle_mask": [""] * len(test_ids)}
+            ).to_csv(task_dir / "sample_submission.csv", index=False)
+            (task_dir / "task_description.md").write_text(
+                "Segment every image mask. Evaluation uses mean average "
+                "precision at intersection over union (IoU) thresholds from "
+                "0.5 to 0.95."
+            )
+
+            analyzer = TaskAnalyzer()
+            spec = analyzer.resolve(task_dir)
+            self.assertEqual(spec.modality, "multimodal")
+            self.assertEqual(spec.component_modalities, ("image", "tabular"))
+            self.assertEqual(spec.problem_type, "segmentation")
+            self.assertEqual(spec.target.type, "mask_path")
+            self.assertEqual(spec.output.type, "masks")
+            self.assertEqual(
+                spec.output.options["submission_encoding"],
+                "run_length_encoding",
+            )
+            self.assertEqual(
+                spec.primary_metric, "segmentation_average_precision"
+            )
+
+            output_dir = root / "analysis"
+            analysis = analyzer.analyze(
+                task_dir, output_dir=output_dir, include_index=True
+            )
+            self.assertEqual(len(analysis.bundle.train_records), 12)
+            self.assertEqual(len(analysis.bundle.test_records), 3)
+            first = analysis.bundle.train_records[0]
+            self.assertTrue(str(first.target).startswith("input/train/masks/"))
+            self.assertIn("depth", first.inputs["metadata"])
+            runtime_contract = build_runtime_data_contract(
+                output_dir / "dataset_index.jsonl",
+                task_spec_path=output_dir / "resolved_task_spec.json",
+                task_dir=task_dir,
+            )
+            self.assertEqual(
+                runtime_contract["target"]["storage"],
+                "task_relative_file_reference",
+            )
+            self.assertEqual(
+                runtime_contract["target"]["decode_stage"],
+                "after_harness_split",
+            )
+
+            loader_path = output_dir / "task_dataloader.py"
+            loader_path.write_text(task_loader_source())
+            expose_task_data(task_dir, output_dir)
+            loader_spec = importlib.util.spec_from_file_location(
+                "paired_segmentation_loader", loader_path
+            )
+            loader_module = importlib.util.module_from_spec(loader_spec)
+            with patch.dict(
+                os.environ,
+                {"AIBUILDAI_TASK_ASSETS_DIR": str(output_dir)},
+            ):
+                loader_spec.loader.exec_module(loader_module)
+                train_data, _ = loader_module.TaskDataLoader()()
+            self.assertEqual(train_data["target_type"], "mask_path")
+            (
+                _,
+                _,
+                _,
+                y_valid,
+                validation_ids,
+                evaluation_meta,
+            ) = prepare_holdout_evaluation_data(
+                train_data,
+                "screen",
+                output_dir=output_dir,
+            )
+            self.assertEqual(y_valid.ndim, 3)
+            write_structured_predictions(
+                output_dir,
+                sample_ids=validation_ids,
+                predictions=y_valid.copy(),
+                targets=y_valid,
+                evaluation_meta=evaluation_meta,
+                output_type="masks",
+            )
+            validated = validate_evaluation_outputs(
+                output_dir,
+                "screen",
+                "segmentation_average_precision",
+                expected_evaluation_mode="holdout",
+            )
+            self.assertEqual(validated["score"], 1.0)
+            error_analysis = build_error_analysis(
+                output_dir,
+                evaluation_mode="holdout",
+                problem_type="segmentation",
+                metric_name="segmentation_average_precision",
+            )
+            self.assertTrue(error_analysis["available"])
+            self.assertEqual(error_analysis["analysis_version"], 2)
+
+    def test_paired_masks_without_metadata_use_image_adapter(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            task_dir = Path(temp_dir) / "image_segmentation"
+            for split, folder, count in (
+                ("train", "images", 2),
+                ("train", "masks", 2),
+                ("test", "images", 1),
+            ):
+                directory = task_dir / split / folder
+                directory.mkdir(parents=True, exist_ok=True)
+                for index in range(count):
+                    name = f"train_{index}" if split == "train" else "test_0"
+                    (directory / f"{name}.png").write_bytes(_PNG_1X1)
+            spec = TaskAnalyzer().resolve(task_dir)
+            self.assertEqual(spec.modality, "image")
+            self.assertEqual(spec.problem_type, "segmentation")
+
     def _task(self, root: Path) -> Path:
         task_dir = root / "multimodal_task"
         (task_dir / "input" / "images").mkdir(parents=True)
@@ -392,6 +542,27 @@ class MultimodalEvaluationTests(unittest.TestCase):
                 set(bundle.train_records[0].inputs), {"image", "metadata"}
             )
             self.assertTrue((output_dir / "dataset_index.jsonl").is_file())
+            self.assertFalse(
+                (output_dir / "dataset_index_manifest.json").exists()
+            )
+            loader_path = output_dir / "task_dataloader.py"
+            loader_path.write_text(task_loader_source())
+            loader_spec = importlib.util.spec_from_file_location(
+                "consolidated_task_loader", loader_path
+            )
+            loader_module = importlib.util.module_from_spec(loader_spec)
+            with patch.dict(
+                os.environ,
+                {"AIBUILDAI_TASK_ASSETS_DIR": str(output_dir)},
+            ):
+                loader_spec.loader.exec_module(loader_module)
+                train_data, test_data = loader_module.TaskDataLoader()()
+            self.assertEqual(len(train_data["X_full"]), 8)
+            self.assertEqual(len(test_data["X_test"]), 2)
+            self.assertEqual(
+                train_data["dataset_fingerprint"],
+                analysis.profile["dataset_index"]["dataset_fingerprint"],
+            )
 
             fidelity = FidelityProfile(
                 name="test",

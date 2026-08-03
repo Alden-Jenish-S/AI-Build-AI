@@ -375,7 +375,9 @@ def inspect_generated_code(
             in {
                 "evaluation_manifest.json",
                 "final_training_manifest.json",
+                "fold_assignments.npz",
                 "fold_assignments.csv",
+                "validation_assignments.npz",
                 "validation_assignments.csv",
             }
             or output_path.replace("\\", "/").startswith(

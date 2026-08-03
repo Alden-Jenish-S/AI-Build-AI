@@ -64,26 +64,5 @@
   "verification_log": "Passed subprocess verification at 2026-07-16 20:27:40.\nOutput:\nFunction returned type: ndarray\nReturned tabular lengths: [30]\nSUCCESS",
   "code_path": "gradient_reversal_domain_adaptation.py",
   "verification_level": "mixed-missing-contract-mock-data",
-  "task_validations": [
-    {
-      "task_name": "playground-series-s6e2",
-      "node_id": "node_6",
-      "score": 0.9501586071970058,
-      "metric_direction": "maximize",
-      "status": "completed",
-      "improved_over_baseline": false
-    },
-    {
-      "task_name": "playground-series-s6e2",
-      "node_id": "node_4",
-      "score": null,
-      "metric_direction": "maximize",
-      "status": "failed",
-      "reward": -1.0,
-      "fidelity": "screen",
-      "elapsed_seconds": 235.69499150000047,
-      "improved_over_baseline": null
-    }
-  ],
   "verification_isolation": "resource-limited-subprocess"
 }

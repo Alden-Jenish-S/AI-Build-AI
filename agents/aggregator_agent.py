@@ -11,7 +11,10 @@ from core.runtime_contracts import EnsembleBundle, PredictionBundle, SplitPlan
 from evaluation.metrics import metric_value, normalized_metric_value
 from evaluation.prediction_io import (
     legacy_prediction_payload,
-    write_legacy_oof,
+    load_assignment_table,
+    load_prediction_table,
+    write_assignment_table,
+    write_prediction_table,
     write_prediction_bundle,
 )
 
@@ -62,7 +65,7 @@ class AggregatorAgent:
                 print(f"AggregatorAgent: Missing submission for {nid}: {sub_file}")
                 return False
             try:
-                df = pd.read_csv(sub_file)
+                df = pd.read_csv(sub_file, keep_default_na=False)
                 submissions.append(df)
                 print(f"AggregatorAgent: Loaded submission for {nid}")
             except Exception as e:
@@ -203,10 +206,12 @@ class AggregatorAgent:
         """Optimize a blend on aligned OOF rows and compare it to every single."""
         frames = []
         for node_id in node_ids:
-            path = run_root / node_id / "oof_predictions.csv"
-            if not path.is_file():
+            try:
+                frame = load_prediction_table(
+                    run_root / node_id / "oof_predictions"
+                )
+            except FileNotFoundError:
                 return None
-            frame = pd.read_csv(path)
             required = {"row_id", "target"}
             if (
                 not required.issubset(frame.columns)
@@ -463,7 +468,9 @@ class AggregatorAgent:
 
         frames = []
         for node_id in node_ids:
-            frame = pd.read_csv(run_root / node_id / "oof_predictions.csv")
+            frame = load_prediction_table(
+                run_root / node_id / "oof_predictions"
+            )
             frames.append(frame.set_index("row_id").sort_index())
         reference = frames[0]
         if any(not frame.index.equals(reference.index) for frame in frames[1:]):
@@ -503,7 +510,9 @@ class AggregatorAgent:
             fold_ids = reference["fold_id"].to_numpy(dtype=int)
         else:
             assignments = (
-                pd.read_csv(run_root / node_ids[0] / "fold_assignments.csv")
+                load_assignment_table(
+                    run_root / node_ids[0] / "fold_assignments"
+                )
                 .set_index("row_id")
                 .reindex(reference.index)
             )
@@ -517,17 +526,19 @@ class AggregatorAgent:
                 return None
 
         destination_dir.mkdir(parents=True, exist_ok=True)
-        write_legacy_oof(
-            destination_dir / "oof_predictions.csv",
+        write_prediction_table(
+            destination_dir / "oof_predictions.npz",
             sample_ids=reference.index.to_numpy(),
             targets=targets,
             predictions=merged_prediction,
             fold_ids=fold_ids,
             class_names=class_names,
         )
-        pd.DataFrame(
-            {"row_id": reference.index.to_numpy(), "fold_id": fold_ids}
-        ).to_csv(destination_dir / "fold_assignments.csv", index=False)
+        write_assignment_table(
+            destination_dir / "fold_assignments.npz",
+            sample_ids=reference.index.to_numpy(),
+            fold_ids=fold_ids,
+        )
 
         submission_path = destination_dir / "submission" / "submission.csv"
         if not self.aggregate_submissions(
@@ -661,7 +672,7 @@ class AggregatorAgent:
                 "folds": len(fold_scores),
                 "fold_scores": [float(value) for value in fold_scores],
             },
-            "oof_path": str(destination_dir / "oof_predictions.csv"),
+            "oof_path": str(destination_dir / "oof_predictions.npz"),
             "code_path": str(destination_dir / "merge_manifest.json"),
             "diagnostics": (
                 "ManagerAgent ensembled measured node predictions using "
@@ -705,7 +716,7 @@ class AggregatorAgent:
             submission_path = run_root / node_id / "submission" / "submission.csv"
             if not submission_path.is_file():
                 continue
-            frame = pd.read_csv(submission_path)
+            frame = pd.read_csv(submission_path, keep_default_na=False)
             if len(frame.columns) < 2:
                 continue
             id_col = frame.columns[0]
@@ -720,7 +731,15 @@ class AggregatorAgent:
                 if list(frame.columns) != reference_columns or set(frame[id_col]) != set(reference_ids):
                     continue
                 aligned = frame.set_index(id_col).reindex(reference_ids)[prediction_columns]
-            vector = aligned.to_numpy(dtype=float).reshape(-1)
+            try:
+                vector = aligned.to_numpy(dtype=float).reshape(-1)
+            except (TypeError, ValueError):
+                # Structured encodings such as RLE masks cannot be averaged in
+                # CSV space. Preserve the strongest ranked candidate and let a
+                # typed model/output merger handle any future structured blend.
+                if not selected:
+                    selected.append(node_id)
+                break
             if not np.isfinite(vector).all():
                 continue
             too_correlated = False

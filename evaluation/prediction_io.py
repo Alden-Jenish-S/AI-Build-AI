@@ -76,6 +76,129 @@ def legacy_prediction_payload(
     return predictions, class_names
 
 
+def write_prediction_table(
+    path: str | Path,
+    *,
+    sample_ids: Sequence[object],
+    predictions: np.ndarray,
+    targets: np.ndarray | None = None,
+    fold_ids: np.ndarray | None = None,
+    class_names: Sequence[object] = (),
+) -> Path:
+    """Persist an evaluation prediction table as a pickle-free NPZ payload."""
+    destination = Path(path)
+    if destination.suffix != ".npz":
+        destination = destination.with_suffix(".npz")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    ids = _storage_array(np.asarray([str(item) for item in sample_ids]))
+    values = _storage_array(np.asarray(predictions))
+    if values.ndim not in {1, 2} or len(values) != len(ids):
+        raise ValueError("prediction rows must align with sample IDs")
+    payload: dict[str, np.ndarray] = {
+        "row_ids": ids,
+        "predictions": values,
+        "class_names": np.asarray(
+            [str(item) for item in class_names], dtype=str
+        ),
+    }
+    if targets is not None:
+        target_values = _storage_array(np.asarray(targets).reshape(-1))
+        if len(target_values) != len(ids):
+            raise ValueError("targets must align with sample IDs")
+        payload["targets"] = target_values
+    if fold_ids is not None:
+        folds = np.asarray(fold_ids, dtype=np.int16).reshape(-1)
+        if len(folds) != len(ids):
+            raise ValueError("fold IDs must align with sample IDs")
+        payload["fold_ids"] = folds
+    np.savez_compressed(destination, **payload)
+    return destination
+
+
+def load_prediction_table(path: str | Path) -> pd.DataFrame:
+    """Load a binary prediction table, with CSV as a legacy fallback."""
+    source = Path(path)
+    binary_path = source if source.suffix == ".npz" else source.with_suffix(".npz")
+    csv_path = source if source.suffix == ".csv" else source.with_suffix(".csv")
+    if binary_path.is_file():
+        with np.load(binary_path, allow_pickle=False) as payload:
+            row_ids = payload["row_ids"].astype(str)
+            predictions = payload["predictions"]
+            class_names = (
+                tuple(payload["class_names"].astype(str).tolist())
+                if "class_names" in payload.files
+                else ()
+            )
+            data: dict[str, object] = {"row_id": row_ids}
+            if "targets" in payload.files:
+                data["target"] = payload["targets"]
+            if predictions.ndim == 1:
+                data["prediction"] = predictions
+            elif predictions.ndim == 2:
+                names = class_names or tuple(
+                    str(index) for index in range(predictions.shape[1])
+                )
+                if len(names) != predictions.shape[1]:
+                    raise ValueError(
+                        "binary class names do not align with predictions"
+                    )
+                for index, name in enumerate(names):
+                    data[f"prediction::{name}"] = predictions[:, index]
+            else:
+                raise ValueError("binary predictions must be one- or two-dimensional")
+            if "fold_ids" in payload.files:
+                data["fold_id"] = payload["fold_ids"].astype(np.int16)
+        return pd.DataFrame(data)
+    if csv_path.is_file():
+        return pd.read_csv(csv_path, dtype={"row_id": str})
+    raise FileNotFoundError(
+        f"prediction table not found: {binary_path} or {csv_path}"
+    )
+
+
+def write_assignment_table(
+    path: str | Path,
+    *,
+    sample_ids: Sequence[object],
+    fold_ids: np.ndarray | None = None,
+) -> Path:
+    """Persist harness row/fold assignments in compact binary form."""
+    destination = Path(path)
+    if destination.suffix != ".npz":
+        destination = destination.with_suffix(".npz")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    payload: dict[str, np.ndarray] = {
+        "row_ids": np.asarray([str(item) for item in sample_ids], dtype=str)
+    }
+    if fold_ids is not None:
+        folds = np.asarray(fold_ids, dtype=np.int16).reshape(-1)
+        if len(folds) != len(payload["row_ids"]):
+            raise ValueError("assignment fold IDs must align with row IDs")
+        payload["fold_ids"] = folds
+    np.savez_compressed(destination, **payload)
+    return destination
+
+
+def load_assignment_table(path: str | Path) -> pd.DataFrame:
+    """Load binary harness assignments, with CSV as a legacy fallback."""
+    source = Path(path)
+    binary_path = source if source.suffix == ".npz" else source.with_suffix(".npz")
+    csv_path = source if source.suffix == ".csv" else source.with_suffix(".csv")
+    if binary_path.is_file():
+        with np.load(binary_path, allow_pickle=False) as payload:
+            data: dict[str, object] = {
+                "row_id": payload["row_ids"].astype(str)
+            }
+            if "fold_ids" in payload.files:
+                data["fold_id"] = payload["fold_ids"].astype(np.int16)
+        return pd.DataFrame(data)
+    if csv_path.is_file():
+        return pd.read_csv(csv_path, dtype={"row_id": str})
+    raise FileNotFoundError(
+        f"assignment table not found: {binary_path} or {csv_path}"
+    )
+
+
 def write_legacy_oof(
     path: str | Path,
     *,
@@ -122,7 +245,7 @@ def write_prediction_bundle(
     fold_ids: np.ndarray | None = None,
     class_names: Sequence[str] = (),
     metadata: dict | None = None,
-    write_legacy_csv: bool = True,
+    write_legacy_csv: bool = False,
 ) -> PredictionBundle:
     """Write an aligned compressed payload and its validated manifest."""
     root = Path(output_dir)
