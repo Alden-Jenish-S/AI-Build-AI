@@ -608,17 +608,35 @@ CRITICAL RULES & AGENT REASONING WORKFLOW:
             )
             try:
                 self._log(display_name, f"Executing {source_file.name}; child logs follow.")
-                completed = run_supervised_process(
-                    [self.python, source_file.name],
-                    cwd=node_dir,
-                    env=child_env,
-                    stall_seconds=stall_seconds,
-                    hard_limit_seconds=hard_limit_seconds,
-                    activity_root=node_dir,
-                    stdout_stream=sys.stdout,
-                    stderr_stream=sys.stderr,
-                    label=f"Implementation {display_name} attempt {attempt}",
-                )
+                install_attempts = 0
+                while True:
+                    completed = run_supervised_process(
+                        [self.python, source_file.name],
+                        cwd=node_dir,
+                        env=child_env,
+                        stall_seconds=stall_seconds,
+                        hard_limit_seconds=hard_limit_seconds,
+                        activity_root=node_dir,
+                        stdout_stream=sys.stdout,
+                        stderr_stream=sys.stderr,
+                        label=f"Implementation {display_name} attempt {attempt}",
+                    )
+                    
+                    if completed.returncode != 0 and install_attempts < 3:
+                        err_match = re.search(r"(?:ModuleNotFoundError|ImportError): No module named '([^']+)'", completed.stderr)
+                        if err_match:
+                            missing_module = err_match.group(1).split('.')[0]
+                            pkg_map = {"cv2": "opencv-python", "sklearn": "scikit-learn", "PIL": "pillow", "yaml": "pyyaml"}
+                            pkg_to_install = pkg_map.get(missing_module, missing_module)
+                            
+                            self._log(display_name, f"Missing module '{missing_module}' detected. Auto-installing {pkg_to_install}...")
+                            import subprocess
+                            subprocess.run([self.python, "-m", "pip", "install", pkg_to_install], check=False)
+                            self._log(display_name, f"Retrying execution after installing '{pkg_to_install}'...")
+                            install_attempts += 1
+                            continue
+                    break
+
             except Exception as exc:
                 feedback = _tail(f"Process launch failed: {exc}")
                 diagnostics.append(f"attempt {attempt}: {feedback}")

@@ -15,7 +15,7 @@ soundfile==0.13.1
 
 # General model families
 catboost==1.2.5
-category_encoders==2.8.1
+category_encoders==2.8.1 
 lightgbm==4.6.0
 xgboost==1.7.6
 # PyTorch's CUDA 12.8 wheel omits Pascal. TITAN Xp is sm_61, so NVIDIA
@@ -29,3 +29,43 @@ pytorch-tabnet==4.1.0
 imbalanced-learn==0.14.0
 optuna==4.5.0
 ngboost==0.5.11
+
+# Advanced Computer Vision
+albumentations==2.0.8
+opencv-python-headless==4.10.0.84
+torchvision==0.23.0
+timm==1.0.20
+
+# Advanced NLP & Transformers Ecosystem
+transformers==4.49.0
+datasets==4.4.1
+sentence-transformers==5.2.0
+spacy==3.8.7
+nltk==3.9.2
+
+# Audio Processing
+torchaudio==2.8.0
+librosa==0.11.0
+
+# Graph Neural Networks
+torch-geometric==2.7.0
+networkx==3.5
+
+# Advanced ML, Deep Learning Utilities & Analytics
+pytorch-lightning==2.5.5
+statsmodels==0.14.5
+umap-learn==0.5.9.post2
+
+# Biology, Chemistry & Medical Imaging
+biopython==1.85
+rdkit==2025.9.1
+monai==0.9.0
+nibabel==5.3.2
+torchio==0.21.3
+pymatgen==2025.10.7
+ase==3.26.0
+e3nn==0.5.8
+
+# Reinforcement Learning & Distributed
+gym==0.26.2
+ray==2.49.2
