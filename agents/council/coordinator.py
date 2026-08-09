@@ -734,6 +734,14 @@ Source index:
                     council_dir,
                     forbidden_terms=self._protected_terms(analysis),
                 )
+                if retriever.openalex_enabled:
+                    self._log(
+                        "Literature provider: OpenAlex (API key detected; secret redaction enabled)."
+                    )
+                else:
+                    self._log(
+                        "OpenAlex disabled: OPENALEX_API_KEY was not found; using bounded web fallbacks."
+                    )
                 sources, audit = retriever.collect(research_requests)
                 if not sources:
                     warnings.append("No primary literature source survived query and provenance checks.")

@@ -8,6 +8,9 @@ __pycache__/
 venv/
 ENV/
 env/
+.env
+.env.*
+!.env.example
 
 # OS files
 .DS_Store

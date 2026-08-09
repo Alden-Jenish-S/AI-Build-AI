@@ -215,6 +215,20 @@ Path('input/train.csv').write_text('changed')
             )
             self.assertFalse(accepted, query)
 
+    def test_generic_task_domain_terms_are_not_mistaken_for_task_identity(self) -> None:
+        accepted, reason = validate_research_query(
+            'site:arxiv.org "tabular neural networks" feature interactions calibration',
+            task_name="tabular-playground-series-may-2022",
+        )
+        self.assertTrue(accepted, reason)
+
+        accepted, reason = validate_research_query(
+            'site:arxiv.org "secretbenchmark2026" neural feature interactions calibration',
+            task_name="SecretBenchmark2026",
+        )
+        self.assertFalse(accepted)
+        self.assertIn("task-identity", reason)
+
     @staticmethod
     def research_requests(count: int = 6) -> list[dict[str, object]]:
         return [

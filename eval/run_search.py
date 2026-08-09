@@ -15,6 +15,7 @@ from typing import Any
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from agents.env_config import load_project_environment
 from agents.llm_utils import get_token_usage, reset_token_usage
 from agents.manager_agent import ManagerAgent
 
@@ -146,6 +147,7 @@ def _write_results(
 
 
 def run_method_tree(task_name: str, budget: int) -> dict[str, Any]:
+    load_project_environment(PROJECT_ROOT)
     reset_token_usage()
     manager = ManagerAgent(task_name=task_name, total_budget=budget)
     started = time.monotonic()
@@ -211,6 +213,9 @@ def run_method_tree(task_name: str, budget: int) -> dict[str, Any]:
 
 
 def main() -> None:
+    # Load before constructing argparse defaults so AIBUILDAI_TASK and provider
+    # credentials declared in the project .env behave like exported variables.
+    load_project_environment(PROJECT_ROOT)
     parser = argparse.ArgumentParser(description="Run direct task analysis and implementation search.")
     parser.add_argument(
         "task_name",

@@ -58,6 +58,44 @@ _PRIMARY_HOST_SUFFIXES = (
 )
 _OPENALEX_RATE_LOCK = threading.Lock()
 _OPENALEX_LAST_REQUEST = 0.0
+_OPENALEX_ENV_NAMES = ("OPENALEX_API_KEY", "OPENALEX_KEY", "OPENALEX_APIKEY")
+_GENERIC_TASK_TERMS = {
+    "audio",
+    "benchmark",
+    "binary",
+    "challenge",
+    "classification",
+    "competition",
+    "data",
+    "dataset",
+    "forecasting",
+    "image",
+    "multimodal",
+    "playground",
+    "regression",
+    "series",
+    "tabular",
+    "text",
+    "video",
+}
+
+
+def configured_openalex_api_key() -> str:
+    """Return the configured key; callers must never log or persist it."""
+    for name in _OPENALEX_ENV_NAMES:
+        value = os.getenv(name, "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _redact_openalex_secret(value: object) -> str:
+    text = str(value)
+    key = configured_openalex_api_key()
+    if key:
+        for secret in {key, urllib.parse.quote(key), urllib.parse.quote_plus(key)}:
+            text = text.replace(secret, "<redacted>")
+    return text
 
 
 class _VisibleTextParser(HTMLParser):
@@ -84,7 +122,9 @@ def _task_tokens(task_name: str) -> set[str]:
     return {
         token.casefold()
         for token in re.findall(r"[A-Za-z0-9]+", str(task_name))
-        if len(token) >= 4 and token.casefold() not in {"classification", "series", "challenge"}
+        if len(token) >= 4
+        and not token.isdigit()
+        and token.casefold() not in _GENERIC_TASK_TERMS
     }
 
 
@@ -223,7 +263,7 @@ def _abstract_from_inverted_index(value: object) -> str:
 
 def _openalex_search(query: str, *, limit: int = 5) -> list[dict[str, Any]]:
     """Search OpenAlex without ever persisting or logging its API key."""
-    api_key = os.getenv("OPENALEX_API_KEY", "").strip()
+    api_key = configured_openalex_api_key()
     if not api_key:
         return []
     terms, date_filter = _openalex_terms(query)
@@ -349,6 +389,18 @@ class ResearchRetriever:
         self.forbidden_terms = tuple(str(term) for term in forbidden_terms)
         self._audit: list[dict[str, Any]] = []
         self._lock = threading.Lock()
+        self._reported_provider_events: set[str] = set()
+
+    @property
+    def openalex_enabled(self) -> bool:
+        return bool(configured_openalex_api_key())
+
+    def _report_provider_once(self, event: str, message: str) -> None:
+        with self._lock:
+            if event in self._reported_provider_events:
+                return
+            self._reported_provider_events.add(event)
+        print(f"MLResearchCouncil: {message}", flush=True)
 
     def _audit_record(self, record: dict[str, Any]) -> None:
         with self._lock:
@@ -365,7 +417,7 @@ class ResearchRetriever:
         )
         if not valid:
             return {"sources": [], "retrieval_succeeded": True}
-        if os.getenv("OPENALEX_API_KEY", "").strip():
+        if self.openalex_enabled:
             try:
                 openalex_sources = _openalex_search(query)
                 for source in openalex_sources:
@@ -382,6 +434,10 @@ class ResearchRetriever:
                         }
                     )
                 if openalex_sources:
+                    self._report_provider_once(
+                        "openalex_success",
+                        "OpenAlex retrieval active; structured scholarly records received.",
+                    )
                     return {
                         "sources": openalex_sources,
                         "retrieval_succeeded": True,
@@ -395,9 +451,12 @@ class ResearchRetriever:
                         "reason": "OpenAlex returned no works; trying web fallbacks",
                     }
                 )
+                self._report_provider_once(
+                    "openalex_empty",
+                    "OpenAlex returned no works for a focused query; using the bounded web fallback for that query.",
+                )
             except Exception as exc:
-                api_key = os.getenv("OPENALEX_API_KEY", "")
-                safe_error = str(exc).replace(api_key, "<redacted>")[:500]
+                safe_error = _redact_openalex_secret(exc)[:500]
                 self._audit_record(
                     {
                         "query": query,
@@ -406,6 +465,11 @@ class ResearchRetriever:
                         "accepted": False,
                         "reason": f"OpenAlex failed; trying web fallbacks: {type(exc).__name__}: {safe_error}",
                     }
+                )
+                self._report_provider_once(
+                    "openalex_failure",
+                    "OpenAlex request failed "
+                    f"({type(exc).__name__}: {safe_error}); using bounded web fallbacks.",
                 )
         try:
             try:
