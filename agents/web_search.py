@@ -26,7 +26,9 @@ import threading
 from typing import Optional
 
 
-_MAX_QUERY_CHARS = 99
+# Preserve precise, source-targeted literature queries. The previous 99-character
+# cap silently removed the discriminating tail of council-generated queries.
+_MAX_QUERY_CHARS = 300
 _MAX_CACHE_ENTRIES = 256
 _SEARCH_CACHE: dict[str, str] = {}
 _SEARCH_CACHE_LOCK = threading.RLock()
@@ -51,7 +53,7 @@ def _random_ua() -> str:
 
 
 def _bounded_query(query: object) -> str:
-    """Normalize a query and keep provider requests below 100 characters."""
+    """Normalize a query while retaining its technical qualifiers."""
     normalized = " ".join(str(query or "").split())
     if len(normalized) <= _MAX_QUERY_CHARS:
         return normalized
@@ -374,8 +376,10 @@ def _ddg_instant_answer(query_str: str) -> Optional[str]:
 # Public Interface
 # ---------------------------------------------------------------------------
 
-def _search_uncached(query: str) -> str:
+def _search_uncached(query: str, *, max_retries: int | None = None) -> str:
     """Run provider fallbacks for one already-normalized query."""
+    lite_retries = 3 if max_retries is None else max_retries
+    html_retries = 2 if max_retries is None else max_retries
     # 1. Serper (Google)
     result = _serper_search(query)
     if result:
@@ -383,13 +387,13 @@ def _search_uncached(query: str) -> str:
         return result
 
     # 2. DDG Lite
-    result = _ddg_lite_search(query)
+    result = _ddg_lite_search(query, max_retries=lite_retries)
     if result:
         print("[WebSearch] Results from DuckDuckGo Lite")
         return result
 
     # 3. DDG HTML
-    result = _ddg_html_search(query)
+    result = _ddg_html_search(query, max_retries=html_retries)
     if result:
         print("[WebSearch] Results from DuckDuckGo HTML")
         return result
@@ -405,11 +409,15 @@ def _search_uncached(query: str) -> str:
     return ""
 
 
-def search_web(query_str: str) -> str:
+def search_web(query_str: str, *, max_retries: int | None = None) -> str:
     """Search with bounded queries, per-process caching, and request coalescing."""
     query = _bounded_query(query_str)
     if not query:
         return ""
+    if max_retries is not None:
+        if isinstance(max_retries, bool) or not isinstance(max_retries, int):
+            raise ValueError("max_retries must be a positive integer or None")
+        max_retries = max(1, min(5, max_retries))
     cache_key = query.casefold()
     with _SEARCH_CACHE_LOCK:
         if cache_key in _SEARCH_CACHE:
@@ -429,7 +437,9 @@ def search_web(query_str: str) -> str:
             return _SEARCH_CACHE.get(cache_key, "")
 
     try:
-        return _cache_result(cache_key, _search_uncached(query))
+        return _cache_result(
+            cache_key, _search_uncached(query, max_retries=max_retries)
+        )
     finally:
         with _SEARCH_CACHE_LOCK:
             completed = _SEARCH_INFLIGHT.pop(cache_key, None)
@@ -439,6 +449,10 @@ def search_web(query_str: str) -> str:
 
 def _cache_result(cache_key: str, result: str) -> str:
     """Store one result with a small process-local size bound."""
+    # A temporary provider/rate-limit failure must not poison this query for
+    # the rest of a long search run.
+    if not result:
+        return ""
     with _SEARCH_CACHE_LOCK:
         if len(_SEARCH_CACHE) >= _MAX_CACHE_ENTRIES:
             oldest_key = next(iter(_SEARCH_CACHE))

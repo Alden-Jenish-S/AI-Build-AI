@@ -28,6 +28,8 @@ _response_cache: "OrderedDict[str, str]" = OrderedDict()
 _MAX_RESPONSE_CACHE_ENTRIES = 128
 _client_cache_lock = threading.Lock()
 _client_cache: dict[tuple[object, ...], object] = {}
+_json_schema_capability_lock = threading.Lock()
+_json_schema_unavailable = False
 
 
 _PROVIDER_DEFAULTS = {
@@ -79,7 +81,7 @@ def get_token_usage() -> Dict[str, Any]:
 
 
 def reset_token_usage():
-    global token_usage
+    global token_usage, _json_schema_unavailable
     with _token_usage_lock:
         token_usage = {
             "input_tokens": 0,
@@ -91,6 +93,8 @@ def reset_token_usage():
         _response_cache.clear()
     with _client_cache_lock:
         _client_cache.clear()
+    with _json_schema_capability_lock:
+        _json_schema_unavailable = False
 
 
 def _cache_flag(value: object, *, default: bool = False) -> bool:
@@ -106,6 +110,7 @@ def _request_cache_key(
     system_prompt: str,
     user_prompt: str,
     temperature: float,
+    response_format: Mapping[str, object] | None = None,
 ) -> str:
     payload = {
         "provider": provider,
@@ -113,6 +118,7 @@ def _request_cache_key(
         "system_prompt": system_prompt,
         "user_prompt": user_prompt,
         "temperature": float(temperature),
+        "response_format": response_format,
     }
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
@@ -358,6 +364,7 @@ def call_llm(
     user_prompt: str,
     model: Optional[str] = None,
     temperature: float = 0.2,
+    response_format: Mapping[str, object] | None = None,
 ) -> str:
     """
     Query any OpenAI-compatible LLM API with bounded retry handling.
@@ -375,6 +382,7 @@ def call_llm(
         system_prompt=system_prompt,
         user_prompt=user_prompt,
         temperature=temperature,
+        response_format=response_format,
     )
     use_response_cache = bool(
         config["cache_deterministic_responses"]
@@ -414,6 +422,8 @@ def call_llm(
             }
             if config["send_temperature"]:
                 request["temperature"] = temperature
+            if response_format is not None:
+                request["response_format"] = dict(response_format)
             if config["send_prompt_cache_key"]:
                 request["extra_body"] = {
                     "prompt_cache_key": hashlib.sha256(
@@ -504,5 +514,201 @@ def call_llm(
                 time.sleep(retry_delay)
                 continue
 
-            logger.error("Failed to query LLM API: %s", error)
+            if response_format is not None and _response_format_is_unavailable(error):
+                logger.info("Provider does not support this response format: %s", error)
+            else:
+                logger.error("Failed to query LLM API: %s", error)
             raise
+
+
+def _extract_json_payload(content: str) -> object:
+    text = str(content or "").strip()
+    if text.startswith("```"):
+        first_newline = text.find("\n")
+        if first_newline >= 0:
+            text = text[first_newline + 1 :]
+        if text.endswith("```"):
+            text = text[:-3]
+        text = text.strip()
+    decoder = json.JSONDecoder()
+    try:
+        value, _ = decoder.raw_decode(text)
+        return value
+    except json.JSONDecodeError:
+        pass
+    for index, character in enumerate(text):
+        if character not in "[{":
+            continue
+        try:
+            value, _ = decoder.raw_decode(text[index:])
+            return value
+        except json.JSONDecodeError:
+            continue
+    raise ValueError("LLM response did not contain a valid JSON value")
+
+
+def _response_format_is_unavailable(error: Exception) -> bool:
+    text = str(error).casefold()
+    return "response_format" in text and any(
+        marker in text
+        for marker in (
+            "unavailable",
+            "unsupported",
+            "not available",
+            "not supported",
+            "unknown field",
+        )
+    )
+
+
+def _should_try_json_schema() -> bool:
+    configured = os.getenv("LLM_USE_JSON_SCHEMA", "auto").strip().casefold()
+    if configured in {"0", "false", "no", "off"}:
+        return False
+    with _json_schema_capability_lock:
+        return not _json_schema_unavailable
+
+
+def _remember_json_schema_unavailable() -> None:
+    global _json_schema_unavailable
+    with _json_schema_capability_lock:
+        _json_schema_unavailable = True
+
+
+def _validate_json_schema(value: object, schema: Mapping[str, object], path: str = "$") -> None:
+    expected = schema.get("type")
+    if expected == "object":
+        if not isinstance(value, dict):
+            raise ValueError(f"{path} must be an object")
+        required = schema.get("required", [])
+        if isinstance(required, (list, tuple)):
+            for key in required:
+                if key not in value:
+                    raise ValueError(f"{path} is missing required field {key!r}")
+        properties = schema.get("properties", {})
+        if isinstance(properties, Mapping):
+            if schema.get("additionalProperties") is False:
+                unexpected = sorted(set(value) - set(properties))
+                if unexpected:
+                    raise ValueError(
+                        f"{path} contains unexpected field(s): {', '.join(unexpected)}"
+                    )
+            for key, child_schema in properties.items():
+                if key in value and isinstance(child_schema, Mapping):
+                    _validate_json_schema(value[key], child_schema, f"{path}.{key}")
+    elif expected == "array":
+        if not isinstance(value, list):
+            raise ValueError(f"{path} must be an array")
+        minimum = int(str(schema.get("minItems", 0) or 0))
+        maximum = schema.get("maxItems")
+        if len(value) < minimum or (
+            maximum is not None and len(value) > int(str(maximum))
+        ):
+            raise ValueError(f"{path} has the wrong item count")
+        child_schema = schema.get("items")
+        if isinstance(child_schema, Mapping):
+            for index, item in enumerate(value):
+                _validate_json_schema(item, child_schema, f"{path}[{index}]")
+    elif expected == "string" and not isinstance(value, str):
+        raise ValueError(f"{path} must be a string")
+    elif expected == "boolean" and not isinstance(value, bool):
+        raise ValueError(f"{path} must be a boolean")
+    elif expected == "integer":
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError(f"{path} must be an integer")
+        if "minimum" in schema and value < int(str(schema["minimum"])):
+            raise ValueError(f"{path} is below its minimum")
+        if "maximum" in schema and value > int(str(schema["maximum"])):
+            raise ValueError(f"{path} is above its maximum")
+    elif expected == "number":
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise ValueError(f"{path} must be numeric")
+        if not math.isfinite(float(value)):
+            raise ValueError(f"{path} must be finite")
+    enum = schema.get("enum")
+    if isinstance(enum, (list, tuple, set)) and value not in enum:
+        raise ValueError(f"{path} contains a value outside its enum")
+
+
+def call_llm_json(
+    system_prompt: str,
+    user_prompt: str,
+    *,
+    schema: Mapping[str, object],
+    schema_name: str,
+    model: Optional[str] = None,
+    temperature: float = 0.0,
+) -> object:
+    """Return schema-checked JSON, repairing providers without response formats."""
+    normalized_name = re.sub(r"[^A-Za-z0-9_-]+", "_", schema_name)[:64] or "response"
+    structured_format = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": normalized_name,
+            "strict": True,
+            "schema": dict(schema),
+        },
+    }
+    response: str | None = None
+    if _should_try_json_schema():
+        try:
+            response = call_llm(
+                system_prompt,
+                user_prompt,
+                model=model,
+                temperature=temperature,
+                response_format=structured_format,
+            )
+        except Exception as structured_error:
+            if _response_format_is_unavailable(structured_error):
+                _remember_json_schema_unavailable()
+            logger.warning(
+                "Provider rejected structured output for %s; using JSON-only fallback: %s",
+                normalized_name,
+                structured_error,
+            )
+
+    schema_text = json.dumps(schema, indent=2, ensure_ascii=False, default=str)
+    if response is None:
+        fallback_prompt = f"""
+{user_prompt}
+
+OUTPUT CONTRACT:
+Return exactly one JSON value and no prose or Markdown. It must validate against
+this JSON Schema:
+{schema_text}
+""".strip()
+        response = call_llm(
+            system_prompt + " Return only the requested JSON value.",
+            fallback_prompt,
+            model=model,
+            temperature=temperature,
+        )
+
+    try:
+        payload = _extract_json_payload(response)
+        _validate_json_schema(payload, schema)
+        return payload
+    except (TypeError, ValueError, json.JSONDecodeError) as validation_error:
+        repair_prompt = f"""
+Repair the JSON response below. Return exactly one corrected JSON value with no
+prose or Markdown.
+
+Validation error:
+{validation_error}
+
+Required JSON Schema:
+{schema_text}
+
+Invalid response:
+{response[:24000]}
+""".strip()
+        repaired = call_llm(
+            "You repair structured JSON without changing its intended factual content.",
+            repair_prompt,
+            model=model,
+            temperature=0.0,
+        )
+        payload = _extract_json_payload(repaired)
+        _validate_json_schema(payload, schema)
+        return payload

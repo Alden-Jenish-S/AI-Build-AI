@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import shutil
 import sys
@@ -16,6 +17,8 @@ from tree.node import NodeState
 from tree.scheduler import UCB1Scheduler
 
 from .aggregator_agent import AggregatorAgent
+from .architecture_policy import classify_architecture, coverage_from_tracks
+from .council import CouncilBrief, CouncilCoordinator
 from .implementation_agent import ImplementationAgent
 from .submission_validator import SubmissionValidator
 from .task_analyzer import TaskAnalysis, TaskAnalyzer
@@ -59,6 +62,15 @@ class ManagerAgent:
         self.metric_name = self.task_analysis.metric
         self.metric_direction = self.task_analysis.direction
         self.technique_agent = TechniqueAgent(model_name=model_name)
+        self.council_brief: CouncilBrief | None = None
+        self.council_coordinator = CouncilCoordinator(
+            python=self.python,
+            model_name=model_name,
+            enable_web=self._env_enabled("AIBUILDAI_COUNCIL_WEB", default=True),
+            enable_generated_diagnostics=self._env_enabled(
+                "AIBUILDAI_COUNCIL_DIAGNOSTICS", default=True
+            ),
+        )
         self.submission_validator = SubmissionValidator()
         self.implementation_agent = ImplementationAgent(
             self.python,
@@ -96,6 +108,22 @@ class ManagerAgent:
         # searches; additional budget is more valuable on measured refinement.
         self.initial_fanout = min(2, max(1, self.total_budget // 3))
         self.max_tune_depth = 3
+        self.architecture_exploration_enabled = self._env_enabled(
+            "AIBUILDAI_ARCHITECTURE_EXPLORATION", default=True
+        )
+        self.architecture_min_budget = max(
+            2, self._env_int("AIBUILDAI_ARCHITECTURE_MIN_BUDGET", 3)
+        )
+        self.plateau_patience = max(
+            1, self._env_int("AIBUILDAI_PLATEAU_PATIENCE", 1)
+        )
+        self.plateau_relative_gain = max(
+            0.0,
+            min(
+                0.05,
+                self._env_float("AIBUILDAI_PLATEAU_RELATIVE_GAIN", 5e-4),
+            ),
+        )
         # Tuning is free with respect to the idea budget, but independent caps
         # guarantee termination under persistent external/generated failures.
         self.tuning_attempt_limit = max(3, self.total_budget * self.max_tune_depth)
@@ -105,6 +133,27 @@ class ManagerAgent:
             f"metric={self.metric_name} ({self.metric_direction}); budget={self.total_budget}."
         )
         self._persist_tree_state()
+
+    @staticmethod
+    def _env_enabled(name: str, *, default: bool) -> bool:
+        value = os.getenv(name)
+        if value is None:
+            return default
+        return value.strip().casefold() not in {"0", "false", "no", "off"}
+
+    @staticmethod
+    def _env_int(name: str, default: int) -> int:
+        try:
+            return int(os.getenv(name, str(default)))
+        except ValueError:
+            return int(default)
+
+    @staticmethod
+    def _env_float(name: str, default: float) -> float:
+        try:
+            return float(os.getenv(name, str(default)))
+        except ValueError:
+            return float(default)
 
     @staticmethod
     def _log(message: str) -> None:
@@ -202,6 +251,9 @@ class ManagerAgent:
                     "priority", "base_node_id", "companion_node_id",
                     "tune_depth", "refine_depth", "diversify_depth",
                     "materialized", "pruned_reason", "replacement",
+                    "hypothesis_id", "council_brief_hash",
+                    "evaluation_protocol_hash", "architecture_track",
+                    "architecture_trigger",
                 }
             } or None,
             "visits": node.visits,
@@ -242,9 +294,29 @@ class ManagerAgent:
             "completed_implementations": self.completed_implementations,
             "tuning_attempts": self.tuning_attempts,
             "tuning_attempt_limit": self.tuning_attempt_limit,
+            "architecture_policy": {
+                "enabled": self.architecture_exploration_enabled,
+                "minimum_idea_budget": self.architecture_min_budget,
+                "plateau_patience": self.plateau_patience,
+                "relative_gain_threshold": self.plateau_relative_gain,
+                "coverage": self._architecture_coverage(),
+                "plateau": self._plateau_state(),
+            },
             "best_node_id": self.best_node_id,
             "best_node": self.node_label(self.best_node_id),
             "final_output": str(self.final_output_path) if self.final_output_path else None,
+            "council": (
+                {
+                    "status": self.council_brief.status,
+                    "brief_hash": self.council_brief.brief_hash,
+                    "evaluation_protocol_hash": (
+                        self.council_brief.evaluation_protocol.protocol_hash
+                    ),
+                    "artifact": str(self.run_root / "council" / "council_brief.json"),
+                }
+                if self.council_brief is not None
+                else None
+            ),
             "nodes": {
                 node_id: self._node_payload(node)
                 for node_id, node in self.all_nodes.items()
@@ -258,6 +330,53 @@ class ManagerAgent:
     def _new_node_id(self, operator: str) -> str:
         self._node_counter += 1
         return f"node{self._node_counter}"
+
+    @staticmethod
+    def _hypothesis_id(plan: str) -> str | None:
+        match = re.search(r"(?im)^\s*Hypothesis ID:\s*([A-Za-z0-9_.-]+)", plan)
+        return match.group(1) if match else None
+
+    def _council_node_config(self, plan: str) -> dict[str, str]:
+        if self.council_brief is None:
+            return {}
+        values = {
+            "council_brief_hash": self.council_brief.brief_hash,
+            "evaluation_protocol_hash": (
+                self.council_brief.evaluation_protocol.protocol_hash
+            ),
+        }
+        hypothesis_id = self._hypothesis_id(plan)
+        if hypothesis_id:
+            values["hypothesis_id"] = hypothesis_id
+        return values
+
+    def _prepare_research_council(self) -> None:
+        if self.council_brief is not None:
+            return
+        if not self._env_enabled("AIBUILDAI_COUNCIL", default=True):
+            self._log("ML research council disabled by AIBUILDAI_COUNCIL.")
+            return
+        self._log("Starting the pre-search ML research council.")
+        try:
+            brief = self.council_coordinator.run(self.task_analysis, self.run_root)
+        except Exception as exc:
+            self._log(
+                "Council preflight could not complete; preserving legacy planning fallback: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return
+        self.council_brief = brief
+        self.technique_agent.set_council_brief(brief)
+        self.initial_fanout = min(
+            self.total_budget,
+            max(1, int(brief.recommended_root_count)),
+        )
+        self._log(
+            f"Council {brief.status}: {len(brief.selected_portfolio)} selected hypotheses; "
+            f"initial roots={self.initial_fanout}; protocol="
+            f"{brief.evaluation_protocol.protocol_hash[:12]}."
+        )
+        self._persist_tree_state()
 
     def _better(self, left: float, right: float) -> bool:
         return left < right if self.metric_direction == "minimize" else left > right
@@ -312,8 +431,11 @@ class ManagerAgent:
         nodes = []
         for node in self.all_nodes.values():
             result = node.result or {}
+            score_value = result.get("score")
+            if score_value is None:
+                continue
             try:
-                score = float(result.get("score"))
+                score = float(score_value)
             except (TypeError, ValueError):
                 continue
             if (
@@ -328,6 +450,131 @@ class ManagerAgent:
             key=lambda node: float(node.result["score"]),
             reverse=self.metric_direction != "minimize",
         )
+
+    def _architecture_coverage(self) -> dict[str, Any]:
+        """Summarize architectures actually measured by completed implementations."""
+        measured: list[tuple[NodeState, str]] = []
+        dedicated_attempted = False
+        for node in self.all_nodes.values():
+            if node.node_type != "implementation" or not node.executed:
+                continue
+            dedicated_attempted = dedicated_attempted or node.operator == "architect"
+            result = node.result or {}
+            if result.get("status") != "completed" or result.get("score") is None:
+                continue
+            code_track = classify_architecture(node.code or "")
+            track = (
+                code_track
+                if code_track != "other"
+                else classify_architecture(node.plan or "")
+            )
+            measured.append((node, track))
+        coverage = coverage_from_tracks(track for _, track in measured)
+        coverage["dedicated_architect_attempted"] = dedicated_attempted
+        coverage["measured_nodes"] = [
+            {
+                "node_id": node.node_id,
+                "operator": node.operator,
+                "track": track,
+                "score": (node.result or {}).get("score"),
+            }
+            for (node, _), track in zip(measured, coverage["tracks"])
+        ]
+        return coverage
+
+    def _plateau_state(self) -> dict[str, Any]:
+        """Detect saturation using material score gains, not exact float equality."""
+        measured: list[tuple[str, float]] = []
+        for node in self.all_nodes.values():
+            result = node.result or {}
+            score_value = result.get("score")
+            if score_value is None:
+                continue
+            try:
+                score = float(score_value)
+            except (TypeError, ValueError):
+                continue
+            if (
+                node.node_type == "implementation"
+                and result.get("status") == "completed"
+                and math.isfinite(score)
+            ):
+                measured.append((node.node_id, score))
+        if not measured:
+            return {
+                "plateaued": False,
+                "completed_measurements": 0,
+                "stagnant_measurements": 0,
+                "reason": "no completed measurements",
+            }
+        best = measured[0][1]
+        last_material_index = 0
+        material_improvements: list[dict[str, Any]] = []
+        for index, (node_id, candidate) in enumerate(measured[1:], start=1):
+            gain = best - candidate if self.metric_direction == "minimize" else candidate - best
+            threshold = max(1e-9, abs(best) * self.plateau_relative_gain)
+            if gain > threshold:
+                material_improvements.append(
+                    {
+                        "node_id": node_id,
+                        "gain": gain,
+                        "threshold": threshold,
+                    }
+                )
+                best = candidate
+                last_material_index = index
+        stagnant = len(measured) - 1 - last_material_index
+        plateaued = len(measured) >= 2 and stagnant >= self.plateau_patience
+        return {
+            "plateaued": plateaued,
+            "completed_measurements": len(measured),
+            "stagnant_measurements": stagnant,
+            "patience": self.plateau_patience,
+            "relative_gain_threshold": self.plateau_relative_gain,
+            "best_material_score": best,
+            "last_material_improvement_node": measured[last_material_index][0],
+            "material_improvements": material_improvements[-6:],
+            "reason": (
+                "no material score gain within the configured patience"
+                if plateaued
+                else "material progress remains or more measurements are needed"
+            ),
+        }
+
+    def _architecture_intervention_reason(
+        self, experiments_remaining: int
+    ) -> str | None:
+        """Reserve one bounded custom-network experiment when coverage is missing."""
+        if (
+            not self.architecture_exploration_enabled
+            or self.total_budget < self.architecture_min_budget
+            or experiments_remaining <= 0
+            or self.best_node_id is None
+        ):
+            return None
+        coverage = self._architecture_coverage()
+        if coverage.get("custom_neural_attempted") or coverage.get(
+            "dedicated_architect_attempted"
+        ):
+            return None
+        plateau = self._plateau_state()
+        reserve_due = experiments_remaining <= min(2, max(1, self.total_budget // 3))
+        if plateau.get("plateaued"):
+            if coverage.get("neural_attempted"):
+                return (
+                    "score progress plateaued after an established neural model, but no "
+                    "task-invented neural computation graph has been measured"
+                )
+            return (
+                "score progress plateaued while measured coverage remained limited to "
+                "conventional or non-neural model families"
+            )
+        if reserve_due and not coverage.get("neural_attempted"):
+            return (
+                "the remaining idea budget reached its architecture-reserve boundary "
+                "without any measured neural representation"
+            )
+        return None
 
     def _branch_root_id(self, node: NodeState) -> str:
         current = node
@@ -364,6 +611,8 @@ class ManagerAgent:
             "tune_depth": int((base.config or {}).get("tune_depth", 0)) if base else 0,
             "refine_depth": int((base.config or {}).get("refine_depth", 0)) if base else 0,
             "diversify_depth": int((base.config or {}).get("diversify_depth", 0)) if base else 0,
+            "architecture_track": classify_architecture(plan),
+            **self._council_node_config(plan),
         }
         node = NodeState(
             node_id=node_id,
@@ -406,7 +655,11 @@ class ManagerAgent:
             "tune_depth": int(base_config.get("tune_depth", 0)) + (operator == "tune"),
             "refine_depth": int(base_config.get("refine_depth", 0)) + (operator == "refine"),
             "diversify_depth": int(base_config.get("diversify_depth", 0)) + (operator == "diversify"),
+            "architecture_track": classify_architecture(plan),
+            **self._council_node_config(plan),
         }
+        if base_config.get("hypothesis_id") and not config.get("hypothesis_id"):
+            config["hypothesis_id"] = base_config["hypothesis_id"]
         node = NodeState(
             node_id=node_id,
             parent_id=parent.node_id if parent else None,
@@ -443,6 +696,7 @@ class ManagerAgent:
                 operator=operator,
                 node_label=display_name,
                 max_debug_attempts=5,
+                council_brief=self.council_brief,
             )
         except Exception as exc:
             result = {
@@ -621,6 +875,8 @@ class ManagerAgent:
         tune_depth = int((node.config or {}).get("tune_depth", 0))
         if not high:
             actions = [("tune", 0.75)] if tune_depth < self.max_tune_depth else []
+        elif node.operator == "architect":
+            actions = [("tune", 0.62), ("refine", 0.3), ("diversify", 0.1)]
         elif node.operator == "refine":
             actions = [("tune", 0.52), ("refine", 0.28), ("diversify", 0.14)]
         elif node.operator == "tune":
@@ -724,6 +980,25 @@ class ManagerAgent:
                     score,
                     str(base.result.get("diagnostics", "")),
                 )
+            elif planning.operator == "architect":
+                measured_context = "\n".join(
+                    f"- {self.node_label(node.node_id)}: operator={node.operator}; "
+                    f"architecture_track={(node.config or {}).get('architecture_track')}; "
+                    f"score={(node.result or {}).get('score')}; "
+                    f"plan_summary={self._clean_plan_text(node.plan)[:350]}"
+                    for node in self.all_nodes.values()
+                    if node.node_type == "implementation"
+                    and node.result
+                    and node.result.get("status") == "completed"
+                )
+                plan = self.technique_agent.propose_architecture_exploration(
+                    self.task_analysis,
+                    base.plan or "",
+                    score,
+                    measured_alternatives=measured_context,
+                    plateau_evidence=json.dumps(self._plateau_state(), default=str),
+                    require_custom=True,
+                )
             else:
                 measured_context = "\n".join(
                     f"- {self.node_label(node.node_id)}: operator={node.operator}; "
@@ -757,6 +1032,7 @@ class ManagerAgent:
         planning.plan = plan
         planning.executed = True
         planning.config["materialized"] = True
+        planning.config["architecture_track"] = classify_architecture(plan)
         planning.result = {"status": "completed", "planning_only": True}
         self._log(
             f"Materialized {self.node_label(planning.node_id)} ({planning.operator}) "
@@ -792,6 +1068,25 @@ class ManagerAgent:
                 priority=0.75,
                 base=node,
             )
+        return self._execute_planning_action(planning)
+
+    def _architect(self, node: NodeState, *, trigger: str) -> NodeState | None:
+        """Measure one custom neural counterfactual against the selected control."""
+        if not self._can_attempt("architect") or not node.result:
+            return None
+        planning = self._pending_action(node, "architect")
+        if planning is None:
+            planning = self._create_planning_node(
+                "Design a bounded task-invented neural architecture from observed evidence; "
+                "materialize only when selected by the architecture coverage policy.",
+                operator="architect",
+                parent=node,
+                executed=False,
+                priority=1.25,
+                base=node,
+            )
+        planning.config["architecture_trigger"] = trigger[:1000]
+        planning.config["architecture_track"] = "custom_neural"
         return self._execute_planning_action(planning)
 
     def _merge_two_nodes(self, first: NodeState, second: NodeState, custom_plan: str = "") -> NodeState | None:
@@ -921,12 +1216,23 @@ class ManagerAgent:
         return recovered
 
     def run_tree_search(self) -> str | None:
-        """Run reference-style planning/implementation search without verifier layers."""
+        """Run council-directed planning and measured implementation search."""
         self._log("=" * 62)
         self._log(f"Starting adaptive method tree search for {self.task_name}.")
         self._log("=" * 62)
 
-        candidate_count = min(3, max(2, self.initial_fanout + 1))
+        self._prepare_research_council()
+
+        if self.council_brief is not None:
+            candidate_count = min(
+                self.total_budget,
+                max(
+                    self.initial_fanout,
+                    len(self.council_brief.selected_portfolio),
+                ),
+            )
+        else:
+            candidate_count = min(3, max(2, self.initial_fanout + 1))
         try:
             plans = self.technique_agent.generate_initial_approaches(
                 self.task_analysis, candidate_count
@@ -1007,6 +1313,12 @@ class ManagerAgent:
                         "node_type": node.node_type,
                         "status": res.get("status", "completed"),
                         "score": res.get("score"),
+                        "architecture_track": (node.config or {}).get(
+                            "architecture_track"
+                        ),
+                        "modality_ablation_scores": res.get(
+                            "modality_ablation_scores"
+                        ),
                         "plan_summary": self._clean_plan_text(node.plan)[:400],
                     }
                 )
@@ -1020,6 +1332,22 @@ class ManagerAgent:
             )
 
             experiments_remaining = max(0, self.total_budget - self.experiments_executed)
+            plateau_state = self._plateau_state()
+            architecture_coverage = self._architecture_coverage()
+
+            architecture_trigger = self._architecture_intervention_reason(
+                experiments_remaining
+            )
+            if architecture_trigger and self.best_node_id is not None:
+                self._log(
+                    "Architecture coverage intervention before merge/finalize: "
+                    f"{architecture_trigger}."
+                )
+                architecture_node = self._architect(
+                    self.all_nodes[self.best_node_id], trigger=architecture_trigger
+                )
+                if architecture_node is not None:
+                    continue
 
             # Analyze state with LLM Manager Agent and decide next action
             decision = self.technique_agent.decide_next_step(
@@ -1028,6 +1356,8 @@ class ManagerAgent:
                 best_node_id=self.best_node_id,
                 best_score=best_score,
                 experiments_remaining=experiments_remaining,
+                plateau_state=plateau_state,
+                architecture_coverage=architecture_coverage,
             )
 
             action = decision.get("action", "diversify")
@@ -1060,6 +1390,18 @@ class ManagerAgent:
                     merged = self._merge_two_nodes(target_nodes[0], target_nodes[1], custom_plan=custom_plan)
                     if merged is not None:
                         continue
+
+            if (
+                action == "architect"
+                and self.best_node_id is not None
+                and self._can_attempt("architect")
+            ):
+                architected = self._architect(
+                    self.all_nodes[self.best_node_id],
+                    trigger=str(reasoning or "LLM identified a missing architecture experiment"),
+                )
+                if architected is not None:
+                    continue
 
             if action in {"tune", "refine"} and target_ids:
                 target_id = target_ids[0]

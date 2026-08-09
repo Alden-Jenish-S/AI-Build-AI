@@ -48,6 +48,17 @@ def _write_token_usage_report(manager: ManagerAgent, usage: dict[str, Any]) -> P
             "free_tuning_attempts": manager.tuning_attempts,
             "implementation_attempts": manager.implementation_attempts,
         },
+        "council": (
+            {
+                "status": manager.council_brief.status,
+                "brief_hash": manager.council_brief.brief_hash,
+                "evaluation_protocol_hash": (
+                    manager.council_brief.evaluation_protocol.protocol_hash
+                ),
+            }
+            if manager.council_brief is not None
+            else None
+        ),
         "calls": list(usage.get("calls", [])),
     }
     temporary = path.with_suffix(".json.tmp")
@@ -88,6 +99,15 @@ def _write_results(
             diagnostic = " ".join(str(result["diagnostics"])[-1200:].split())
             node_lines.append(f"  - last error: {diagnostic}")
     path = manager.run_root / "results.md"
+    council_lines = ["Council: not run"]
+    if manager.council_brief is not None:
+        council_lines = [
+            f"Council: {manager.council_brief.status}",
+            f"Council brief: {manager.run_root / 'council' / 'council_brief.json'}",
+            f"Council brief hash: {manager.council_brief.brief_hash}",
+            "Evaluation protocol hash: "
+            f"{manager.council_brief.evaluation_protocol.protocol_hash}",
+        ]
     path.write_text(
         "\n".join(
             [
@@ -96,6 +116,7 @@ def _write_results(
                 f"Task: {manager.task_name}",
                 f"Goal: {manager.task_analysis.goal}",
                 f"Metric: {manager.metric_name} ({manager.metric_direction})",
+                *council_lines,
                 f"Status: {'completed' if manager.final_output_path else 'failed'}",
                 f"Failure: {failure or 'none'}",
                 f"Best node: {manager.node_label(manager.best_node_id)}",
@@ -174,6 +195,18 @@ def run_method_tree(task_name: str, budget: int) -> dict[str, Any]:
         "method_tree": str(tree_artifacts.get("method_tree", manager.run_root / "method_tree.png")),
         "results_file": str(results_file),
         "final_output": str(manager.final_output_path),
+        "council": (
+            {
+                "status": manager.council_brief.status,
+                "brief": str(manager.run_root / "council" / "council_brief.json"),
+                "brief_hash": manager.council_brief.brief_hash,
+                "evaluation_protocol_hash": (
+                    manager.council_brief.evaluation_protocol.protocol_hash
+                ),
+            }
+            if manager.council_brief is not None
+            else None
+        ),
     }
 
 

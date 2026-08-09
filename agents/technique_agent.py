@@ -4,14 +4,67 @@ from __future__ import annotations
 
 import re
 import json
-from typing import Any
+from typing import Any, TYPE_CHECKING
+
+from .architecture_policy import classify_architecture
 from .llm_utils import call_llm
+from .modality_policy import predictive_modality_inventory
 from .task_analyzer import TaskAnalysis
+
+if TYPE_CHECKING:
+    from .council.contracts import CouncilBrief
 
 
 class TechniqueAgent:
-    def __init__(self, model_name: str | None = None) -> None:
+    def __init__(
+        self,
+        model_name: str | None = None,
+        council_brief: "CouncilBrief | None" = None,
+    ) -> None:
         self.model_name = model_name
+        self.council_brief = council_brief
+
+    def set_council_brief(self, brief: "CouncilBrief | None") -> None:
+        self.council_brief = brief
+
+    def _council_context(self, max_chars: int = 12000) -> str:
+        if self.council_brief is None:
+            return ""
+        return (
+            "\n\n# ML Research Council brief (authoritative pre-search evidence)\n"
+            + self.council_brief.prompt_context(max_chars)
+        )
+
+    def _portfolio_plans(self, count: int) -> list[str]:
+        if self.council_brief is None:
+            return []
+        plans: list[str] = []
+        for hypothesis in self.council_brief.selected_portfolio[:count]:
+            plan = "\n".join(
+                (
+                    f"Hypothesis ID: {hypothesis.get('hypothesis_id', 'unknown')}",
+                    f"Research direction: {hypothesis.get('title', 'Untitled hypothesis')}",
+                    f"Model family or representation: {hypothesis.get('model_family', 'task-selected')}",
+                    "Architecture track: "
+                    f"{hypothesis.get('architecture_track') or classify_architecture(json.dumps(hypothesis, default=str))}",
+                    f"Architecture specification: {hypothesis.get('architecture_spec', '')}",
+                    f"Novelty/value test: {hypothesis.get('novelty_test', '')}",
+                    f"Modality scope: {hypothesis.get('modality_scope', 'not_applicable')}",
+                    f"Modality ablation: {hypothesis.get('modality_ablation', '')}",
+                    f"Evidence-backed rationale: {hypothesis.get('rationale', '')}",
+                    f"First experiment: {hypothesis.get('experiment', '')}",
+                    f"Expected signal: {hypothesis.get('expected_signal', '')}",
+                    f"Estimated cost: {hypothesis.get('estimated_cost', '')}",
+                    "Risks: " + "; ".join(str(item) for item in hypothesis.get("risks", [])),
+                    f"Stopping rule: {hypothesis.get('stopping_rule', '')}",
+                    f"Council brief hash: {self.council_brief.brief_hash}",
+                    f"Evaluation protocol hash: {self.council_brief.evaluation_protocol.protocol_hash}",
+                    "Implement this discriminating experiment using only council-approved inputs. "
+                    "Preserve the fixed evaluation protocol and report fold-level evidence.",
+                )
+            )
+            plans.append(plan[:8000])
+        return plans
 
     @staticmethod
     def _parse_plans(response: str, count: int) -> list[str]:
@@ -28,6 +81,12 @@ class TechniqueAgent:
 
     def search_for_new_ideas(self, analysis: TaskAnalysis, query_extra: str = "") -> str:
         """Query web search for competitive ML strategies and novel literature ideas tailored to this task."""
+        if self.council_brief is not None:
+            return "\n\n".join(
+                f"Title: {item.get('title', '')}\nURL: {item.get('url', '')}\n"
+                f"Council claim: {item.get('claim') or item.get('snippet', '')}"
+                for item in self.council_brief.sources[:12]
+            )
         try:
             from .web_search import search_web
             prompt = (
@@ -66,6 +125,13 @@ class TechniqueAgent:
     ) -> list[str]:
         """Ask once for several materially different implementation plans with distinct model families."""
         count = max(1, int(count))
+        council_plans = self._portfolio_plans(count)
+        if council_plans:
+            print(
+                f"TechniqueAgent: Using {len(council_plans)} evidence-ranked council hypotheses.",
+                flush=True,
+            )
+            return council_plans
         print(f"TechniqueAgent: Requesting {count} initial implementation plans (distinct model families).", flush=True)
         
         web_insights = self.search_for_new_ideas(analysis)
@@ -80,11 +146,14 @@ class TechniqueAgent:
             f"   a. Task & Resource Inspection: Analyze the task goal, score metric ({analysis.metric} {analysis.direction}), expected output deliverable, and observed files. Do NOT assume hardcoded file names, columns, or schemas—inspect actual resources dynamically from `input/`.\n"
             "   b. Data Modality & Architecture Suitability: Inspect the observed data modalities (tabular, vision, text, audio, etc.). Consider BOTH simple foundational algorithms (e.g., Logistic Regression, SVM, Naive Bayes) and complex SOTA architectures (e.g., custom PyTorch, GBDT). Simple baselines can often outperform complex models.\n"
             "   c. Novel & Task-Tailored Techniques: Where appropriate, think through domain-specific data augmentations, metric-aligned loss functions, and specialized feature representations.\n"
-            "   d. Model Size & Complexity vs Customization: Note that smaller/lighter custom architectures with tailored modules, custom augmentations, or domain features often outperform heavy generic off-the-shelf pre-trained models. Reason through the right tradeoff for this dataset.\n"
-            f"   e. Architecture Progression: PLAN 1 MUST be a fast, simple foundational baseline model that are applicable to the given task to establish a strong baseline score. Subsequent plans (PLAN 2, etc.) should progressively move to more complex or SOTA architectures (e.g., tree-based ensembles, neural networks) if applicable.\n\n"
+            "   d. Neural Counterfactual: Explicitly assess whether learned representations could capture signal that tree or linear libraries cannot. Distinguish an established neural baseline from a task-invented computation graph built from primitive trainable operations. If rejecting both, cite concrete data-size, structure, compute, or validation evidence.\n"
+            "   e. Modality Necessity: If more than one predictive modality is present, do not assume fusion helps. Plan identical-fold comparisons for full fusion, credible single-modality controls, and leave-one-modality-out variants; allow a single modality to win.\n"
+            "   f. Model Size & Complexity vs Customization: Note that smaller/lighter custom architectures with tailored modules, custom augmentations, or domain features often outperform heavy generic off-the-shelf pre-trained models. Reason through the right tradeoff for this dataset.\n"
+            "   g. Portfolio Design: Select the approaches with the strongest expected value and information gain under the observed resource budget. Include a simple baseline only when it is a useful measured control; do not force an architecture progression.\n\n"
             "2. PROPOSAL REQUIREMENTS:\n"
             f"   Propose {count} executable approaches for this task. Each approach must explain how to load observed paths dynamically from input/, build an honest local validation score matching {analysis.metric} ({analysis.direction}), fit/train, tune, and write the requested deliverable.\n"
             "   STRICT REQUIREMENT: Use a materially DIFFERENT model family / algorithm in each plan. "
+            "When two or more plans are requested and neural training is resource-feasible, at least one plan must measure a compact neural or custom-neural counterfactual rather than returning only tree ensembles. A custom plan must describe the actual computation graph and ablation; naming TabNet, an MLP, or a transformer alone is not custom architecture design. "
             "DO NOT repeat the same model family across plans. Return sections labelled "
             "PLAN 1:, PLAN 2:, and so on, preceded by your <thinking> ... </thinking> block."
         )
@@ -108,9 +177,12 @@ class TechniqueAgent:
                 "or algorithm, honest local validation/proxy scoring, and emit the exact sample format."
             ),
             (
-                "Implement a second, materially different algorithm suitable for the observed data. "
-                "Tune a small high-impact parameter set with deterministic splits or a transparent "
-                "unsupervised proxy, refit on all useful data, and write the exact requested output."
+                "Run an architecture counterfactual suitable for the observed data. Build a compact "
+                "custom PyTorch nn.Module from primitive layers after inspecting modality, shapes, "
+                "sample count, feature types, and available hardware. Derive its trainable interactions "
+                "from those observations instead of instantiating a named tabular architecture. Compare "
+                "it honestly with the conventional control, use early stopping, and retain it only when "
+                "the fixed local protocol improves."
             ),
             (
                 "Use an efficient representation or feature pipeline tailored to the actual file "
@@ -127,6 +199,25 @@ class TechniqueAgent:
                 "across every approach; if the official score is hidden, use the same deterministic "
                 "stability/holdout proxy in every node."
             )
+        modality_inventory = predictive_modality_inventory(analysis.files)
+        if modality_inventory["is_multimodal"] and not any(
+            "modality scope: modality_ablation" in plan.casefold()
+            for plan in plans
+        ):
+            modalities = ", ".join(modality_inventory["modalities"])
+            audit_plan = (
+                "Modality scope: modality_ablation\n"
+                f"Predictive modalities: {modalities}. Determine rather than assume which inputs "
+                "are necessary. On identical validation indices, compare a resource-matched full "
+                "fusion model, credible models using each modality alone, and every leave-one-"
+                "modality-out variant. Cache reusable representations, report all ablation scores, "
+                "and select the smallest modality subset within validation uncertainty of the best "
+                "score. Generate the requested output using that measured winner."
+            )
+            if len(plans) >= count:
+                plans[-1] = audit_plan
+            else:
+                plans.append(audit_plan)
         return plans[:count]
 
     def propose_tuning(
@@ -140,6 +231,7 @@ class TechniqueAgent:
         print(f"TechniqueAgent: Requesting focused tuning for score {score}.", flush=True)
         prompt = (
             f"{analysis.prompt_context(10000)}\n\n"
+            f"{self._council_context(9000)}\n\n"
             f"Current plan:\n{plan[:5000]}\n\n"
             f"Current local score: {score} ({analysis.direction}).\n"
             f"Run notes:\n{diagnostics[-3000:]}\n\n"
@@ -167,6 +259,85 @@ class TechniqueAgent:
                 f"bounded hyperparameter search around its current values and retain the best "
                 f"local setting. Planning service note: {exc}"
             )[:6000]
+
+    def propose_architecture_exploration(
+        self,
+        analysis: TaskAnalysis,
+        parent_plan: str,
+        score: float,
+        *,
+        measured_alternatives: str = "",
+        plateau_evidence: str = "",
+        require_custom: bool = True,
+    ) -> str:
+        """Design one measured neural counterfactual from task evidence, not a template."""
+        mode = "custom, task-invented neural architecture" if require_custom else "neural architecture"
+        track = "custom_neural" if require_custom else "established_neural"
+        print(
+            f"TechniqueAgent: Designing a {mode} experiment after measured model-family saturation.",
+            flush=True,
+        )
+        prompt = (
+            f"{analysis.prompt_context(11000)}\n\n"
+            f"{self._council_context(10000)}\n\n"
+            f"Measured control plan:\n{parent_plan[:4500]}\n\n"
+            f"Control score: {score} ({analysis.direction}).\n"
+            f"Plateau evidence:\n{plateau_evidence[-3000:]}\n\n"
+            f"Previously measured alternatives:\n{measured_alternatives[-5000:]}\n\n"
+            "ARCHITECTURE-LAB INSTRUCTIONS:\n"
+            "1. Re-inspect the observed modality, sample count, feature geometry, missingness, "
+            "cardinality, dependency structure, metric, CPU/GPU inventory, and time budget.\n"
+            "2. Explain which residual error or interaction the conventional control cannot model "
+            "well and turn that into a falsifiable neural inductive bias.\n"
+            "3. Design the computation graph explicitly: input encoders, tensor shapes, learned "
+            "transformations, interaction/routing mechanism, residual paths, output head, loss, "
+            "regularization, optimizer, batching, early stopping, and inference.\n"
+            "4. Build the primary predictor as a self-contained PyTorch `nn.Module` from primitive "
+            "layers and tensor operations. Do not use TabNet, FT-Transformer, TabTransformer, an "
+            "off-the-shelf pretrained architecture, or a renamed plain MLP as the proposal. It may "
+            "use a plain MLP as an ablation/control only.\n"
+            "5. The architecture must be derived adaptively from the observed evidence; do not copy "
+            "a canned modality template. Keep parameter count and training bounded, work on CPU, and "
+            "optionally accelerate on an available GPU.\n"
+            "6. Use the exact shared split and metric. Compare the custom network against the measured "
+            "parent and at least one architecture ablation. Stop if the custom mechanism does not add "
+            "repeatable validation value.\n"
+            "7. You may combine known primitive operations in a new task-specific way, but do not claim "
+            "the design is globally unprecedented. State component-level prior-art searches and "
+            "ablations that would be needed to support a novelty claim.\n\n"
+            f"Return one concrete executable plan for a {mode}. Include an `Architecture specification:` "
+            "section and an `Ablation and stopping rule:` section."
+        )
+        try:
+            response = call_llm(
+                "You are the architecture-invention lead in a senior ML lab. You derive compact trainable computation graphs from measured task evidence and test them skeptically.",
+                prompt,
+                model=self.model_name,
+                temperature=0.3,
+            )
+            cleaned = re.sub(r"(?s)<thinking>.*?</thinking>", "", response).strip()
+            if len(cleaned.split()) < 20:
+                raise ValueError("architecture plan was empty or too short")
+            return (
+                f"Architecture exploration track: {track}\n"
+                + cleaned[:7000]
+            )
+        except Exception as exc:
+            return (
+                f"Architecture exploration track: {track}\n"
+                "Construct a resource-bounded, task-tailored PyTorch `nn.Module` after inspecting "
+                "the actual input modality, tensor geometry, sample count, feature types, and hardware. "
+                "Use primitive layers and tensor operations to encode the strongest observed inductive "
+                "bias, with explicit input projections, a learned interaction or gating module, residual "
+                "paths where justified, and a metric-appropriate output head. Do not instantiate TabNet, "
+                "FT-Transformer, TabTransformer, a pretrained architecture, or a renamed plain MLP as the "
+                "primary model. Keep a plain MLP and the measured parent as controls. Train with bounded "
+                "batches, regularization, deterministic seeds, early stopping, and CPU fallback under the "
+                "same validation protocol. Ablate the custom interaction module and retain the architecture "
+                "only if it produces a repeatable score improvement. Do not claim global novelty; record "
+                "which component-level literature searches would be needed. "
+                f"Planning service note: {exc}"
+            )[:7500]
 
     def propose_follow_up(
         self,
@@ -206,6 +377,7 @@ class TechniqueAgent:
         )
         prompt = (
             f"{analysis.prompt_context(10000)}\n\n"
+            f"{self._council_context(9000)}\n\n"
             f"Measured parent plan:\n{parent_plan[:5000]}\n\n"
             f"Parent local score: {score} ({analysis.direction}).\n"
             f"Bounded execution notes:\n{diagnostics[-3000:]}\n\n"
@@ -248,6 +420,7 @@ class TechniqueAgent:
         print("TechniqueAgent: Requesting a merge of two strong branches.", flush=True)
         prompt = (
             f"{analysis.prompt_context(9000)}\n\n"
+            f"{self._council_context(8000)}\n\n"
             f"Strong approach A:\n{first_plan[:3500]}\n\n"
             f"Strong approach B:\n{second_plan[:3500]}\n\n"
             "CRITICAL REASONING INSTRUCTIONS:\n\n"
@@ -281,6 +454,8 @@ class TechniqueAgent:
         best_node_id: str | None,
         best_score: float | None,
         experiments_remaining: int,
+        plateau_state: dict[str, Any] | None = None,
+        architecture_coverage: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """
         Analyze current tree search state and executed results, then use LLM to decide
@@ -298,18 +473,37 @@ class TechniqueAgent:
             ntype = n.get("node_type", "")
             status = n.get("status", "")
             score = n.get("score")
+            architecture_track = n.get("architecture_track", "other")
+            modality_evidence = n.get("modality_ablation_scores")
             plan_summary = n.get("plan_summary", "")
             is_best = " [BEST SCORE SO FAR]" if nid == best_node_id else ""
             score_str = f"{score:.5f}" if score is not None else "failed"
             history_lines.append(
-                f"- Node '{nid}' ({ntype}, operator='{op}', status='{status}'): score={score_str}{is_best}. Plan summary: {plan_summary}"
+                f"- Node '{nid}' ({ntype}, operator='{op}', architecture_track='{architecture_track}', status='{status}'): score={score_str}{is_best}. Modality evidence: {json.dumps(modality_evidence, default=str)[:900] if modality_evidence else 'none'}. Plan summary: {plan_summary}"
             )
 
         history_text = "\n".join(history_lines) if history_lines else "No executed nodes yet."
 
-        # Check if score progress has plateaued or if we need web search for fresh competitive ideas
-        recent_scores = [n.get("score") for n in nodes_history[-4:] if n.get("score") is not None]
-        plateaued = len(recent_scores) >= 2 and len(set(recent_scores)) <= 1
+        # The manager normally supplies a tolerance-based plateau analysis. Keep
+        # a conservative fallback for direct callers rather than comparing floats
+        # for exact equality.
+        recent_scores = [
+            float(n["score"])
+            for n in nodes_history[-4:]
+            if n.get("score") is not None
+        ]
+        if plateau_state is None:
+            spread = max(recent_scores) - min(recent_scores) if recent_scores else 0.0
+            scale = max((abs(value) for value in recent_scores), default=1.0)
+            plateaued = len(recent_scores) >= 2 and spread <= max(1e-6, scale * 5e-4)
+            plateau_state = {
+                "plateaued": plateaued,
+                "recent_score_spread": spread,
+                "reason": "local tolerance-based fallback",
+            }
+        else:
+            plateaued = bool(plateau_state.get("plateaued"))
+        architecture_coverage = dict(architecture_coverage or {})
 
         web_insights = ""
         if plateaued or experiments_remaining <= 2:
@@ -319,29 +513,36 @@ class TechniqueAgent:
 
         prompt = (
             f"{analysis.prompt_context(10000)}\n\n"
+            f"{self._council_context(8000)}\n\n"
             f"# Execution History\n"
             f"Metric: {analysis.metric} ({analysis.direction})\n"
             f"Best Score so far: {best_score if best_score is not None else 'N/A'} (Node: {best_node_id})\n"
             f"Remaining Main Ideas Budget: {experiments_remaining} (Tuning is FREE and does not consume main budget)\n\n"
+            f"Tolerance-based Plateau State: {json.dumps(plateau_state, default=str)}\n"
+            f"Measured Architecture Coverage: {json.dumps(architecture_coverage, default=str)}\n\n"
             f"Executed Nodes History:\n{history_text}\n"
             f"{web_section}\n"
             "# Manager Agent Decision Rules\n"
-            "1. THINK BEFORE YOU DECIDE: Analyze score progression across all executed nodes. Check if current model family has plateaued and if switching architectures (SOTA models, or even simple foundational baselines) or merging will boost score.\n"
+            "1. THINK BEFORE YOU DECIDE: Analyze tolerance-based score progression across all executed nodes. Check if current model family has plateaued and if switching architectures (including a measured custom neural computation graph) will boost score.\n"
             "2. Model Suitability & Performance Assessment: Verify if fixing/tuning the current model actually suits the task or if switching architectures will improve performance.\n"
             "3. STRICT ANTI-REPETITION: DO NOT repeat any model family, algorithm, or pipeline component that has already been attempted in previous nodes. Review the 'plan_summary' in Executed Nodes History carefully to identify what models have been used.\n"
             "4. Tuning a node (hyperparameters, extra layers, or preprocessing) is FREE and does NOT deduct from the main budget.\n"
             "5. If a tuned node fails to improve upon its parent score, it will be automatically stopped and pruned immediately to save budget for high-performing nodes.\n"
-            "6. If single-model tuning/refining plateaus or doesn't improve scores, select `merge` to combine two or more complementary strong nodes, or `diversify` using web search insights to try a genuinely novel model family (ranging from simple to complex).\n\n"
+            "6. If conventional tuning/refining plateaus and no neural architecture has been measured, prefer `architect` before another merge. A merge cannot reveal whether a different representation learns missing interactions.\n"
+            "7. `architect` means a bounded custom PyTorch nn.Module derived from observed inductive biases, with a plain neural ablation and the current best model as controls. It must not be a renamed off-the-shelf architecture. Do not claim global novelty without prior-art evidence.\n"
+            "8. On multimodal tasks, use measured modality-ablation scores: keep full fusion only when it beats credible single and leave-one-out controls on identical folds. Do not merge modalities merely because they are available.\n"
+            "9. Use `merge` only when at least two independently strong, genuinely complementary representations exist and architecture coverage is not the larger evidence gap.\n\n"
             "Select the single best strategic action to execute next:\n"
             "1. `merge`: Combine/blend/ensemble two or more top or complementary nodes (e.g. Node A and Node B) mid-process or at the end to achieve a score breakthrough.\n"
             "2. `tune`: Perform focused tuning (hyperparameters, layers, preprocessing) on a specific promising node.\n"
             "3. `refine`: Perform targeted structural/feature refinement on a specific node.\n"
             "4. `diversify`: Propose a fundamentally NEW model family or SOTA architecture not tried before.\n"
-            "5. `finalize`: Stop search and build final submission/ensemble if scores are saturated.\n\n"
+            "5. `architect`: Design and measure a task-tailored neural computation graph from primitive trainable operations.\n"
+            "6. `finalize`: Stop search and build final submission/ensemble if scores are saturated.\n\n"
             "Respond strictly with a JSON object containing:\n"
             "{\n"
             '  "thinking": "step-by-step reasoning analysis",\n'
-            '  "action": "merge" | "tune" | "refine" | "diversify" | "finalize",\n'
+            '  "action": "merge" | "tune" | "refine" | "diversify" | "architect" | "finalize",\n'
             '  "target_node_ids": ["node_id_1", "node_id_2"],\n'
             '  "reasoning": "concise explanation of why this step is chosen over others",\n'
             '  "plan": "concise execution plan for this action"\n'
@@ -360,7 +561,7 @@ class TechniqueAgent:
                 decision = json.loads(json_match.group(0))
                 if isinstance(decision, dict) and "action" in decision:
                     action = str(decision.get("action", "")).lower()
-                    if action in {"merge", "tune", "refine", "diversify", "finalize"}:
+                    if action in {"merge", "tune", "refine", "diversify", "architect", "finalize"}:
                         decision["action"] = action
                         if not isinstance(decision.get("target_node_ids"), list):
                             decision["target_node_ids"] = [best_node_id] if best_node_id else []

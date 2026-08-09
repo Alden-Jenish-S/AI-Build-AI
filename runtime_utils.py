@@ -290,13 +290,43 @@ def task_data_files(task_dir: Path) -> list[Path]:
     return files
 
 
-def expose_task_data(task_dir: Path, run_dir: Path) -> list[Path]:
-    """Expose task files through file-level links in ``run_dir/input``."""
+def expose_task_data(
+    task_dir: Path,
+    run_dir: Path,
+    *,
+    allowed_paths: Sequence[str] | None = None,
+    copy_files: bool = False,
+) -> list[Path]:
+    """Expose approved task files through file-level links in ``run_dir/input``.
+
+    Without ``allowed_paths`` this retains the historical all-files behavior.
+    Council-guided runs provide an explicit allowlist so held-out labels and
+    grading artifacts are not made visible to generated programs. Focused
+    diagnostic workers use read-only copies instead of links so a faulty script
+    cannot modify task-owned files through a link.
+    """
     task_root = Path(task_dir).resolve()
     destination = Path(run_dir) / "input"
     destination.mkdir(parents=True, exist_ok=True)
     linked: list[Path] = []
-    for source in task_data_files(task_root):
+    if allowed_paths is None:
+        sources = task_data_files(task_root)
+    else:
+        sources = []
+        for raw in sorted(set(str(item) for item in allowed_paths)):
+            relative = Path(raw)
+            if relative.is_absolute() or ".." in relative.parts:
+                raise ValueError(f"Invalid allowed task path: {raw!r}")
+            source = task_root / relative
+            try:
+                resolved = source.resolve()
+            except OSError:
+                continue
+            if resolved != task_root and task_root not in resolved.parents:
+                raise ValueError(f"Allowed task path escapes task root: {raw!r}")
+            if resolved.is_file():
+                sources.append(resolved)
+    for source in sources:
         target = destination / source.relative_to(task_root)
         target.parent.mkdir(parents=True, exist_ok=True)
         if target.is_symlink() and target.resolve() == source.resolve():
@@ -304,12 +334,19 @@ def expose_task_data(task_dir: Path, run_dir: Path) -> list[Path]:
             continue
         if target.exists() or target.is_symlink():
             raise FileExistsError(f"Node input path is already occupied: {target}")
-        try:
-            os.symlink(str(source.resolve()), str(target))
-        except OSError:
-            # Windows often denies symlink creation to ordinary users. A
-            # private node-local copy keeps the workflow operational there.
+        if copy_files:
             shutil.copy2(source, target)
+            try:
+                target.chmod(0o444)
+            except OSError:
+                pass
+        else:
+            try:
+                os.symlink(str(source.resolve()), str(target))
+            except OSError:
+                # Windows often denies symlink creation to ordinary users. A
+                # private node-local copy keeps the workflow operational there.
+                shutil.copy2(source, target)
         linked.append(target)
     return linked
 
