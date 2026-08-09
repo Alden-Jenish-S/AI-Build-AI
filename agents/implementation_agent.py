@@ -423,10 +423,10 @@ MULTIMODAL CONTRIBUTION CONTRACT (mandatory):
         return f"""
 Write one complete, self-contained Python program for this task.
 
-{analysis.prompt_context(20000)}
+{analysis.prompt_context(6000)}
 
 Implementation plan:
-{plan[:8000]}
+{plan[:3000]}
 {parent}{companion}{repair}{research}
 {council}
 {architecture_contract}
@@ -447,6 +447,7 @@ CRITICAL RULES & AGENT REASONING WORKFLOW:
    g. Outline your end-to-end data pipeline, validation split strategy, model training, and exact output generation.
 
 2. RUNTIME & SUBMISSION CONSTRAINTS:
+   - For your first debug attempt, aggressively subsample the training dataset (e.g. 5%) to quickly verify end-to-end execution without wasting GPU time on full training loops. You can scale to 100% data once the pipeline logic is proven to work.
    - The program runs from an isolated node directory. Every approved task file is available under `input/<inventory path>`.
    - Do NOT hardcode file names or column names. Inspect actual files and dataframes dynamically at runtime from `input/`.
    - Treat `input/` as immutable: never write, rename, move, or delete files in `input/`.
@@ -623,6 +624,7 @@ CRITICAL RULES & AGENT REASONING WORKFLOW:
                     )
                     
                     if completed.returncode != 0 and install_attempts < 3:
+                        # 1. Handle missing modules
                         err_match = re.search(r"(?:ModuleNotFoundError|ImportError): No module named '([^']+)'", completed.stderr)
                         if err_match:
                             missing_module = err_match.group(1).split('.')[0]
@@ -635,6 +637,14 @@ CRITICAL RULES & AGENT REASONING WORKFLOW:
                             self._log(display_name, f"Retrying execution after installing '{pkg_to_install}'...")
                             install_attempts += 1
                             continue
+                            
+                        # 2. Handle CUDA compatibility/GPU errors
+                        if "is not compatible with the current PyTorch installation" in completed.stderr or "no kernel image is available" in completed.stderr:
+                            if child_env.get("CUDA_VISIBLE_DEVICES") != "":
+                                self._log(display_name, "CUDA GPU compatibility error detected. Forcing CPU fallback and retrying...")
+                                child_env["CUDA_VISIBLE_DEVICES"] = ""
+                                install_attempts += 1
+                                continue
                     break
 
             except Exception as exc:
@@ -656,17 +666,17 @@ CRITICAL RULES & AGENT REASONING WORKFLOW:
                         f"elapsed_seconds: {completed.elapsed_seconds:.3f}",
                         "",
                         "STDOUT:",
-                        _tail(completed.stdout, 20000),
+                        _tail(completed.stdout, 2500),
                         "",
                         "STDERR:",
-                        _tail(completed.stderr, 20000),
+                        _tail(completed.stderr, 2500),
                         "",
                     )
                 ),
                 encoding="utf-8",
             )
             diagnostics.append(
-                f"attempt {attempt}: exit={completed.returncode}; elapsed={completed.elapsed_seconds:.1f}s\n{_tail(combined, 3000)}"
+                f"attempt {attempt}: exit={completed.returncode}; elapsed={completed.elapsed_seconds:.1f}s\n{_tail(combined, 2000)}"
             )
             self._log(
                 display_name,

@@ -107,7 +107,7 @@ class ManagerAgent:
         # Two independent roots are enough to establish diversity for larger
         # searches; additional budget is more valuable on measured refinement.
         self.initial_fanout = min(2, max(1, self.total_budget // 3))
-        self.max_tune_depth = 3
+        self.max_tune_depth = 1
         self.architecture_exploration_enabled = self._env_enabled(
             "AIBUILDAI_ARCHITECTURE_EXPLORATION", default=True
         )
@@ -126,7 +126,7 @@ class ManagerAgent:
         )
         # Tuning is free with respect to the idea budget, but independent caps
         # guarantee termination under persistent external/generated failures.
-        self.tuning_attempt_limit = max(3, self.total_budget * self.max_tune_depth)
+        self.tuning_attempt_limit = max(1, self.total_budget)
         self.attempt_limit = max(self.total_budget * 5, self.total_budget + 12)
         self._log(
             f"Prepared task '{self.task_name}' with {len(self.task_analysis.files)} files; "
