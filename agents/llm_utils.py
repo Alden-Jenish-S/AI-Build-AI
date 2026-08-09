@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import json
 import math
@@ -24,23 +26,50 @@ _token_usage_lock = threading.Lock()
 _response_cache_lock = threading.Lock()
 _response_cache: "OrderedDict[str, str]" = OrderedDict()
 _MAX_RESPONSE_CACHE_ENTRIES = 128
+_client_cache_lock = threading.Lock()
+_client_cache: dict[tuple[object, ...], object] = {}
 
 
 _PROVIDER_DEFAULTS = {
-    "nvidia": {
-        "api_key_env": "NVIDIA_API_KEY",
-        "base_url": "https://integrate.api.nvidia.com/v1",
-        "model": "openai/gpt-oss-120b",
-    },
     "gemini": {
         "api_key_env": "GEMINI_API_KEY",
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
         "model": "gemini-2.5-flash",
     },
+    "deepseek": {
+        "api_key_env": "DEEPSEEK_API_KEY",
+        "base_url": "https://api.deepseek.com",
+        "model": "deepseek-chat",
+    },
     "openai": {
         "api_key_env": "OPENAI_API_KEY",
         "base_url": "https://api.openai.com/v1",
-        "model": None,
+        "model": "gpt-4o",
+    },
+    "nvidia": {
+        "api_key_env": "NVIDIA_API_KEY",
+        "base_url": "https://integrate.api.nvidia.com/v1",
+        "model": "deepseek-ai/deepseek-v4-flash",
+    },
+    "nautilus": {
+        "api_key_env": "NAUT_API_KEY",
+        "base_url": "https://ellm.nrp-nautilus.io/v1",
+        "model": "qwen3",
+    },
+    "together": {
+        "api_key_env": "TOGETHER_API_KEY",
+        "base_url": "https://api.together.xyz/v1",
+        "model": "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+    },
+    "mistral": {
+        "api_key_env": "MISTRAL_API_KEY",
+        "base_url": "https://api.mistral.ai/v1",
+        "model": "mistral-large-latest",
+    },
+    "openrouter": {
+        "api_key_env": "OPENROUTER_API_KEY",
+        "base_url": "https://openrouter.ai/api/v1",
+        "model": "deepseek/deepseek-chat",
     },
 }
 
@@ -60,6 +89,8 @@ def reset_token_usage():
         }
     with _response_cache_lock:
         _response_cache.clear()
+    with _client_cache_lock:
+        _client_cache.clear()
 
 
 def _cache_flag(value: object, *, default: bool = False) -> bool:
@@ -75,7 +106,6 @@ def _request_cache_key(
     system_prompt: str,
     user_prompt: str,
     temperature: float,
-    response_format: Mapping[str, object] | None,
 ) -> str:
     payload = {
         "provider": provider,
@@ -83,7 +113,6 @@ def _request_cache_key(
         "system_prompt": system_prompt,
         "user_prompt": user_prompt,
         "temperature": float(temperature),
-        "response_format": response_format,
     }
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
@@ -118,9 +147,9 @@ def _resolve_llm_config(
 ) -> Dict[str, Any]:
     """Resolve any OpenAI-compatible provider from environment configuration.
 
-    Known NVIDIA, Gemini, and OpenAI providers retain convenient defaults. Any
-    other provider works by setting LLM_PROVIDER, LLM_BASE_URL, LLM_MODEL, and
-    either LLM_API_KEY or <PROVIDER>_API_KEY.
+    Known OpenAI-compatible providers are auto-detected from their API keys.
+    Custom providers must declare LLM_PROVIDER/LLM_BASE_URL/LLM_MODEL so an
+    unrelated service key cannot accidentally be selected as the LLM.
     """
     env = os.environ if environ is None else environ
     provider = str(env.get("LLM_PROVIDER", "")).strip().lower()
@@ -129,16 +158,10 @@ def _resolve_llm_config(
         if env.get("LLM_BASE_URL") or env.get("LLM_API_KEY"):
             provider = str(env.get("LLM_PROVIDER_NAME", "custom")).strip().lower()
         else:
-            # Preserve the historical NVIDIA/Gemini precedence while adding
-            # first-class OpenAI auto-detection.
-            provider = next(
-                (
-                    name
-                    for name in ("nvidia", "gemini", "openai")
-                    if env.get(_PROVIDER_DEFAULTS[name]["api_key_env"])
-                ),
-                "",
-            )
+            for name, spec in _PROVIDER_DEFAULTS.items():
+                if env.get(spec["api_key_env"]):
+                    provider = name
+                    break
     if not provider:
         raise ValueError(
             "No LLM provider is configured. Set LLM_PROVIDER plus LLM_API_KEY, "
@@ -196,11 +219,17 @@ def _resolve_llm_config(
         )
 
     try:
-        timeout_seconds = float(env.get("LLM_TIMEOUT_SECONDS", "120"))
+        timeout_seconds = float(env.get("LLM_TIMEOUT_SECONDS", "300"))
     except (TypeError, ValueError) as exc:
         raise ValueError("LLM_TIMEOUT_SECONDS must be a positive number") from exc
     if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
         raise ValueError("LLM_TIMEOUT_SECONDS must be a positive finite number")
+    try:
+        max_retries = int(env.get("LLM_MAX_RETRIES", "4"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("LLM_MAX_RETRIES must be a non-negative integer") from exc
+    if max_retries < 0:
+        raise ValueError("LLM_MAX_RETRIES must be a non-negative integer")
 
     default_headers: Dict[str, str] = {}
     headers_json = str(env.get("LLM_DEFAULT_HEADERS_JSON", "")).strip()
@@ -227,6 +256,7 @@ def _resolve_llm_config(
         "base_url": base_url,
         "model": model_name.strip(),
         "timeout_seconds": timeout_seconds,
+        "max_retries": max_retries,
         "default_headers": default_headers,
         "send_temperature": send_temperature,
         "cache_deterministic_responses": _cache_flag(
@@ -239,13 +269,95 @@ def _resolve_llm_config(
     }
 
 
+def _llm_client(config: Mapping[str, object]):
+    """Reuse one HTTP client and disable the SDK's hidden retry layer."""
+    from openai import OpenAI
+
+    key = (
+        config["provider"],
+        config["base_url"],
+        config["api_key"],
+        config["timeout_seconds"],
+        tuple(sorted(dict(config["default_headers"]).items())),
+        OpenAI,
+    )
+    with _client_cache_lock:
+        client = _client_cache.get(key)
+        if client is not None:
+            return client
+        client_kwargs = {
+            "api_key": config["api_key"],
+            "base_url": config["base_url"],
+            "timeout": config["timeout_seconds"],
+            # Retrying in both the SDK and this module multiplies requests and
+            # makes rate-limit recovery much worse. Keep one auditable layer.
+            "max_retries": 0,
+        }
+        if config["default_headers"]:
+            client_kwargs["default_headers"] = config["default_headers"]
+        client = OpenAI(**client_kwargs)
+        _client_cache[key] = client
+        return client
+
+
+def _status_code(error: Exception) -> int | None:
+    value = getattr(error, "status_code", None)
+    if value is None:
+        response = getattr(error, "response", None)
+        value = getattr(response, "status_code", None)
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_transient_error(error: Exception) -> bool:
+    status = _status_code(error)
+    if status in {408, 409, 425, 429, 500, 502, 503, 504}:
+        return True
+    name = type(error).__name__.lower()
+    text = str(error).lower()
+    return any(marker in name for marker in ("connection", "timeout")) or any(
+        marker in text
+        for marker in (
+            "connection reset",
+            "connection refused",
+            "empty choices",
+            "empty message",
+            "rate limit",
+            "temporarily unavailable",
+            "timed out",
+            "timeout",
+            "unexpected token",
+            "overloaded",
+            "exhausted",
+        )
+    )
+
+
+def _retry_delay(error: Exception, attempt: int) -> float:
+    response = getattr(error, "response", None)
+    headers = getattr(response, "headers", None)
+    retry_after = None
+    if headers is not None:
+        try:
+            retry_after = headers.get("retry-after")
+        except AttributeError:
+            retry_after = None
+    try:
+        requested = float(retry_after) if retry_after is not None else None
+    except (TypeError, ValueError):
+        requested = None
+    if requested is not None and math.isfinite(requested) and requested >= 0:
+        return min(requested, 60.0)
+    return min(0.75 * (2 ** attempt), 12.0)
+
+
 def call_llm(
     system_prompt: str,
     user_prompt: str,
     model: Optional[str] = None,
     temperature: float = 0.2,
-    *,
-    response_format: Mapping[str, object] | None = None,
 ) -> str:
     """
     Query any OpenAI-compatible LLM API with bounded retry handling.
@@ -263,7 +375,6 @@ def call_llm(
         system_prompt=system_prompt,
         user_prompt=user_prompt,
         temperature=temperature,
-        response_format=response_format,
     )
     use_response_cache = bool(
         config["cache_deterministic_responses"]
@@ -288,23 +399,12 @@ def call_llm(
                 )
             return cached
 
-    # 2. Query LLM with Retry Logic for Rate Limits (429)
-    retries = 5
-    delay = 10.0  # Start with a 10-second delay
-    
-    for attempt in range(retries):
+    attempts = int(config["max_retries"]) + 1
+    client = _llm_client(config)
+
+    for attempt in range(attempts):
         call_started = time.monotonic()
         try:
-            from openai import OpenAI
-            client_kwargs = {
-                "api_key": config["api_key"],
-                "base_url": config["base_url"],
-                "timeout": config["timeout_seconds"],
-            }
-            if config["default_headers"]:
-                client_kwargs["default_headers"] = config["default_headers"]
-            client = OpenAI(**client_kwargs)
-
             request = {
                 "model": model_name,
                 "messages": [
@@ -314,8 +414,6 @@ def call_llm(
             }
             if config["send_temperature"]:
                 request["temperature"] = temperature
-            if response_format is not None:
-                request["response_format"] = dict(response_format)
             if config["send_prompt_cache_key"]:
                 request["extra_body"] = {
                     "prompt_cache_key": hashlib.sha256(
@@ -325,8 +423,9 @@ def call_llm(
             response = client.chat.completions.create(**request)
 
             if not response.choices:
-                raise ValueError(f"LLM API returned a response with an empty choices list. Response structure: {response}")
-            content = response.choices[0].message.content
+                raise ValueError("LLM API returned an empty choices list")
+            msg = response.choices[0].message
+            content = msg.content
             if isinstance(content, list):
                 content = "".join(
                     str(
@@ -336,6 +435,11 @@ def call_llm(
                     )
                     for item in content
                 )
+            if not isinstance(content, str) or not content.strip():
+                reasoning = getattr(msg, "reasoning", None) or getattr(msg, "thinking", None)
+                if reasoning and isinstance(reasoning, str) and reasoning.strip():
+                    content = reasoning
+
             if not isinstance(content, str) or not content.strip():
                 raise ValueError("LLM API returned an empty message")
             usage = getattr(response, "usage", None)
@@ -390,134 +494,15 @@ def call_llm(
                 
             return content
             
-        except Exception as e:
-            # Check if this is a rate limit error (status code 429 or matching string)
-            error_text = str(e).lower()
-            is_rate_limit = False
-            if hasattr(e, "status_code") and e.status_code == 429:
-                is_rate_limit = True
-            elif "429" in error_text or "exhausted" in error_text or "rate limit" in error_text:
-                is_rate_limit = True
-
-            if is_rate_limit and attempt < retries - 1:
-                print(f"LLM Call: Hit rate limit (429). Sleeping for {delay} seconds before retry {attempt + 1}/{retries}...")
-                time.sleep(delay)
-                delay *= 1.5
-                continue
-
-            # Some OpenAI-compatible providers return an HTTP-400-shaped response
-            # with no choices for transient server/parser faults. Retry only these
-            # known transient forms; genuine invalid-request errors still fail fast.
-            status_code = getattr(e, "status_code", None)
-            is_transient_provider_error = (
-                "empty choices" in error_text
-                or "unexpected token" in error_text
-                or "timed out" in error_text
-                or status_code in {500, 502, 503, 504}
-            )
-            if is_transient_provider_error and attempt < retries - 1:
-                retry_delay = min(1.0 * (2 ** attempt), 5.0)
+        except Exception as error:
+            if _is_transient_error(error) and attempt < attempts - 1:
+                retry_delay = _retry_delay(error, attempt)
                 print(
                     "LLM Call: Transient provider response; retrying in "
-                    f"{retry_delay:.1f}s ({attempt + 1}/{retries})..."
+                    f"{retry_delay:.1f}s ({attempt + 1}/{attempts - 1})..."
                 )
                 time.sleep(retry_delay)
                 continue
 
-            logger.error(f"Failed to query LLM API: {e}")
-            raise e
-
-
-def _extract_json_payload(content: str) -> object:
-    text = str(content).strip()
-    if text.startswith("```"):
-        first_newline = text.find("\n")
-        if first_newline >= 0:
-            text = text[first_newline + 1 :]
-        if text.endswith("```"):
-            text = text[:-3]
-        text = text.strip()
-    decoder = json.JSONDecoder()
-    # Structured providers normally return a complete JSON value. Decode from
-    # the beginning first so an outer array is not mistaken for its first
-    # object element. The fallback supports gateways that prefix brief prose.
-    try:
-        payload, _ = decoder.raw_decode(text)
-        return payload
-    except json.JSONDecodeError:
-        pass
-    starts = sorted(
-        index for index, character in enumerate(text) if character in "[{"
-    )
-    for start in starts:
-        try:
-            payload, _ = decoder.raw_decode(text[start:])
-            return payload
-        except json.JSONDecodeError:
-            continue
-    raise ValueError("LLM response did not contain a valid JSON value")
-
-
-def _validate_json_schema(value: object, schema: Mapping[str, object]) -> None:
-    expected_type = schema.get("type")
-    if expected_type == "object":
-        if not isinstance(value, dict):
-            raise ValueError("structured LLM response must be a JSON object")
-        for key in schema.get("required", []):
-            if key not in value:
-                raise ValueError(f"structured LLM response is missing {key!r}")
-        properties = schema.get("properties", {})
-        if isinstance(properties, Mapping):
-            for key, child_schema in properties.items():
-                if key in value and isinstance(child_schema, Mapping):
-                    _validate_json_schema(value[key], child_schema)
-    elif expected_type == "array":
-        if not isinstance(value, list):
-            raise ValueError("structured LLM response must be a JSON array")
-        minimum = int(schema.get("minItems", 0) or 0)
-        maximum = schema.get("maxItems")
-        if len(value) < minimum or (
-            maximum is not None and len(value) > int(maximum)
-        ):
-            raise ValueError("structured LLM response has the wrong item count")
-        item_schema = schema.get("items")
-        if isinstance(item_schema, Mapping):
-            for item in value:
-                _validate_json_schema(item, item_schema)
-    elif expected_type == "string" and not isinstance(value, str):
-        raise ValueError("structured LLM response field must be a string")
-    elif expected_type == "boolean" and not isinstance(value, bool):
-        raise ValueError("structured LLM response field must be boolean")
-    elif expected_type == "number" and not isinstance(value, (int, float)):
-        raise ValueError("structured LLM response field must be numeric")
-    if "enum" in schema and value not in schema["enum"]:
-        raise ValueError("structured LLM response contains an invalid enum value")
-
-
-def call_llm_json(
-    system_prompt: str,
-    user_prompt: str,
-    *,
-    schema: Mapping[str, object],
-    schema_name: str,
-    model: Optional[str] = None,
-    temperature: float = 0.0,
-) -> object:
-    """Return one schema-constrained JSON response without repair prompting."""
-    response = call_llm(
-        system_prompt,
-        user_prompt,
-        model=model,
-        temperature=temperature,
-        response_format={
-            "type": "json_schema",
-            "json_schema": {
-                "name": re.sub(r"[^A-Za-z0-9_-]+", "_", schema_name)[:64],
-                "strict": True,
-                "schema": dict(schema),
-            },
-        },
-    )
-    payload = _extract_json_payload(response)
-    _validate_json_schema(payload, schema)
-    return payload
+            logger.error("Failed to query LLM API: %s", error)
+            raise

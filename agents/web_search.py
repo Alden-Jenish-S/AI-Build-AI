@@ -4,11 +4,16 @@ Web Search Module — Robust, zero-dependency web search for the agent system.
 Provides search_web(query) which tries multiple strategies in order:
   1. Serper API (if SERPER_API_KEY is set)
   2. DuckDuckGo Lite HTML scraping (with retries + user-agent rotation)
-  3. DuckDuckGo JSON API fallback (instant answers endpoint)
+  3. DuckDuckGo HTML scraping
+  4. DuckDuckGo JSON API fallback (instant answers endpoint)
 
-All methods use only the Python stdlib (urllib, json, re) — no pip installs needed.
+All methods use only the Python stdlib. Search-page HTML is parsed structurally
+with ``html.parser`` rather than regular expressions tied to CSS class names.
 """
 
+from __future__ import annotations
+
+from html.parser import HTMLParser
 import json
 import os
 import re
@@ -17,7 +22,15 @@ import random
 import urllib.request
 import urllib.parse
 import http.client
-from typing import List, Optional
+import threading
+from typing import Optional
+
+
+_MAX_QUERY_CHARS = 99
+_MAX_CACHE_ENTRIES = 256
+_SEARCH_CACHE: dict[str, str] = {}
+_SEARCH_CACHE_LOCK = threading.RLock()
+_SEARCH_INFLIGHT: dict[str, threading.Event] = {}
 
 # Pool of realistic browser user-agents to rotate through
 _USER_AGENTS = [
@@ -37,9 +50,169 @@ def _random_ua() -> str:
     return random.choice(_USER_AGENTS)
 
 
-def _clean_html(text: str) -> str:
-    """Strip HTML tags from a string."""
-    return re.sub(r'<[^>]+>', '', text).strip()
+def _bounded_query(query: object) -> str:
+    """Normalize a query and keep provider requests below 100 characters."""
+    normalized = " ".join(str(query or "").split())
+    if len(normalized) <= _MAX_QUERY_CHARS:
+        return normalized
+    prefix = normalized[:_MAX_QUERY_CHARS]
+    if " " in prefix:
+        shortened = prefix.rsplit(" ", 1)[0].strip()
+        if shortened:
+            return shortened
+    return prefix
+
+
+def clear_search_cache() -> None:
+    """Clear process-local search results, primarily for run/test boundaries."""
+    with _SEARCH_CACHE_LOCK:
+        _SEARCH_CACHE.clear()
+
+
+def _result_url(href: str) -> str | None:
+    """Decode a DDG redirect or accept a direct external HTTP(S) URL."""
+    raw = str(href or "").strip()
+    if not raw or raw.startswith(("#", "javascript:", "mailto:")):
+        return None
+    parse_target = "https:" + raw if raw.startswith("//") else raw
+    if raw.startswith("/"):
+        parse_target = "https://duckduckgo.com" + raw
+    try:
+        parsed = urllib.parse.urlparse(parse_target)
+        query = urllib.parse.parse_qs(parsed.query)
+        redirected = query.get("uddg", [None])[0]
+        if redirected:
+            parse_target = urllib.parse.unquote(str(redirected))
+            parsed = urllib.parse.urlparse(parse_target)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return None
+        host = (parsed.hostname or "").lower()
+        if host == "duckduckgo.com" or host.endswith(".duckduckgo.com"):
+            return None
+        return parse_target
+    except (TypeError, ValueError):
+        return None
+
+
+class _SearchPageParser(HTMLParser):
+    """Extract external result anchors and their nearby visible text."""
+
+    def __init__(self, limit: int = 5) -> None:
+        super().__init__(convert_charrefs=True)
+        self.limit = limit
+        self.results: list[dict[str, object]] = []
+        self._hidden_depth = 0
+        self._inside_anchor = False
+        self._anchor_url: str | None = None
+        self._anchor_text: list[str] = []
+        self._active_result: int | None = None
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        lowered = tag.lower()
+        if lowered in {"script", "style", "noscript", "form"}:
+            self._hidden_depth += 1
+            return
+        if lowered != "a" or self._hidden_depth:
+            return
+        self._inside_anchor = True
+        attributes = {str(name).lower(): value for name, value in attrs}
+        self._anchor_url = _result_url(str(attributes.get("href") or ""))
+        self._anchor_text = []
+
+    def handle_endtag(self, tag: str) -> None:
+        lowered = tag.lower()
+        if lowered in {"script", "style", "noscript", "form"}:
+            self._hidden_depth = max(0, self._hidden_depth - 1)
+            return
+        if lowered != "a" or not self._inside_anchor:
+            return
+        if self._anchor_url:
+            title = " ".join(self._anchor_text).strip()
+            if title:
+                existing_index = next(
+                    (
+                        index
+                        for index, item in enumerate(self.results)
+                        if str(item["url"]) == self._anchor_url
+                    ),
+                    None,
+                )
+                if existing_index is None and len(self.results) < self.limit:
+                    self.results.append(
+                        {
+                            "title": title,
+                            "url": self._anchor_url,
+                            "snippet_parts": [],
+                        }
+                    )
+                    self._active_result = len(self.results) - 1
+                elif existing_index is not None:
+                    parts = self.results[existing_index]["snippet_parts"]
+                    if (
+                        isinstance(parts, list)
+                        and title != self.results[existing_index]["title"]
+                    ):
+                        parts.append(title)
+                    self._active_result = existing_index
+        self._inside_anchor = False
+        self._anchor_url = None
+        self._anchor_text = []
+
+    def handle_data(self, data: str) -> None:
+        cleaned = " ".join(data.split())
+        if not cleaned or self._hidden_depth:
+            return
+        if self._inside_anchor:
+            if self._anchor_url:
+                self._anchor_text.append(cleaned)
+            return
+        if self._active_result is None:
+            return
+        parts = self.results[self._active_result]["snippet_parts"]
+        if not isinstance(parts, list):
+            return
+        joined_length = sum(len(str(item)) for item in parts)
+        if joined_length < 500 and cleaned.lower() not in {
+            "more results",
+            "feedback",
+            "next",
+        }:
+            parts.append(cleaned)
+
+
+def _parse_search_html(html: str, *, limit: int = 5) -> list[dict[str, str]]:
+    """Parse result pages without relying on provider CSS class names."""
+    parser = _SearchPageParser(limit=limit)
+    parser.feed(html)
+    parser.close()
+    parsed = []
+    for result in parser.results:
+        title = " ".join(str(result["title"]).split())
+        snippet = " ".join(
+            str(item)
+            for item in result.get("snippet_parts", [])
+            if str(item).strip()
+        )
+        # Stop generic nearby-text capture before the next result title when it
+        # was emitted outside its anchor by unusual markup.
+        parsed.append(
+            {
+                "title": title[:300],
+                "url": str(result["url"]),
+                "snippet": snippet[:600],
+            }
+        )
+    return parsed
+
+
+def _format_results(results: list[dict[str, str]]) -> str | None:
+    rendered = [
+        f"Title: {item['title']}\nURL: {item['url']}\n"
+        f"Snippet: {item.get('snippet', '')}\n"
+        for item in results
+        if item.get("title") and item.get("url")
+    ]
+    return "\n".join(rendered) if rendered else None
 
 
 # ---------------------------------------------------------------------------
@@ -112,50 +285,9 @@ def _ddg_lite_search(query_str: str, max_retries: int = 3) -> Optional[str]:
             with urllib.request.urlopen(req, timeout=15) as response:
                 html = response.read().decode("utf-8", errors="replace")
 
-            # Parse the lite results page
-            # DDG Lite uses a table-based layout with <a class="result-link"> for links
-            # and <td class="result-snippet"> for snippets
-            results = []
-
-            # Try multiple parsing strategies
-            # Strategy A: Look for result-link anchors
-            link_matches = re.findall(
-                r'<a[^>]*class="result-link"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
-                html, re.DOTALL
-            )
-            snippet_matches = re.findall(
-                r'<td[^>]*class="result-snippet"[^>]*>(.*?)</td>',
-                html, re.DOTALL
-            )
-
-            if link_matches:
-                for i, (link, title_html) in enumerate(link_matches[:5]):
-                    title = _clean_html(title_html)
-                    snippet = _clean_html(snippet_matches[i]) if i < len(snippet_matches) else ""
-                    # Decode DDG redirect URLs
-                    if "uddg=" in link:
-                        try:
-                            qs = urllib.parse.parse_qs(urllib.parse.urlparse(link).query)
-                            if 'uddg' in qs:
-                                link = qs['uddg'][0]
-                        except Exception:
-                            pass
-                    results.append(f"Title: {title}\nURL: {link}\nSnippet: {snippet}\n")
-
-            # Strategy B: Fallback to generic link/snippet extraction
-            if not results:
-                # Look for any links that look like search results
-                all_links = re.findall(r'<a[^>]*href="(https?://[^"]+)"[^>]*>(.*?)</a>', html, re.DOTALL)
-                for link, title_html in all_links[:5]:
-                    # Skip DDG internal links
-                    if 'duckduckgo.com' in link:
-                        continue
-                    title = _clean_html(title_html)
-                    if title and len(title) > 5:
-                        results.append(f"Title: {title}\nURL: {link}\nSnippet: \n")
-
+            results = _format_results(_parse_search_html(html))
             if results:
-                return "\n".join(results)
+                return results
 
         except Exception as e:
             print(f"[WebSearch] DDG Lite attempt {attempt + 1} failed: {e}")
@@ -184,31 +316,9 @@ def _ddg_html_search(query_str: str, max_retries: int = 2) -> Optional[str]:
             with urllib.request.urlopen(req, timeout=15) as response:
                 html = response.read().decode("utf-8", errors="replace")
 
-            divs = html.split('<div class="result')
-            results = []
-            for div in divs[1:6]:
-                link_match = re.search(r'href="([^"]+)"', div)
-                link = link_match.group(1) if link_match else ""
-                if link.startswith("//"):
-                    link = "https:" + link
-                if "uddg=" in link:
-                    try:
-                        qs = urllib.parse.parse_qs(urllib.parse.urlparse(link).query)
-                        if 'uddg' in qs:
-                            link = qs['uddg'][0]
-                    except Exception:
-                        pass
-
-                title_match = re.search(r'<a class="result__url"[^>]*>(.*?)</a>', div, re.DOTALL)
-                title = _clean_html(title_match.group(1)) if title_match else "No Title"
-
-                snippet_match = re.search(r'<a class="result__snippet"[^>]*>(.*?)</a>', div, re.DOTALL)
-                snippet = _clean_html(snippet_match.group(1)) if snippet_match else ""
-
-                results.append(f"Title: {title}\nURL: {link}\nSnippet: {snippet}\n")
-
+            results = _format_results(_parse_search_html(html))
             if results:
-                return "\n".join(results)
+                return results
 
         except Exception as e:
             print(f"[WebSearch] DDG HTML attempt {attempt + 1} failed: {e}")
@@ -264,39 +374,28 @@ def _ddg_instant_answer(query_str: str) -> Optional[str]:
 # Public Interface
 # ---------------------------------------------------------------------------
 
-def search_web(query_str: str) -> str:
-    """
-    Search the web using the best available strategy.
-
-    Tries in order:
-      1. Serper API (if SERPER_API_KEY env var is set)
-      2. DuckDuckGo Lite (POST-based, with retries + UA rotation)
-      3. DuckDuckGo HTML (GET-based, with retries + UA rotation)
-      4. DuckDuckGo Instant Answer JSON API (limited but never blocked)
-      5. Empty fallback message
-
-    Returns formatted search results as a string.
-    """
+def _search_uncached(query: str) -> str:
+    """Run provider fallbacks for one already-normalized query."""
     # 1. Serper (Google)
-    result = _serper_search(query_str)
+    result = _serper_search(query)
     if result:
         print("[WebSearch] Results from Serper API (Google)")
         return result
 
     # 2. DDG Lite
-    result = _ddg_lite_search(query_str)
+    result = _ddg_lite_search(query)
     if result:
         print("[WebSearch] Results from DuckDuckGo Lite")
         return result
 
     # 3. DDG HTML
-    result = _ddg_html_search(query_str)
+    result = _ddg_html_search(query)
     if result:
         print("[WebSearch] Results from DuckDuckGo HTML")
         return result
 
     # 4. DDG Instant Answer
-    result = _ddg_instant_answer(query_str)
+    result = _ddg_instant_answer(query)
     if result:
         print("[WebSearch] Results from DuckDuckGo Instant Answer API")
         return result
@@ -304,3 +403,45 @@ def search_web(query_str: str) -> str:
     # 5. All strategies failed
     print("[WebSearch] WARNING: All search strategies failed!")
     return ""
+
+
+def search_web(query_str: str) -> str:
+    """Search with bounded queries, per-process caching, and request coalescing."""
+    query = _bounded_query(query_str)
+    if not query:
+        return ""
+    cache_key = query.casefold()
+    with _SEARCH_CACHE_LOCK:
+        if cache_key in _SEARCH_CACHE:
+            print("[WebSearch] Results from in-memory cache")
+            return _SEARCH_CACHE[cache_key]
+        pending = _SEARCH_INFLIGHT.get(cache_key)
+        if pending is None:
+            pending = threading.Event()
+            _SEARCH_INFLIGHT[cache_key] = pending
+            owns_request = True
+        else:
+            owns_request = False
+
+    if not owns_request:
+        pending.wait(timeout=75)
+        with _SEARCH_CACHE_LOCK:
+            return _SEARCH_CACHE.get(cache_key, "")
+
+    try:
+        return _cache_result(cache_key, _search_uncached(query))
+    finally:
+        with _SEARCH_CACHE_LOCK:
+            completed = _SEARCH_INFLIGHT.pop(cache_key, None)
+            if completed is not None:
+                completed.set()
+
+
+def _cache_result(cache_key: str, result: str) -> str:
+    """Store one result with a small process-local size bound."""
+    with _SEARCH_CACHE_LOCK:
+        if len(_SEARCH_CACHE) >= _MAX_CACHE_ENTRIES:
+            oldest_key = next(iter(_SEARCH_CACHE))
+            _SEARCH_CACHE.pop(oldest_key, None)
+        _SEARCH_CACHE[cache_key] = result
+    return result

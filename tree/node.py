@@ -1,20 +1,20 @@
+"""In-memory state for one planning or implementation branch."""
+
 from dataclasses import dataclass, field
-from typing import Literal, Optional, List
+from typing import Any
+
 
 @dataclass
 class NodeState:
     node_id: str
-    parent_id: Optional[str]
-    node_type: Literal["technique", "implementation"]
-    plan: Optional[str] = None          # Technique node output: strategy/plan
-    code: Optional[str] = None          # Implementation node output: glue code
-    config: Optional[dict] = None       # Config details
-    result: Optional[dict] = None       # {"score": float, "diagnostics": str}
-    executed: bool = False               # True after node has been fully processed
-    operator: Optional[str] = None       # refine, tune, diversify, promote, etc.
-    fidelity: str = "full"              # screen, medium, or full evaluation
-    
-    # Scheduling fields
+    parent_id: str | None
+    node_type: str = "implementation"
+    plan: str | None = None
+    code: str | None = None
+    result: dict[str, Any] | None = None
+    executed: bool = False
+    operator: str | None = None
+    config: dict[str, Any] = field(default_factory=dict)
     visits: int = 0
     total_reward: float = 0.0
-    children_ids: List[str] = field(default_factory=list)
+    children_ids: list[str] = field(default_factory=list)

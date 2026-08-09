@@ -1,4 +1,4 @@
-"""Launch the method tree directly for one task."""
+"""Run the lean implementation search for one task."""
 
 from __future__ import annotations
 
@@ -20,11 +20,8 @@ from agents.manager_agent import ManagerAgent
 
 
 def _token_counts(usage: dict[str, Any]) -> dict[str, int]:
-    """Return a serializable, non-negative LLM usage snapshot."""
-    input_tokens = int(usage.get("input_tokens", 0))
-    output_tokens = int(usage.get("output_tokens", 0))
-    if input_tokens < 0 or output_tokens < 0:
-        raise ValueError("token usage cannot be negative")
+    input_tokens = max(0, int(usage.get("input_tokens", 0)))
+    output_tokens = max(0, int(usage.get("output_tokens", 0)))
     return {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
@@ -32,171 +29,156 @@ def _token_counts(usage: dict[str, Any]) -> dict[str, int]:
     }
 
 
-def _write_token_usage_report(
-    task_name: str,
-    usage: dict[str, Any],
-    *,
-    runs_root: Path | None = None,
-    calls: list[dict] | None = None,
-) -> Path:
-    """Persist token usage for the direct method-tree search."""
-    search = _token_counts(usage)
-    root = Path(runs_root) if runs_root is not None else PROJECT_ROOT / "runs"
-    report_file = root / task_name / "token_usage.json"
-    report_file.parent.mkdir(parents=True, exist_ok=True)
-    report = {
-        "task_name": task_name,
+def _write_token_usage_report(manager: ManagerAgent, usage: dict[str, Any]) -> Path:
+    """Write compact per-call and aggregate LLM metrics for this run."""
+    counts = _token_counts(usage)
+    path = manager.run_root / "token_usage.json"
+    payload = {
+        "task_name": manager.task_name,
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "measurement": (
-            "Provider-reported LLM token usage when available; otherwise the "
-            "llm_utils word-based fallback estimate."
+            "Provider-reported token usage when available; otherwise the "
+            "shared client's word-based fallback estimate."
         ),
-        "method_tree": search,
-        "calls": list(calls or []),
+        "method_tree": counts,
+        "search_accounting": {
+            "new_idea_budget": manager.total_budget,
+            "new_idea_budget_used": manager.experiments_executed,
+            "completed_implementations": manager.completed_implementations,
+            "free_tuning_attempts": manager.tuning_attempts,
+            "implementation_attempts": manager.implementation_attempts,
+        },
+        "calls": list(usage.get("calls", [])),
     }
-    report_file.write_text(
-        json.dumps(report, indent=2) + "\n", encoding="utf-8"
-    )
-    return report_file
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(payload, indent=2, default=str) + "\n", encoding="utf-8")
+    temporary.replace(path)
+    return path
 
 
 def _write_results(
     manager: ManagerAgent,
-    best_node_id: str | None,
     *,
     elapsed_seconds: float,
     usage: dict[str, int],
-    submission_written: bool = False,
-    failure: str | None = None,
+    failure: str | None,
 ) -> Path:
-    """Write a method-tree run summary without a synthetic comparison model."""
-    best_node = (
-        manager.all_nodes.get(best_node_id) if best_node_id else None
+    best = manager.all_nodes.get(manager.best_node_id or "")
+    best_score = best.result.get("score") if best and best.result else None
+    completed = sum(
+        1 for node in manager.all_nodes.values()
+        if node.node_type == "implementation"
+        and node.result
+        and node.result.get("status") == "completed"
     )
-    best_score = (
-        float(best_node.result["score"])
-        if best_node is not None and best_node.result
-        else None
+    pruned = sum(
+        1 for node in manager.all_nodes.values()
+        if node.result and node.result.get("pruned")
     )
-    technique_nodes = [
-        node
-        for node in manager.all_nodes.values()
-        if node.node_type == "technique"
-        and node.parent_id is not None
-        and node.executed
-    ]
-    pool_hits = sum(
-        1
-        for node in technique_nodes
-        if ((node.config or {}).get("technique_record") or {}).get("status")
-        == "pool_hit"
-    )
-    result_file = manager.run_root / "results.md"
-    result_file.write_text(
+    node_lines: list[str] = []
+    for node in manager.all_nodes.values():
+        result = node.result or {}
+        node_lines.append(
+            f"- `{manager.node_label(node.node_id)}` — {node.node_type}/{node.operator or 'run'}; "
+            f"status={result.get('status', 'unknown')}; "
+            f"score={result.get('score', 'none')}; "
+            f"pruned={bool(result.get('pruned'))}"
+        )
+        if result.get("status") != "completed" and result.get("diagnostics"):
+            diagnostic = " ".join(str(result["diagnostics"])[-1200:].split())
+            node_lines.append(f"  - last error: {diagnostic}")
+    path = manager.run_root / "results.md"
+    path.write_text(
         "\n".join(
-            (
-                "# Method Tree Search",
+            [
+                "# Implementation search",
                 "",
                 f"Task: {manager.task_name}",
+                f"Goal: {manager.task_analysis.goal}",
                 f"Metric: {manager.metric_name} ({manager.metric_direction})",
-                f"Status: {'completed' if submission_written else 'failed'}",
+                f"Status: {'completed' if manager.final_output_path else 'failed'}",
                 f"Failure: {failure or 'none'}",
-                f"Best node: {best_node_id or 'none'}",
-                (
-                    f"Best score: {best_score:.8f}"
-                    if best_score is not None
-                    else "Best score: none"
-                ),
-                (
-                    f"Best fidelity: {best_node.fidelity}"
-                    if best_node is not None
-                    else "Best fidelity: none"
-                ),
-                f"Final submission written: {submission_written}",
-                (
-                    "Completed evaluation experiments: "
-                    f"{manager.experiments_executed}"
-                ),
-                (
-                    "Implementation attempts: "
-                    f"{getattr(manager, 'implementation_attempts', 0)}"
-                ),
-                f"Technique nodes resolved: {len(technique_nodes)}",
-                (
-                    "Memory-pool hit rate: "
-                    f"{pool_hits / len(technique_nodes):.1%}"
-                    if technique_nodes
-                    else "Memory-pool hit rate: 0.0%"
-                ),
+                f"Best node: {manager.node_label(manager.best_node_id)}",
+                f"Best score: {best_score if best_score is not None else 'none'}",
+                f"Final output: {manager.final_output_path or 'none'}",
+                f"Runnable implementations: {completed}",
+                f"New-idea budget used: {manager.experiments_executed}/{manager.total_budget}",
+                f"Free tuning nodes attempted: {manager.tuning_attempts}",
+                f"Implementation nodes attempted: {manager.implementation_attempts}",
+                f"Non-improving branches pruned: {pruned}",
                 f"Elapsed seconds: {elapsed_seconds:.2f}",
-                f"LLM tokens: {usage['total_tokens']}",
+                f"LLM input tokens: {usage['input_tokens']}",
+                f"LLM output tokens: {usage['output_tokens']}",
+                f"Tree state: {manager.run_root / 'tree_state.json'}",
+                f"Method tree image: {manager.run_root / 'method_tree.png'}",
+                f"Token usage report: {manager.run_root / 'token_usage.json'}",
                 "",
-            )
+                "## Nodes",
+                "",
+                *node_lines,
+                "",
+            ]
         ),
         encoding="utf-8",
     )
-    return result_file
+    return path
 
 
 def run_method_tree(task_name: str, budget: int) -> dict[str, Any]:
-    """Run search immediately, select the best method, and emit a submission."""
     reset_token_usage()
     manager = ManagerAgent(task_name=task_name, total_budget=budget)
-    started = time.time()
-    best_node_id = None
-    submission_written = False
+    started = time.monotonic()
     failure: Exception | None = None
+    best_node_id: str | None = None
     try:
         best_node_id = manager.run_tree_search()
-        if not best_node_id:
-            raise RuntimeError(
-                "method tree produced no successful implementation node"
-            )
-        submission_written = manager.generate_final_submission(best_node_id)
-        if not submission_written:
-            raise RuntimeError(
-                "method tree produced an invalid final submission"
-            )
+        if best_node_id is None:
+            raise RuntimeError("No implementation produced a deliverable; see node diagnostics.")
+        if not manager.generate_final_submission(best_node_id):
+            raise RuntimeError("The strongest runnable implementation did not expose its deliverable.")
     except Exception as exc:
         failure = exc
-    elapsed_seconds = time.time() - started
+    elapsed = time.monotonic() - started
+    try:
+        tree_artifacts = manager.finalize_run_artifacts()
+    except Exception as exc:
+        tree_artifacts = {}
+        print(f"ManagerAgent WARNING: Could not refresh final tree reports: {exc}", flush=True)
     usage_snapshot = get_token_usage()
     usage = _token_counts(usage_snapshot)
-    token_report = _write_token_usage_report(
-        task_name,
-        usage,
-        calls=list(usage_snapshot.get("calls", [])),
-    )
+    token_report = _write_token_usage_report(manager, usage_snapshot)
     results_file = _write_results(
         manager,
-        best_node_id,
-        elapsed_seconds=elapsed_seconds,
+        elapsed_seconds=elapsed,
         usage=usage,
-        submission_written=submission_written,
         failure=str(failure) if failure else None,
     )
     if failure is not None:
         raise failure
+    best = manager.all_nodes[manager.best_node_id]
     return {
-        "best_node_id": best_node_id,
-        "best_score": manager.all_nodes[best_node_id].result["score"],
+        "best_node_id": manager.best_node_id,
+        "best_node": manager.node_label(manager.best_node_id),
+        "best_score": best.result["score"],
         "metric": manager.metric_name,
         "direction": manager.metric_direction,
         "experiments": manager.experiments_executed,
-        "implementation_attempts": getattr(
-            manager, "implementation_attempts", 0
-        ),
-        "elapsed_seconds": elapsed_seconds,
+        "new_idea_budget_used": manager.experiments_executed,
+        "completed_implementations": manager.completed_implementations,
+        "tuning_attempts": manager.tuning_attempts,
+        "implementation_attempts": manager.implementation_attempts,
+        "elapsed_seconds": elapsed,
         "token_usage": usage,
-        "results_file": str(results_file),
         "token_report": str(token_report),
+        "tree_state": str(tree_artifacts.get("tree_state", manager.run_root / "tree_state.json")),
+        "method_tree": str(tree_artifacts.get("method_tree", manager.run_root / "method_tree.png")),
+        "results_file": str(results_file),
+        "final_output": str(manager.final_output_path),
     }
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Run the autonomous method tree directly for one task."
-    )
+    parser = argparse.ArgumentParser(description="Run direct task analysis and implementation search.")
     parser.add_argument(
         "task_name",
         nargs="?",
@@ -208,8 +190,8 @@ def main() -> None:
         type=int,
         default=6,
         help=(
-            "Number of completed evaluation experiments; planning and bounded "
-            "technical recovery actions are free (default: 6)."
+            "Completed new root/branch ideas to fund; tuning is free and failures "
+            "preserve this budget (default: 6)."
         ),
     )
     args = parser.parse_args()
@@ -221,18 +203,20 @@ def main() -> None:
     result = run_method_tree(args.task_name, args.budget)
     usage = result["token_usage"]
     print(
-        "\nMethod-tree search completed. "
-        f"Best node={result['best_node_id']}, "
+        f"Search completed: best={result['best_node']}, "
         f"{result['metric']}={float(result['best_score']):.8f}."
     )
+    print(f"Final output: {result['final_output']}")
     print(
-        "LLM token usage: "
-        f"input={usage['input_tokens']}, "
-        f"output={usage['output_tokens']}, "
-        f"total={usage['total_tokens']}"
+        f"Search accounting: new ideas={result['new_idea_budget_used']}/{args.budget}, "
+        f"free tuning attempts={result['tuning_attempts']}, "
+        f"completed implementations={result['completed_implementations']}."
     )
-    print(f"Results written to {result['results_file']}")
-    print(f"Token usage report written to {result['token_report']}")
+    print(f"LLM tokens: input={usage['input_tokens']}, output={usage['output_tokens']}")
+    print(f"Results: {result['results_file']}")
+    print(f"Tree state: {result['tree_state']}")
+    print(f"Token usage: {result['token_report']}")
+    print(f"Method tree: {result['method_tree']}")
 
 
 if __name__ == "__main__":

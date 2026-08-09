@@ -1,756 +1,376 @@
+"""LLM planning for direct task implementations."""
+
 from __future__ import annotations
 
-import json
-import os
 import re
-from pathlib import Path
-from typing import List, Dict, Any
-from .llm_utils import call_llm, call_llm_json
-from .web_search import search_web
-from memory_pool.query_tool import query
-from .strategy_patterns import render_strategy_patterns, strategy_patterns
+import json
+from typing import Any
+from .llm_utils import call_llm
+from .task_analyzer import TaskAnalysis
+
 
 class TechniqueAgent:
-    def __init__(
-        self,
-        model_name: str = None,
-        max_l1_categories: int = 8,
-        max_artifact_candidates: int = 5,
-    ):
+    def __init__(self, model_name: str | None = None) -> None:
         self.model_name = model_name
-        self.max_l1_categories = max(1, int(max_l1_categories))
-        self.max_artifact_candidates = max(1, int(max_artifact_candidates))
-        self.dataset_directives: tuple[str, ...] = ()
-        self.task_evidence = ""
-
-    def set_task_evidence(self, evidence: object) -> None:
-        """Provide the verified, content-first task inspection to planning."""
-        if isinstance(evidence, str):
-            rendered = evidence
-        else:
-            rendered = json.dumps(evidence, indent=2, sort_keys=True, default=str)
-        self.task_evidence = rendered.strip()[:60_000]
-
-    def set_dataset_directives(self, directives: object) -> None:
-        """Set task-local, analyzer-derived evidence for planning prompts."""
-        if not isinstance(directives, (list, tuple)):
-            self.dataset_directives = ()
-            return
-        self.dataset_directives = tuple(
-            str(item).strip() for item in directives if str(item).strip()
-        )
-
-    def _dataset_directive_prompt(self) -> str:
-        directives = getattr(self, "dataset_directives", ())
-        if not directives:
-            return "- No synthesized dataset directive was available."
-        return "\n".join(f"- {item}" for item in directives)
-
-    def generate_initial_approaches(
-        self, task_description: str, count: int = 3
-    ) -> List[Dict[str, str]]:
-        """
-        Suggests a budget-aware number of distinct full modeling approaches.
-        Returns a list of dicts: [{'name': '...', 'plan': '...'}]
-        """
-        count = max(1, min(3, int(count)))
-        print(
-            f"TechniqueAgent: Generating {count} dynamic initial approaches "
-            "based on task description..."
-        )
-        system_prompt = (
-            "You are the Technique Agent. Given a machine learning task description, think from first principles "
-            f"and propose {count} distinct, promising, and tailored full modeling approaches (branches) "
-            "that make sense for this specific task.\n"
-            "CRITICAL PIPELINE-HYPOTHESIS CONTRACT:\n"
-            "- Branch on distinct data representation, feature engineering, robustness, or training hypotheses—not model-family names alone.\n"
-            "- Two branches may use the same strong estimator only when they test meaningfully different leakage-safe pipelines.\n"
-            "- Each branch must name the diagnostic evidence that would justify its encodings, interactions, clipping, selection, augmentation, or regularization.\n"
-            "- Include a model family as one component of the complete pipeline, not as the branch's entire idea.\n"
-            f"Respond ONLY with a valid JSON list of {count} dictionaries. Each dictionary must have two keys:\n"
-            "1. 'name': A short camel_case or snake_case name describing the "
-            "model family and representation strategy.\n"
-            "2. 'plan': A detailed description of the approach, serving as a strategic direction for the technique selection.\n"
-            "Do not reuse stock branch labels like Branch_A_Ensembling, Branch_B_Features, or Branch_C_DeepLearning. "
-            "Each root branch must specify a complete pipeline or model family, not a standalone scaler, encoder, imputer, or CV utility. "
-            "The branches must be task-specific, complementary, and directly implementable. "
-            "Avoid superficial hyperparameter-only variants. Prefer complementary error profiles and robust pipeline controls.\n"
-            "Reusable design principles:\n"
-            f"{render_strategy_patterns({})}\n"
-            "AUTHORITATIVE DATASET-DIAGNOSTIC DIRECTIVES:\n"
-            f"{self._dataset_directive_prompt()}\n"
-            "VERIFIED TASK-DIRECTORY EVIDENCE:\n"
-            f"{self.task_evidence or '- No verified task evidence was supplied.'}\n"
-            "First reconcile the task narrative with the observed files, content "
-            "signatures, table previews, and cross-file relationships. Every "
-            "branch must cite concrete evidence from this inspection. Do not "
-            "assume conventional filenames, a predefined data family, scalar "
-            "targets, or a particular prediction shape.\n"
-            "Use these as evidence for branch design while keeping every "
-            "learned operation leakage-safe.\n"
-            "Do not include any explanation or markdown formatting, just the raw JSON list."
-        )
-        user_prompt = (
-            f"Task Description:\n{task_description}\n\n"
-            f"Propose the {count} best approaches in JSON format."
-        )
-        response = call_llm_json(
-            system_prompt,
-            user_prompt,
-            model=self.model_name,
-            schema_name="initial_pipeline_approaches",
-            schema={
-                "type": "array",
-                "minItems": count,
-                "maxItems": count,
-                "items": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "required": ["name", "plan"],
-                    "properties": {
-                        "name": {"type": "string"},
-                        "plan": {"type": "string"},
-                    },
-                },
-            },
-        )
-        return self._parse_initial_approaches(response, count)
-
-    def _parse_initial_approaches(
-        self, response: object, expected_count: int = 3
-    ) -> List[Dict[str, str]]:
-        """Parse and validate the LLM-authored initial branch ideas."""
-        if isinstance(response, str) and "```json" in response:
-            payload = json.loads(
-                response.split("```json", 1)[1].split("```", 1)[0].strip()
-            )
-        elif isinstance(response, str) and "```" in response:
-            payload = json.loads(
-                response.split("```", 1)[1].split("```", 1)[0].strip()
-            )
-        elif isinstance(response, str):
-            payload = json.loads(response.strip())
-        else:
-            payload = response
-        approaches = payload
-        if not isinstance(approaches, list) or len(approaches) != expected_count:
-            raise ValueError(
-                f"expected a JSON list with exactly {expected_count} approaches"
-            )
-
-        valid_approaches = []
-        seen_names = set()
-        for idx, app in enumerate(approaches, start=1):
-            if not isinstance(app, dict):
-                raise ValueError(f"approach {idx} is not a dictionary")
-            name = str(app.get("name", "")).strip()
-            plan = str(app.get("plan", "")).strip()
-            if not name or not plan:
-                raise ValueError(f"approach {idx} must include non-empty name and plan")
-
-            normalized_name = re.sub(r"[^a-zA-Z0-9_]+", "_", name).strip("_").lower()
-            if not normalized_name:
-                normalized_name = f"llm_branch_{idx}"
-            if normalized_name in seen_names:
-                raise ValueError(f"duplicate branch name: {normalized_name}")
-            seen_names.add(normalized_name)
-
-            valid_approaches.append({"name": normalized_name, "plan": plan})
-
-        return valid_approaches
-
-    def generate_follow_up_approach(
-        self,
-        operator: str,
-        task_description: str,
-        parent_code: str,
-        parent_result: dict,
-        global_memory_context: dict,
-    ) -> Dict[str, Any]:
-        """Materialize one previously scheduled operator slot on demand."""
-        if operator not in {"refine", "tune", "diversify"}:
-            raise ValueError(f"unsupported lazy operator: {operator!r}")
-        instructions = {
-            "refine": (
-                "Use the parent's error_analysis to change the one data, "
-                "feature, calibration, or model component most likely to fix "
-                "the observed residual/error bucket; preserve the rest."
-            ),
-            "tune": (
-                "Keep the complete pipeline and define a compact pruned "
-                "search only when measured evidence supports tuning."
-            ),
-            "diversify": (
-                "Target a complementary representation or robustness "
-                "hypothesis whose errors should be less correlated with the "
-                "parent; a different model family alone is insufficient."
-            ),
-        }
-        user_prompt = (
-            f"Task:\n{task_description}\n\n"
-            f"Selected operator: {operator}\n"
-            f"Operator contract: {instructions[operator]}\n\n"
-            f"Parent result:\n{json.dumps(parent_result or {}, indent=2, default=str)}\n\n"
-            f"Relevant prior experiments:\n"
-            f"{json.dumps(global_memory_context or {}, indent=2, default=str)}\n\n"
-            f"Parent code:\n```python\n{parent_code}\n```\n"
-        )
-        item = call_llm_json(
-            "You are an ML search-policy agent. Materialize exactly one already-selected "
-            "operator into a concrete task-specific experiment. Return ONLY one JSON object "
-            "with fields name, plan, operator, priority. Priority must be numeric in [-0.1, 0.1].\n"
-            "AUTHORITATIVE DATASET-DIAGNOSTIC DIRECTIVES:\n"
-            f"{self._dataset_directive_prompt()}\n"
-            "VERIFIED TASK-DIRECTORY EVIDENCE:\n"
-            f"{self.task_evidence or '- No verified task evidence was supplied.'}\n",
-            user_prompt,
-            model=self.model_name,
-            schema_name="follow_up_approach",
-            schema={
-                "type": "object",
-                "additionalProperties": False,
-                "required": ["name", "plan", "operator", "priority"],
-                "properties": {
-                    "name": {"type": "string"},
-                    "plan": {"type": "string"},
-                    "operator": {"type": "string", "enum": [operator]},
-                    "priority": {"type": "number"},
-                },
-            },
-        )
-        if not isinstance(item, dict) or item.get("operator") != operator:
-            raise ValueError("lazy proposal did not preserve the selected operator")
-        name = re.sub(
-            r"[^a-zA-Z0-9_]+", "_", str(item.get("name", "")).strip()
-        ).strip("_").lower()
-        plan = str(item.get("plan", "")).strip()
-        if not name or not plan:
-            raise ValueError("lazy proposal is incomplete")
-        try:
-            priority = max(-0.1, min(0.1, float(item.get("priority", 0.0))))
-        except (TypeError, ValueError):
-            priority = 0.0
-        return {"name": name, "plan": plan, "operator": operator, "priority": priority}
 
     @staticmethod
-    def _terms(text: str) -> set[str]:
-        return {
-            token
-            for token in re.findall(r"[a-z0-9]+", str(text).lower())
-            if len(token) > 2 or token.isdigit()
-        }
+    def _parse_plans(response: str, count: int) -> list[str]:
+        cleaned = re.sub(r"(?s)<thinking>.*?</thinking>", "", response).strip()
+        chunks = re.split(r"(?im)^\s*(?:PLAN\s*\d*|\d+[.)])\s*[:.-]?\s*", cleaned)
+        plans = [" ".join(chunk.split()) for chunk in chunks if len(chunk.split()) >= 8]
+        if not plans and cleaned.strip():
+            plans = [" ".join(cleaned.split())]
+        unique: list[str] = []
+        for plan in plans:
+            if plan not in unique:
+                unique.append(plan[:4000])
+        return unique[:count]
 
-    def _prefilter_l1(self, l1_index: dict, query_text: str) -> dict:
-        """Bound L1 prompt growth using deterministic lexical relevance."""
-        query_terms = self._terms(query_text)
-        ranked = []
-        for position, (category, details) in enumerate(l1_index.items()):
-            category_terms = self._terms(
-                category.replace("_", " ") + " " + details.get("description", "")
+    def search_for_new_ideas(self, analysis: TaskAnalysis, query_extra: str = "") -> str:
+        """Query web search for competitive ML strategies and novel literature ideas tailored to this task."""
+        try:
+            from .web_search import search_web
+            prompt = (
+                f"{analysis.prompt_context(4000)}\n\n"
+                "Based on the task description and data properties above, formulate a highly effective "
+                "web search query to find state-of-the-art machine learning architectures, novel literature, "
+                f"or general ML strategies specific to this problem type. The target metric is {analysis.metric}.\n"
+                f"Additional context: {query_extra}\n\n"
+                "CRITICAL ANTI-PLAGIARISM RULE: Do NOT search for 'Kaggle winning solutions', 'notebooks', or exact answers for this specific dataset. "
+                "Search ONLY for general ML techniques, architectures, or strategies that apply to this modality.\n\n"
+                "Return ONLY the exact search query string to use, without quotes, explanations, or introductory text. Keep it concise (under 150 characters)."
             )
-            overlap = len(query_terms & category_terms)
-            ranked.append((overlap, -position, category, details))
-        ranked.sort(reverse=True)
-        return {
-            category: details
-            for _, _, category, details in ranked[: self.max_l1_categories]
-        }
-
-    def _artifact_prior(
-        self,
-        candidate: dict,
-        branch_plan: str,
-        preferred_accelerator: str = "cpu",
-    ) -> float:
-        """Rank immutable strategy metadata without task-run evidence."""
-        branch_terms = self._terms(branch_plan)
-        artifact_terms = self._terms(
-            " ".join(
-                [
-                    candidate.get("artifact_id", ""),
-                    candidate.get("category", ""),
-                    candidate.get("description", ""),
-                    json.dumps(candidate.get("interface", {})),
-                ]
-            ).replace("_", " ")
-        )
-        lexical = len(branch_terms & artifact_terms) / max(len(branch_terms), 1)
-        capabilities = candidate.get("capabilities") or {}
-        raw_supported_accelerators = capabilities.get("supported_accelerators") or []
-        if not isinstance(raw_supported_accelerators, (list, tuple, set)):
-            raw_supported_accelerators = []
-        supported_accelerators = {
-            str(item).lower()
-            for item in raw_supported_accelerators
-        }
-        gpu_bonus = 0.0
-        if (
-            preferred_accelerator in {"cuda", "mps"}
-            and capabilities.get("gpu_accelerated") is True
-            and (
-                not supported_accelerators
-                or preferred_accelerator in supported_accelerators
-            )
-        ):
-            gpu_bonus = 0.12
-        return lexical + gpu_bonus
-
-    def generate_follow_up_approaches(
-        self,
-        task_description: str,
-        parent_code: str,
-        parent_result: dict,
-        global_memory_context: dict,
-    ) -> List[Dict[str, Any]]:
-        """Generate a small operator portfolio for measured candidate evolution."""
-        system_prompt = (
-            "You are an ML search-policy agent. Given a working parent pipeline and its measured result, "
-            "propose exactly three complementary child experiments. Return ONLY a JSON list. The three "
-            "operators must be exactly: 'refine', 'tune', and 'diversify'.\n"
-            "- refine: use parent error_analysis to change the highest-impact representation, feature, calibration, or model block while preserving the rest.\n"
-            "- tune: keep the architecture and use Optuna-style pruning or a compact search space.\n"
-            "- diversify: target a complementary data representation or robustness hypothesis likely to reduce the parent's measured error buckets; changing only the model-family label is insufficient.\n"
-            "PIPELINE EVIDENCE CONTRACT: Every refine/diversify plan must cite a concrete parent residual, confidence, class, or error bucket when error_analysis is available.\n"
-            "Each item must have non-empty 'name', 'plan', 'operator', and numeric 'priority' in [-0.1, 0.1]. "
-            "Plans must be concrete, task-specific, leakage-safe, and directly executable.\n"
-            "AUTHORITATIVE DATASET-DIAGNOSTIC DIRECTIVES:\n"
-            f"{self._dataset_directive_prompt()}\n"
-        )
-        user_prompt = f"""
-Task:
-{task_description}
-
-Parent result:
-{json.dumps(parent_result or {}, indent=2, default=str)}
-
-Relevant prior experiments:
-{json.dumps(global_memory_context or {}, indent=2, default=str)}
-
-Parent code:
-```python
-{parent_code}
-```
-
-Return the three child experiments as JSON only.
-"""
-        response = call_llm_json(
-            system_prompt,
-            user_prompt,
-            model=self.model_name,
-            schema_name="follow_up_portfolio",
-            schema={
-                "type": "array",
-                "minItems": 3,
-                "maxItems": 3,
-                "items": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "required": ["name", "plan", "operator", "priority"],
-                    "properties": {
-                        "name": {"type": "string"},
-                        "plan": {"type": "string"},
-                        "operator": {
-                            "type": "string",
-                            "enum": ["refine", "tune", "diversify"],
-                        },
-                        "priority": {"type": "number"},
-                    },
-                },
-            },
-        )
-        return self._parse_follow_up_approaches(response)
-
-    def _parse_follow_up_approaches(self, response: object) -> List[Dict[str, Any]]:
-        if isinstance(response, str) and "```json" in response:
-            payload = json.loads(
-                response.split("```json", 1)[1].split("```", 1)[0].strip()
-            )
-        elif isinstance(response, str) and "```" in response:
-            payload = json.loads(
-                response.split("```", 1)[1].split("```", 1)[0].strip()
-            )
-        elif isinstance(response, str):
-            payload = json.loads(response.strip())
-        else:
-            payload = response
-        approaches = payload
-        if not isinstance(approaches, list) or len(approaches) != 3:
-            raise ValueError("expected exactly three follow-up approaches")
-        required_operators = {"refine", "tune", "diversify"}
-        actual_operators = {str(item.get("operator", "")).strip() for item in approaches}
-        if actual_operators != required_operators:
-            raise ValueError("follow-up operators must be refine, tune, and diversify")
-        result = []
-        for index, item in enumerate(approaches, start=1):
-            name = re.sub(
-                r"[^a-zA-Z0-9_]+", "_", str(item.get("name", "")).strip()
-            ).strip("_").lower()
-            plan = str(item.get("plan", "")).strip()
-            operator = str(item["operator"]).strip()
-            if not name or not plan:
-                raise ValueError(f"follow-up approach {index} is incomplete")
-            try:
-                priority = max(-0.1, min(0.1, float(item.get("priority", 0.0))))
-            except (TypeError, ValueError):
-                priority = 0.0
-            result.append(
-                {"name": name, "plan": plan, "operator": operator, "priority": priority}
-            )
-        return result
-
-    def run(
-        self,
-        task_description: str,
-        branch_plan: str,
-        global_memory_context: dict,
-        l1_index: dict,
-        allowed_scopes: set[str] | None = None,
-        available_accelerators: set[str] | None = None,
-        preferred_accelerator: str = "cpu",
-        excluded_artifact_ids: set[str] | None = None,
-        available_dependencies: set[str] | None = None,
-        task_spec: dict | None = None,
-        enable_executable_artifacts: bool | None = None,
-    ) -> Dict[str, Any]:
-        """
-        1. Decides if relevant techniques are in the Memory Pool.
-        2. If not, searches the web, pulls new technique info, and flags for L2 build.
-        
-        Args:
-            task_description: Clean task description for web search queries (no internal bias)
-            branch_plan: Internal branch strategy/bias for L1 category selection only
-            global_memory_context: Sibling/parent context from GlobalMemory
-            l1_index: The L1 category index
-        """
-        if enable_executable_artifacts is None:
-            enable_executable_artifacts = (
-                os.environ.get(
-                    "METHOD_TREE_ENABLE_EXECUTABLE_ARTIFACTS", "0"
-                )
-                == "1"
-            )
-        task_spec = dict(task_spec or {})
-        excluded_artifact_ids = {
-            str(item) for item in (excluded_artifact_ids or set()) if item
-        }
-        if not enable_executable_artifacts:
-            patterns = strategy_patterns(task_spec)
-            return {
-                "status": "strategy_only",
-                "plan": (
-                    f"Implement this branch as clean task-specific code: "
-                    f"{branch_plan}\n\nApply only diagnostically justified "
-                    "robust design patterns:\n- " + "\n- ".join(patterns)
-                ),
-                "strategy_patterns": patterns,
-                "artifact_execution": "disabled",
-            }
-
-        use_pool = True
-        if not use_pool or not l1_index:
-            print("TechniqueAgent: Memory pool disabled or empty. Generating a new technique outline.")
-            return self._bootstrap_from_web(
-                task_description,
-                branch_plan,
-                available_dependencies=available_dependencies,
-            )
-
-        # Use both the branch direction and measured lineage context. The latter
-        # prevents repeating failed sibling experiments and enables evidence-based reuse.
-        system_prompt = (
-            "You are the Technique Agent. Given the strategic direction below, select the 1-2 MOST RELEVANT "
-            "categories from the list that align with this direction.\n"
-            "CONSTRAINTS:\n"
-            "- Select AT MOST 2 categories.\n"
-            "- Do NOT select all categories. Focus only on what the strategic direction calls for.\n"
-            "- Output ONLY a comma-separated list of category names from the available list. No explanation."
-        )
-        
-        visible_l1 = self._prefilter_l1(
-            l1_index,
-            task_description
-            + "\n"
-            + branch_plan
-            + "\n"
-            + self.task_evidence[:10_000],
-        )
-        l1_summary = ""
-        for cat, details in visible_l1.items():
-            l1_summary += f"- {cat}: {details['description']}\n"
+            query = call_llm(
+                "You are an expert Machine Learning Researcher formulating web search queries.",
+                prompt,
+                model=self.model_name,
+                temperature=0.2,
+            ).strip().strip('"\',.')
             
-        user_prompt = f"""
-Strategic Direction:
-{branch_plan}
+            query = query[:150].strip()
+            print(f"TechniqueAgent: LLM generated web search query: '{query}'...", flush=True)
+            results = search_web(query)
+            if not results:
+                fallback = f"{analysis.task_name} machine learning competitive approaches {analysis.metric}"[:150].strip()
+                print(f"TechniqueAgent: Fallback web search: '{fallback}'...", flush=True)
+                results = search_web(fallback)
+            return results
+        except Exception as exc:
+            print(f"TechniqueAgent: Web search call failed: {exc}", flush=True)
+            return ""
 
-Measured Parent/Sibling Context:
-{json.dumps(global_memory_context or {}, indent=2, default=str)}
+    def generate_initial_approaches(
+        self,
+        analysis: TaskAnalysis,
+        count: int = 3,
+    ) -> list[str]:
+        """Ask once for several materially different implementation plans with distinct model families."""
+        count = max(1, int(count))
+        print(f"TechniqueAgent: Requesting {count} initial implementation plans (distinct model families).", flush=True)
+        
+        web_insights = self.search_for_new_ideas(analysis)
+        web_section = f"\nWeb Search Literature & Solution Insights:\n{web_insights[:3000]}\n" if web_insights else ""
 
-Verified Task Evidence:
-{self.task_evidence or '- No verified evidence was supplied.'}
+        prompt = (
+            f"{analysis.prompt_context(14000)}\n"
+            f"{web_section}\n"
+            "CRITICAL REASONING & PLANNING INSTRUCTIONS:\n\n"
+            "1. THINK BEFORE YOU DECIDE:\n"
+            "   Begin your response with a <thinking> ... </thinking> block where you step-by-step:\n"
+            f"   a. Task & Resource Inspection: Analyze the task goal, score metric ({analysis.metric} {analysis.direction}), expected output deliverable, and observed files. Do NOT assume hardcoded file names, columns, or schemas—inspect actual resources dynamically from `input/`.\n"
+            "   b. Data Modality & Architecture Suitability: Inspect the observed data modalities (tabular, vision, text, audio, etc.). Consider BOTH simple foundational algorithms (e.g., Logistic Regression, SVM, Naive Bayes) and complex SOTA architectures (e.g., custom PyTorch, GBDT). Simple baselines can often outperform complex models.\n"
+            "   c. Novel & Task-Tailored Techniques: Where appropriate, think through domain-specific data augmentations, metric-aligned loss functions, and specialized feature representations.\n"
+            "   d. Model Size & Complexity vs Customization: Note that smaller/lighter custom architectures with tailored modules, custom augmentations, or domain features often outperform heavy generic off-the-shelf pre-trained models. Reason through the right tradeoff for this dataset.\n"
+            f"   e. Architecture Progression: PLAN 1 MUST be a fast, simple foundational baseline model that are applicable to the given task to establish a strong baseline score. Subsequent plans (PLAN 2, etc.) should progressively move to more complex or SOTA architectures (e.g., tree-based ensembles, neural networks) if applicable.\n\n"
+            "2. PROPOSAL REQUIREMENTS:\n"
+            f"   Propose {count} executable approaches for this task. Each approach must explain how to load observed paths dynamically from input/, build an honest local validation score matching {analysis.metric} ({analysis.direction}), fit/train, tune, and write the requested deliverable.\n"
+            "   STRICT REQUIREMENT: Use a materially DIFFERENT model family / algorithm in each plan. "
+            "DO NOT repeat the same model family across plans. Return sections labelled "
+            "PLAN 1:, PLAN 2:, and so on, preceded by your <thinking> ... </thinking> block."
+        )
+        try:
+            response = call_llm(
+                "You are an expert AI Machine Learning Architect. You inspect task resources thoroughly, reason step-by-step, and design competitive SOTA implementations tailored to observed data modalities.",
+                prompt,
+                model=self.model_name,
+                temperature=0.25,
+            )
+            plans = self._parse_plans(response, count)
+            print(f"TechniqueAgent: Parsed {len(plans)} plans from the LLM response.", flush=True)
+        except Exception as exc:
+            print(f"TechniqueAgent: planning call failed; using resilient defaults: {exc}")
+            plans = []
 
-Verified Task Evidence:
-{self.task_evidence or '- No verified evidence was supplied.'}
-
-Execution Resources:
-Available accelerators: {sorted(available_accelerators or {'cpu'})}
-Preferred accelerator: {preferred_accelerator}
-
-Available Categories:
-{l1_summary}
-
-Which 1-2 categories best match the strategic direction? Output a comma-separated list.
-"""
-        response = call_llm(system_prompt, user_prompt, model=self.model_name).strip()
-        selected_categories = [
-            c.strip() for c in response.split(",") if c.strip() in visible_l1
+        defaults = [
+            (
+                "Build a dependable baseline after inspecting the listed inputs at runtime. "
+                "Use a task-appropriate preprocessing pipeline, a robust conventional model "
+                "or algorithm, honest local validation/proxy scoring, and emit the exact sample format."
+            ),
+            (
+                "Implement a second, materially different algorithm suitable for the observed data. "
+                "Tune a small high-impact parameter set with deterministic splits or a transparent "
+                "unsupervised proxy, refit on all useful data, and write the exact requested output."
+            ),
+            (
+                "Use an efficient representation or feature pipeline tailored to the actual file "
+                "contents, compare a compact set of model settings, retain the strongest local result, "
+                "and generate the submission directly from that implementation."
+            ),
         ]
-        
-        # Bug 4: Limit to max 2 categories even if LLM returns more
-        selected_categories = selected_categories[:2]
-        
-        if not selected_categories:
-            print("TechniqueAgent: No valid L1 category matched the branch plan. Initiating web search...")
-            return self._bootstrap_from_web(
-                task_description,
-                branch_plan,
-                available_dependencies=available_dependencies,
+        for default in defaults:
+            if len(plans) >= count:
+                break
+            plans.append(
+                default
+                + f" Use one deterministic local estimate of {analysis.metric} ({analysis.direction}) "
+                "across every approach; if the official score is hidden, use the same deterministic "
+                "stability/holdout proxy in every node."
             )
-            
-        print(f"TechniqueAgent: Selected L1 categories: {selected_categories} (for branch: {branch_plan[:60]}...)")
-        
-        # Query L1 categories to get L2 candidates
-        l2_candidates = []
-        for cat in selected_categories:
-            res = query(cat)
-            verified_artifacts = [
-                artifact for artifact in res.get("artifacts", [])
-                if artifact.get("verified") is True
-                and artifact.get("artifact_id") not in excluded_artifact_ids
-                and (
-                    not allowed_scopes
-                    or artifact.get("scope") in allowed_scopes
-                )
-            ]
-            l2_candidates.extend(verified_artifacts)
+        return plans[:count]
 
-        for candidate in l2_candidates:
-            candidate["retrieval_prior"] = self._artifact_prior(
-                candidate,
-                branch_plan,
-                preferred_accelerator=preferred_accelerator,
-            )
-        l2_candidates.sort(
-            key=lambda item: item.get("retrieval_prior", 0.0), reverse=True
-        )
-        l2_candidates = l2_candidates[: self.max_artifact_candidates]
-            
-        system_prompt = (
-            "You are the Technique Agent. Evaluate if any candidate artifact is a high-quality match for the task requirements. "
-            "Default to novelty unless a pool artifact is a strong, direct fit.\n"
-            "Choose an artifact ONLY if it satisfies ALL checks:\n"
-            "1. It directly implements the branch direction rather than merely belonging to the same broad category.\n"
-            "2. Its concrete callable interface can consume the verified runtime "
-            "values and produce the required output without inventing a loader, "
-            "target, or prediction shape. Category labels are not evidence.\n"
-            "3. It is more useful than generating a tailored technique for this branch.\n"
-            "If any check is uncertain, output ONLY 'web_search'.\n"
-            "If one artifact clearly passes all checks, output ONLY its artifact_id."
-        )
-        
-        candidates_str = ""
-        for cand in l2_candidates:
-            if "error" not in cand:
-                candidates_str += (
-                    f"- ID: {cand['artifact_id']} (Category: {cand['category']}): "
-                    f"{cand['description']} | scope={cand.get('scope')} | "
-                    f"retrieval_prior={cand.get('retrieval_prior', 0.0):.4f} | "
-                    f"resources={json.dumps(cand.get('resource_profile', {}))} | "
-                    f"capabilities={json.dumps(cand.get('capabilities', {}))} | "
-                    f"pitfalls={cand.get('known_pitfalls', [])}\n"
-                )
-        
-        # If no candidates exist at all, skip LLM call and go straight to web search
-        if not candidates_str.strip():
-            decision = "web_search"
-        else:
-            user_prompt = f"""
-Task Description:
-{task_description}
-
-Strategic Direction:
-{branch_plan}
-
-Measured Parent/Sibling Context:
-{json.dumps(global_memory_context or {}, indent=2, default=str)}
-
-Artifacts excluded by the search operator:
-{sorted(excluded_artifact_ids)}
-
-Candidate Artifacts in Memory Pool:
-{candidates_str}
-
-Decide: Output either one artifact_id from the list, or 'web_search'.
-"""
-            decision = call_llm(system_prompt, user_prompt, model=self.model_name).strip()
-        
-        # Check if decision matches an existing candidate
-        matching_cand = [c for c in l2_candidates if c.get("artifact_id") == decision]
-        
-        if matching_cand:
-            # Memory Pool Hit
-            selected_candidate = matching_cand[0]
-            artifact_id = selected_candidate["artifact_id"]
-            cat = selected_candidate["category"]
-            card = query(cat, artifact_id)
-            print(f"TechniqueAgent: Memory Pool Hit: {artifact_id}")
-            return {
-                "status": "pool_hit",
-                "artifact_id": artifact_id,
-                "category": cat,
-                "scope": selected_candidate.get("scope"),
-                "retrieval_prior": selected_candidate.get("retrieval_prior"),
-                "plan": f"Use memory pool artifact {artifact_id} from category {cat}.",
-                "model_card": card
-            }
-        else:
-            # Memory Pool Miss -> Web Search
-            print("TechniqueAgent: Memory Pool Miss. Initiating web search...")
-            return self._bootstrap_from_web(
-                task_description,
-                branch_plan,
-                available_dependencies=available_dependencies,
-            )
-
-    def _bootstrap_from_web(
+    def propose_tuning(
         self,
-        task_description: str,
-        branch_plan: str,
-        available_dependencies: set[str] | None = None,
-        modality: str | None = None,
-    ) -> Dict[str, Any]:
-        """Searches or synthesizes a new technique outline for later L2 building."""
-        query_prompt_sys = (
-            "You are an ML research scientist. Write a short, precise web search query "
-            "to find machine learning techniques, objective functions, or "
-            "architectures suitable for the verified task evidence and planned "
-            "technique. Do not add a data-family label that is not established "
-            "by the observed files.\n"
-            "CRITICAL: Do NOT include Kaggle file names (like 'train.csv', 'test.csv', 'sample_submission.csv') or generic words like 'notebook'. "
-            "Query for scientific methodologies, architectures, or specific algorithms.\n"
-            "Output ONLY the search query string, nothing else."
+        analysis: TaskAnalysis,
+        plan: str,
+        score: float,
+        diagnostics: str = "",
+    ) -> str:
+        """Turn a successful implementation into one focused improvement plan."""
+        print(f"TechniqueAgent: Requesting focused tuning for score {score}.", flush=True)
+        prompt = (
+            f"{analysis.prompt_context(10000)}\n\n"
+            f"Current plan:\n{plan[:5000]}\n\n"
+            f"Current local score: {score} ({analysis.direction}).\n"
+            f"Run notes:\n{diagnostics[-3000:]}\n\n"
+            "CRITICAL REASONING INSTRUCTIONS:\n\n"
+            "1. THINK BEFORE YOU DECIDE:\n"
+            "   Begin your response with a <thinking> ... </thinking> block where you step-by-step:\n"
+            "   a. Evaluate the current plan, local score, and execution diagnostics.\n"
+            "   b. Model Suitability & Performance Assessment: Verify if this current model architecture actually suits the task given and data properties. Assess whether focused tuning (hyperparameters, layer depth, feature engineering/scaling, regularization) will realistically improve validation performance.\n"
+            "   c. Determine the highest-leverage tuning changes without switching the core algorithm family.\n\n"
+            "2. PROPOSAL:\n"
+            "   Propose one focused improvement to this working model: tune hyperparameter settings, add feature engineering/scaling modules, or tune layer structure. Preserve the core algorithm, working data paths, and output behavior. Return the revised implementation plan after your <thinking> block."
         )
-        query_prompt_user = (
-            f"Task Description:\n{task_description}\n\n"
-            f"Planned Technique to Implement:\n{branch_plan}\n\n"
-            "Verified Task Evidence:\n"
-            f"{self.task_evidence or '- No verified evidence was supplied.'}\n\n"
-            "Write only the query string."
-        )
-        query_error = None
         try:
-            search_query = (
-                call_llm(
-                    query_prompt_sys,
-                    query_prompt_user,
-                    model=self.model_name,
-                )
-                .strip()
-                .replace('"', '')
+            response = call_llm(
+                "You are an expert AI ML Optimization Engineer improving working models without destabilizing them.",
+                prompt,
+                model=self.model_name,
+                temperature=0.15,
             )
+            cleaned = re.sub(r"(?s)<thinking>.*?</thinking>", "", response).strip()
+            return cleaned[:6000]
         except Exception as exc:
-            # Query generation is optional planning work. Provider-side parser
-            # errors must not destroy the whole branch; derive a bounded query
-            # deterministically and continue.
-            query_error = str(exc)
-            search_query = " ".join(
-                (branch_plan or task_description or "robust machine learning method")
-                .replace("\n", " ")
-                .split()
-            )[:240]
-            print(
-                "TechniqueAgent WARNING: LLM query generation failed; using "
-                f"deterministic query fallback: {query_error[-500:]}"
-            )
+            return (
+                f"Keep the working implementation described here: {plan}. Perform a small, "
+                f"bounded hyperparameter search around its current values and retain the best "
+                f"local setting. Planning service note: {exc}"
+            )[:6000]
 
-        print(f"TechniqueAgent: Running web search for query: '{search_query}'")
-        search_results = search_web(search_query)
+    def propose_follow_up(
+        self,
+        analysis: TaskAnalysis,
+        operator: str,
+        parent_plan: str,
+        score: float,
+        diagnostics: str = "",
+        search_context: str = "",
+    ) -> str:
+        """Materialize one score-selected refinement or diversity action."""
+        if operator not in {"refine", "diversify"}:
+            raise ValueError(f"unsupported follow-up operator: {operator!r}")
 
-        if not search_results or "error" in search_results:
-            print("Web search failed or blocked. Using LLM internal knowledge fallback...")
-            search_results = (
-                "No web pages returned. Fallback to LLM internal knowledge base. "
-                "Provide a robust, original ML technique tailored to the "
-                "verified files and planned technique."
-            )
+        web_insights = ""
+        if operator == "diversify":
+            web_insights = self.search_for_new_ideas(analysis)
 
-        build_prompt_sys = (
-            "You are the Technique Agent. Review the search results and outline "
-            "ONE new reusable ML technique "
-            "we should implement. The technique MUST faithfully implement the Planned Technique below. "
-            "Do not substitute a different model family merely because it appears in the search results; "
-            "the search results are supporting evidence, not permission to replace the branch. "
-            "It should be meaningfully different from generic memory-pool defaults when possible. "
-            "Use only the explicitly available third-party distributions listed by the user. If the "
-            "planned technique normally uses an unavailable convenience package, implement its core "
-            "mechanism with an available lower-level framework when feasible and state that choice. "
-            "Never declare or import an unavailable package. "
-            "Provide: 1) Chosen Category, 2) a unique artifact_id (lowercase_underscores), "
-            "3) a description, 4) the raw python code implementing it, 5) the interface entrypoint."
+        web_section = f"\n\nWeb Search Discovery Insights:\n{web_insights}" if web_insights else ""
+
+        guidance = {
+            "refine": (
+                "Preserve the working pipeline and change only the highest-impact feature, "
+                "representation, calibration, regularization, or model module suggested by "
+                "the measured run. Include an explicit local comparison with the parent."
+            ),
+            "diversify": (
+                "Build a genuinely NEW and complementary representation or model family that HAS NOT "
+                "been attempted in previous runs. Use web search literature insights if available. Do NOT repeat "
+                "already executed model families. Preserve the same split, metric, input paths, and "
+                "output format so the result is directly comparable and mergeable."
+            ),
+        }
+        print(
+            f"TechniqueAgent: Materializing {operator} follow-up for score {score}.",
+            flush=True,
         )
-        dependency_text = ", ".join(
-            sorted(available_dependencies or set())
-        ) or "Python standard library only"
-        build_prompt_user = f"""
-Search Results:
-{search_results}
-
-Task Description:
-{task_description}
-
-Verified Task Evidence:
-{self.task_evidence or '- No verified evidence was supplied.'}
-
-Planned Technique:
-{branch_plan}
-
-Available Third-Party Distributions:
-{dependency_text}
-
-Outline the new technique and return the raw source logic for our builder.
-"""
+        prompt = (
+            f"{analysis.prompt_context(10000)}\n\n"
+            f"Measured parent plan:\n{parent_plan[:5000]}\n\n"
+            f"Parent local score: {score} ({analysis.direction}).\n"
+            f"Bounded execution notes:\n{diagnostics[-3000:]}\n\n"
+            f"Recent measured alternatives to avoid repeating:\n{search_context[-2000:]}"
+            f"{web_section}\n\n"
+            "CRITICAL REASONING INSTRUCTIONS:\n\n"
+            "1. THINK BEFORE YOU DECIDE:\n"
+            "   Begin your response with a <thinking> ... </thinking> block where you step-by-step:\n"
+            "   a. Analyze the parent plan's performance and diagnostics.\n"
+            "   b. For `refine`: Identify the highest-impact feature representation, calibration, or model tuning improvement.\n"
+            "   c. For `diversify`: Inspect web search literature insights for architectures suitable for this modality. Assess whether proposed new model families actually suit the task and will push validation score beyond current plateaus. Consider BOTH complex SOTA models and simple foundational models (like Logistic Regression or SVM) if they haven't been tried.\n"
+            "   d. Verify that no previously attempted model family (from the measured alternatives context) is repeated.\n\n"
+            f"2. Selected action: {operator}. {guidance[operator]}\n"
+            "   STRICT REQUIREMENT: DO NOT repeat model algorithms already tried. Return only one concrete revised implementation plan."
+        )
         try:
-            new_technique_outline = call_llm(
-                build_prompt_sys, build_prompt_user, model=self.model_name
+            response = call_llm(
+                "You are an expert AI ML Scientist materializing selected research experiments around measured baselines.",
+                prompt,
+                model=self.model_name,
+                temperature=0.15,
             )
+            cleaned = re.sub(r"(?s)<thinking>.*?</thinking>", "", response).strip()
+            if len(cleaned.split()) < 8:
+                raise ValueError("follow-up plan was empty or too short")
+            return cleaned[:6500]
         except Exception as exc:
-            # The implementation agent can still build a useful branch directly
-            # from the original plan using installed core libraries.
-            outline_error = str(exc)
-            print(
-                "TechniqueAgent WARNING: Web-outline generation failed; preserving "
-                "the branch as a self-contained implementation fallback."
+            return (
+                f"{guidance[operator]} Keep this exact measured parent as the control: "
+                f"{parent_plan}. Use a bounded deterministic comparison and retain the parent "
+                f"whenever the {operator} candidate does not improve. Planning note: {exc}"
+            )[:6500]
+
+    def propose_merge(
+        self,
+        analysis: TaskAnalysis,
+        first_plan: str,
+        second_plan: str,
+    ) -> str:
+        print("TechniqueAgent: Requesting a merge of two strong branches.", flush=True)
+        prompt = (
+            f"{analysis.prompt_context(9000)}\n\n"
+            f"Strong approach A:\n{first_plan[:3500]}\n\n"
+            f"Strong approach B:\n{second_plan[:3500]}\n\n"
+            "CRITICAL REASONING INSTRUCTIONS:\n\n"
+            "1. THINK BEFORE YOU DECIDE:\n"
+            "   Begin your response with a <thinking> ... </thinking> block where you step-by-step:\n"
+            "   a. Analyze the architectures, predictions, and validation scores of Parent A and Parent B.\n"
+            "   b. Assess whether combining them (via stacking, weighted blending, rank averaging, or feature concatenation) will yield a performance boost over the stronger parent.\n"
+            "   c. Design the exact executable merge pipeline.\n\n"
+            "2. PROPOSAL:\n"
+            "   Design one executable merge that combines complementary strengths. Include a local comparison against both parents and preserve exact output format."
+        )
+        try:
+            response = call_llm(
+                "You combine strong methods only when the merge has a credible performance benefit.",
+                prompt,
+                model=self.model_name,
+                temperature=0.15,
             )
-            return {
-                "status": "self_contained_fallback",
-                "artifact_id": None,
-                "category": "planning_fallback",
-                "plan": (
-                    "Implement the planned technique directly as a dependency-light, "
-                    "self-contained pipeline using only already importable project "
-                    f"libraries. Preserve this intent: {branch_plan}"
-                ),
-                "search_query": search_query,
-                "planning_error": outline_error,
-                "query_generation_error": query_error,
-            }
+            cleaned = re.sub(r"(?s)<thinking>.*?</thinking>", "", response).strip()
+            return cleaned[:7000]
+        except Exception:
+            return (
+                "Combine the two working approaches with a validation-selected blend or consensus, "
+                "falling back to the stronger parent if the merged local score does not improve."
+            )
+
+    def decide_next_step(
+        self,
+        analysis: TaskAnalysis,
+        nodes_history: list[dict[str, Any]],
+        best_node_id: str | None,
+        best_score: float | None,
+        experiments_remaining: int,
+    ) -> dict[str, Any]:
+        """
+        Analyze current tree search state and executed results, then use LLM to decide
+        the optimal next strategic step (merge, tune, refine, diversify, or finalize).
+        """
+        print(
+            f"TechniqueAgent: Evaluating {len(nodes_history)} executed nodes to decide next strategic action.",
+            flush=True,
+        )
+
+        history_lines = []
+        for n in nodes_history:
+            nid = n.get("node_id", "")
+            op = n.get("operator", "root")
+            ntype = n.get("node_type", "")
+            status = n.get("status", "")
+            score = n.get("score")
+            plan_summary = n.get("plan_summary", "")
+            is_best = " [BEST SCORE SO FAR]" if nid == best_node_id else ""
+            score_str = f"{score:.5f}" if score is not None else "failed"
+            history_lines.append(
+                f"- Node '{nid}' ({ntype}, operator='{op}', status='{status}'): score={score_str}{is_best}. Plan summary: {plan_summary}"
+            )
+
+        history_text = "\n".join(history_lines) if history_lines else "No executed nodes yet."
+
+        # Check if score progress has plateaued or if we need web search for fresh competitive ideas
+        recent_scores = [n.get("score") for n in nodes_history[-4:] if n.get("score") is not None]
+        plateaued = len(recent_scores) >= 2 and len(set(recent_scores)) <= 1
+
+        web_insights = ""
+        if plateaued or experiments_remaining <= 2:
+            web_insights = self.search_for_new_ideas(analysis)
+
+        web_section = f"\n# Web Search Discovery Insights for Task\n{web_insights}\n" if web_insights else ""
+
+        prompt = (
+            f"{analysis.prompt_context(10000)}\n\n"
+            f"# Execution History\n"
+            f"Metric: {analysis.metric} ({analysis.direction})\n"
+            f"Best Score so far: {best_score if best_score is not None else 'N/A'} (Node: {best_node_id})\n"
+            f"Remaining Main Ideas Budget: {experiments_remaining} (Tuning is FREE and does not consume main budget)\n\n"
+            f"Executed Nodes History:\n{history_text}\n"
+            f"{web_section}\n"
+            "# Manager Agent Decision Rules\n"
+            "1. THINK BEFORE YOU DECIDE: Analyze score progression across all executed nodes. Check if current model family has plateaued and if switching architectures (SOTA models, or even simple foundational baselines) or merging will boost score.\n"
+            "2. Model Suitability & Performance Assessment: Verify if fixing/tuning the current model actually suits the task or if switching architectures will improve performance.\n"
+            "3. STRICT ANTI-REPETITION: DO NOT repeat any model family, algorithm, or pipeline component that has already been attempted in previous nodes. Review the 'plan_summary' in Executed Nodes History carefully to identify what models have been used.\n"
+            "4. Tuning a node (hyperparameters, extra layers, or preprocessing) is FREE and does NOT deduct from the main budget.\n"
+            "5. If a tuned node fails to improve upon its parent score, it will be automatically stopped and pruned immediately to save budget for high-performing nodes.\n"
+            "6. If single-model tuning/refining plateaus or doesn't improve scores, select `merge` to combine two or more complementary strong nodes, or `diversify` using web search insights to try a genuinely novel model family (ranging from simple to complex).\n\n"
+            "Select the single best strategic action to execute next:\n"
+            "1. `merge`: Combine/blend/ensemble two or more top or complementary nodes (e.g. Node A and Node B) mid-process or at the end to achieve a score breakthrough.\n"
+            "2. `tune`: Perform focused tuning (hyperparameters, layers, preprocessing) on a specific promising node.\n"
+            "3. `refine`: Perform targeted structural/feature refinement on a specific node.\n"
+            "4. `diversify`: Propose a fundamentally NEW model family or SOTA architecture not tried before.\n"
+            "5. `finalize`: Stop search and build final submission/ensemble if scores are saturated.\n\n"
+            "Respond strictly with a JSON object containing:\n"
+            "{\n"
+            '  "thinking": "step-by-step reasoning analysis",\n'
+            '  "action": "merge" | "tune" | "refine" | "diversify" | "finalize",\n'
+            '  "target_node_ids": ["node_id_1", "node_id_2"],\n'
+            '  "reasoning": "concise explanation of why this step is chosen over others",\n'
+            '  "plan": "concise execution plan for this action"\n'
+            "}\n"
+        )
+
+        try:
+            response = call_llm(
+                "You are an expert AI Search Manager orchestrating an adaptive machine learning search tree.",
+                prompt,
+                model=self.model_name,
+                temperature=0.2,
+            )
+            json_match = re.search(r"\{.*\}", response, re.DOTALL)
+            if json_match:
+                decision = json.loads(json_match.group(0))
+                if isinstance(decision, dict) and "action" in decision:
+                    action = str(decision.get("action", "")).lower()
+                    if action in {"merge", "tune", "refine", "diversify", "finalize"}:
+                        decision["action"] = action
+                        if not isinstance(decision.get("target_node_ids"), list):
+                            decision["target_node_ids"] = [best_node_id] if best_node_id else []
+                        return decision
+        except Exception as exc:
+            print(f"TechniqueAgent: decision call failed; using resilient default: {exc}", flush=True)
 
         return {
-            "status": "pool_miss",
-            "artifact_id": None,
-            "category": "web_search_fallback",
-            "plan": f"Bootstrap new technique from web search: {search_query}",
-            "search_query": search_query,
-            "search_results": search_results,
-            "raw_outline": new_technique_outline,
-            "query_generation_error": query_error,
+            "action": "diversify" if experiments_remaining > 0 else "finalize",
+            "target_node_ids": [best_node_id] if best_node_id else [],
+            "reasoning": "Fallback search decision.",
+            "plan": "Continue adaptive search or finalize.",
         }

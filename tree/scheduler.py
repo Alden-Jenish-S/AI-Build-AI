@@ -1,117 +1,110 @@
+"""Small lineage-aware UCB scheduler for the pending planning frontier."""
+
+from __future__ import annotations
+
 import math
-from typing import Dict, List, Optional
+
 from .node import NodeState
 
+
 class UCB1Scheduler:
-    def __init__(self, total_budget: int, c_0: float = 1.414, **_legacy_options):
-        """Keep scheduling deliberately small.
+    """Favor strong lineages while retaining bounded exploration."""
 
-        Statistical pruning, promotion, diversity, and information gain are
-        computed before an action reaches this class. Legacy decay options are
-        accepted for configuration compatibility but no longer alter scheduling.
-        """
-        self.total_budget = total_budget
-        self.c_0 = c_0
+    def __init__(self, total_budget: int, exploration: float = 1.15) -> None:
+        self.total_budget = max(1, int(total_budget))
+        self.exploration = max(0.0, float(exploration))
         self.current_step = 0
-        self.warmup_budget = 0
-
-    def set_warmup_budget(self, warmup_budget: int) -> None:
-        """Exclude forced initial coverage from UCB decay and visit accounting."""
-        self.warmup_budget = max(0, min(int(warmup_budget), self.total_budget))
-
-    def get_exploration_constant(self, t: int) -> float:
-        """Return the standard UCB1 exploration constant.
-
-        The previous hand-tuned time decay added scheduler state without
-        evidence that it improved time-to-best. Action policies now provide the
-        evidence-derived utility through ``config["priority"]``.
-        """
-        return self.c_0
-
-    def compute_ucb_score(self, node: NodeState, parent_visits: int, t: int) -> float:
-        """Calculates the UCB1 score for a node. Unvisited nodes receive infinity."""
-        if node.visits == 0:
-            return float('inf')
-        
-        avg_reward = node.total_reward / node.visits
-        c_t = self.get_exploration_constant(t)
-        
-        # Avoid math log(0)
-        p_visits = max(parent_visits, 1)
-        exploration_term = c_t * math.sqrt(math.log(p_visits) / node.visits)
-        
-        return avg_reward + exploration_term
-
-    def backpropagate(self, node_id: str, reward: float, all_nodes: Dict[str, NodeState]):
-        """Backpropagates the reward up the parent hierarchy path to the root."""
-        curr_id = node_id
-        while curr_id is not None:
-            curr_node = all_nodes[curr_id]
-            curr_node.visits += 1
-            curr_node.total_reward += reward
-            curr_id = curr_node.parent_id
 
     @staticmethod
-    def _root_branch(node_id: str, root_id: str, all_nodes: Dict[str, NodeState]) -> NodeState:
+    def _root_branch(
+        node_id: str,
+        root_id: str,
+        all_nodes: dict[str, NodeState],
+    ) -> NodeState:
         current = all_nodes[node_id]
         while current.parent_id not in {None, root_id}:
-            current = all_nodes[current.parent_id]
+            parent = all_nodes.get(str(current.parent_id))
+            if parent is None:
+                break
+            current = parent
         return current
 
-    def compute_frontier_score(
+    def backpropagate(
         self,
-        node: NodeState,
-        root_id: str,
-        all_nodes: Dict[str, NodeState],
-    ) -> float:
-        """Apply standard lineage-level UCB to an already eligible action."""
-        root = all_nodes[root_id]
-        branch = self._root_branch(node.node_id, root_id, all_nodes)
-        branch_mean = branch.total_reward / branch.visits if branch.visits else 0.0
-        eligible_root_visits = max(root.visits - self.warmup_budget, 0)
-        eligible_branch_visits = max(branch.visits - (1 if branch.visits else 0), 0)
-        exploration = self.get_exploration_constant(self.current_step) * math.sqrt(
-            math.log(eligible_root_visits + 2.0) / (eligible_branch_visits + 1.0)
-        )
-        config = node.config or {}
-        prior = float(config.get("priority", 0.0) or 0.0)
-        return branch_mean + exploration + prior
+        node_id: str,
+        reward: float,
+        all_nodes: dict[str, NodeState],
+    ) -> None:
+        """Propagate one measured reward through its structural lineage."""
+        current_id: str | None = node_id
+        visited: set[str] = set()
+        while current_id is not None and current_id not in visited:
+            visited.add(current_id)
+            current = all_nodes.get(current_id)
+            if current is None:
+                break
+            current.visits += 1
+            current.total_reward += float(reward)
+            current_id = current.parent_id
 
     def frontier_scores(
-        self, root_id: str, all_nodes: Dict[str, NodeState]
-    ) -> Dict[str, float]:
-        """Return the currently reachable frontier and its auditable scores."""
-        if root_id not in all_nodes:
+        self,
+        root_id: str,
+        all_nodes: dict[str, NodeState],
+    ) -> dict[str, float]:
+        """Return pending reachable nodes and their lineage-level UCB scores."""
+        root = all_nodes.get(root_id)
+        if root is None:
             return {}
 
+        pending: list[NodeState] = []
         queue = [root_id]
-        pending: List[NodeState] = []
-        cursor = 0
-        while cursor < len(queue):
-            node_id = queue[cursor]
-            cursor += 1
-            node = all_nodes[node_id]
+        seen: set[str] = set()
+        while queue:
+            node_id = queue.pop(0)
+            if node_id in seen:
+                continue
+            seen.add(node_id)
+            node = all_nodes.get(node_id)
+            if node is None:
+                continue
             if node_id != root_id and not node.executed:
                 pending.append(node)
                 continue
-            for child_id in node.children_ids:
-                if child_id in all_nodes:
-                    queue.append(child_id)
+            queue.extend(child for child in node.children_ids if child in all_nodes)
 
-        if not pending:
-            return {}
-
-        return {
-            candidate.node_id: self.compute_frontier_score(
-                candidate, root_id, all_nodes
+        scores: dict[str, float] = {}
+        root_visits = max(root.visits, 1)
+        for candidate in pending:
+            branch = self._root_branch(candidate.node_id, root_id, all_nodes)
+            branch_mean = (
+                branch.total_reward / branch.visits if branch.visits else 0.0
             )
-            for candidate in pending
-        }
+            exploration = self.exploration * math.sqrt(
+                math.log(root_visits + 2.0) / (branch.visits + 1.0)
+            )
+            priority = float((candidate.config or {}).get("priority", 0.0) or 0.0)
+            scores[candidate.node_id] = branch_mean + exploration + priority
+        return scores
 
-    def select_next_node(self, root_id: str, all_nodes: Dict[str, NodeState]) -> Optional[str]:
-        """Select the best pending frontier action with lineage-level UCB."""
+    def select_next_node(
+        self,
+        root_id: str,
+        all_nodes: dict[str, NodeState],
+        eligible_node_ids: set[str] | None = None,
+    ) -> str | None:
         scores = self.frontier_scores(root_id, all_nodes)
+        if eligible_node_ids is not None:
+            scores = {
+                node_id: score
+                for node_id, score in scores.items()
+                if node_id in eligible_node_ids
+            }
         if not scores:
             return None
+        return max(scores, key=lambda node_id: (scores[node_id], -_node_number(node_id)))
 
-        return max(scores, key=scores.get)
+
+def _node_number(node_id: str) -> int:
+    digits = "".join(character for character in str(node_id) if character.isdigit())
+    return int(digits) if digits else 0

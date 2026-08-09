@@ -1,15 +1,19 @@
 # Core agent runtime and LLM client
 openai==2.3.0
-packaging==25.0
 
-# Data, evaluation, and visualization
+# Common data/model formats available to generated implementations
 numpy==1.26.4
 pandas==2.3.3
 scipy==1.16.2
 scikit-learn==1.7.2
 matplotlib==3.10.7
+pyarrow==18.1.0
+openpyxl==3.1.5
+pillow==11.1.0
+imageio==2.37.0
+soundfile==0.13.1
 
-# Model families used by verified memory-pool artifacts
+# General model families
 catboost==1.2.5
 category_encoders==2.8.1
 lightgbm==4.6.0
@@ -21,10 +25,7 @@ torch==2.8.0+cu126 ; (platform_system == "Linux" and platform_machine == "x86_64
 torch==2.8.0 ; (platform_system != "Linux" or platform_machine != "x86_64") and (platform_system != "Windows" or platform_machine != "AMD64")
 pytorch-tabnet==4.1.0
 
-# Useful tabular-search extensions for generated techniques
+# Search extensions available to generated techniques
 imbalanced-learn==0.14.0
 optuna==4.5.0
 ngboost==0.5.11
-
-# Tests
-pytest==8.4.2

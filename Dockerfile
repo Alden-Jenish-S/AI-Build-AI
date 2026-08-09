@@ -6,12 +6,8 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
+COPY requirements.txt /tmp/requirements.txt
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
-COPY . .
-
-RUN chmod +x run_all_tasks.sh
-
-CMD ["./run_all_tasks.sh"]
+CMD ["/bin/sh"]

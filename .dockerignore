@@ -37,9 +37,6 @@ results/
 artifacts/
 runs/
 checkpoints/
-tasks/*/input/
-tasks/*/data/
-datasets/
 
 # Notebooks and local tooling
 .ipynb_checkpoints/

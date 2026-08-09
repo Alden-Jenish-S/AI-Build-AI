@@ -1,201 +1,125 @@
-# AIBuildAI: Evidence-Driven Autonomous Machine Learning Engine
+# AIBuildAI
 
-AIBuildAI is an autonomous, data-agnostic AutoML and research framework. It inspects the files supplied with each task, verifies a task-local runtime contract, and only then searches, evaluates, fine-tunes, and ensembles machine-learning methods.
+AIBuildAI inspects an arbitrary task directory, asks an LLM to write direct
+implementations for the observed data, executes and repairs them, and keeps the
+best locally scored deliverable.
 
-The engine uses statistical search policies, candidate lineage tracking, a verified memory pool of reusable templates, and harness-owned evaluation safety to build, optimize, and bundle deployable ensemble solutions.
+## Workflow
 
----
+1. `TaskAnalyzer` recursively inventories the task's files and folders. For
+   common table/JSON formats it records bounded samples, counts, columns, and
+   keys. It also reads supplied task instructions and identifies the requested
+   output/sample-submission shape.
+2. `TechniqueAgent` proposes a small primary/backup root portfolio in one LLM
+   call. Larger budgets execute at most two independent roots so most compute is
+   retained for measured improvement.
+3. Each root, tuning, merge, or recovery proposal is stored as a planning node;
+   its following numbered child is the implementation node.
+4. `ImplementationAgent` writes one self-contained `algorithm.py` per
+   implementation node. Task files are exposed under `input/`; generated code
+   uses those files directly and writes its deliverable under `submission/`.
+5. Every deliverable passes a format-adaptive validator before its score is
+   accepted. Supplied sample outputs define structure; otherwise arbitrary
+   non-empty files or directory bundles are accepted, with safe semantic checks
+   for recognized formats. Validation failures enter the repair loop.
+6. A failed execution is repaired from its real code and stdout/stderr. Stale
+   deliverables are removed between attempts, documentation search is available
+   during repair, and transient provider responses are retried with backoff.
+7. `ManagerAgent` uses a lineage-aware UCB frontier over lazy `refine`, `tune`,
+   and `diversify` planning nodes. The strongest runnable node becomes the
+   baseline. A displaced root receives one model-locked rescue tune and is
+   pruned if it remains weak. Any later underperforming refinement, diversity,
+   or merge candidate also receives one focused rescue tune before pruning.
+   Improving descendants receive new actions; stale ancestors do not expand.
+   Root, recovery, refinement, diversity, and merge implementations consume the
+   configured new-idea budget. Tuning implementations are free and use separate
+   depth/attempt safety limits.
+8. Two competitive, independent lineages may be merged during the search. Both
+   measured parent implementations are supplied to the merge, and an improving
+   merge becomes the new baseline.
+9. The selected node's native deliverable is validated again, then copied to
+   `submission.csv` or `final_output/` at the run root.
 
-## Key Features
+Manager, planner, implementation-attempt, generated-program stdout/stderr,
+tuning, pruning, merging, promotion, web-repair, and finalization progress are
+printed live with node names and timestamps.
 
-- **Content-First Task Discovery**: Builds a neutral inventory from file signatures, bounded previews, directory collections, and cross-file identifier/stem alignment. No missing configuration silently defaults to a table or a conventional filename.
-- **Pre-Planning Verification Gate**: The method tree is created only after required sources and targets exist, indexed records align, and the resolved contract accounts for substantial observed data groups.
-- **Evidence-Driven Search Scheduler**: A lineage-aware scheduling tree that manages search and promotion budgets dynamically based on uncertainty-adjusted cross-validation performance.
-- **Harness-Owned Evaluation Protocol**: Enforces strict out-of-fold (OOF) cross-validation splits, leakage checks, and multi-fidelity runtime profiles (`screen`, `medium`, and `full`).
-- **Dynamic Ensembling & Stacking**: Automatically generates OOF-weighted cross-validated stacking combiners or structured output merges (embeddings, spatial logit maps, bounding boxes) without code fusion.
-- **Empirical Memory Pool**: Retrieves reusable methods by branch intent and verified callable evidence; historical modality labels do not prefilter candidates.
-- **Sandbox Verification Runtime**: Runs and checks newly discovered models and pipelines within isolated, resource-limited subprocesses (`sandbox-exec` on macOS).
+There are no task/runtime contract builders, modality adapters, artifact
+manifests, repository evaluation harnesses, static generated-code gates, or
+memory-pool verification jobs. The active tests cover submission validation,
+but not the complete search workflow.
+The generated implementation owns the task-appropriate local scoring method and
+output construction.
 
----
-
-## Project Structure
-
-```text
-agent_system/
-├── core/
-│   ├── contracts.py              # TaskSpec, InputSpec, and MetricSpec definitions
-│   ├── runtime_contracts.py      # DatasetBundle, ResultRecord, and PredictionBundle
-│   └── modality_registry.py      # Registry for modality-specific adapters
-│
-├── modalities/
-│   ├── base.py                   # Protocols defining adapter interfaces
-│   ├── generic.py                # Contract-driven indexing for unseen task formats
-│   ├── media_base.py             # Shared manifest-driven media indexing logic
-│   ├── tabular.py                # Tabular indexing, profiling, and discovery
-│   ├── image.py                  # Image lazy loading, sizing, color modes
-│   ├── audio.py                  # Audio indexing, duration, and resampling
-│   ├── video.py                  # Video clip sampling and metadata profiling
-│   ├── text.py                   # Document/caption text handling primitive
-│   ├── multimodal.py             # Compositional entity-aligned multimodal adapters
-│   └── common.py                 # File resolvers, pandas wrappers, and schema checkers
-│
-├── evaluation/
-│   ├── runner.py                 # Core evaluation and protocol manifest lifecycle
-│   ├── splitters.py              # Stratified, group, and entity-aware splitters
-│   ├── fidelity.py               # Resource limits and fidelity configurations
-│   ├── metrics.py                # Unified classification/regression metric definitions
-│   └── prediction_io.py          # PredictionBundle validation and payload IO
-│
-├── ensemble/
-│   ├── registry.py               # Output-type mapping to preferred/fallback strategies
-│   ├── stacking.py               # Out-of-fold convex optimized stacker
-│   └── structured.py             # Embedding, mask, and bounding box fusion
-│
-├── agents/
-│   ├── task_analyzer.py          # Registry-driven task configuration analyzer
-│   ├── task_inventory.py         # Neutral file inspection and contract verification
-│   ├── data_analyzer.py          # Backward-compatible tabular analyzer facade
-│   ├── manager_agent.py          # Search orchestrator and merge builder
-│   ├── technique_agent.py        # Retrieves techniques and designs approaches
-│   ├── implementation_agent.py   # Generates and refines executable scripts
-│   ├── aggregator_agent.py       # Blends predictions using OOF weights
-│   ├── validation_guard.py       # General and modality-specific leakage guards
-│   ├── prompt_context.py         # Evidence-derived generation constraints
-│   ├── modality_scaffold.py      # Scaffolds for media and multimodal data loading
-│   └── llm_utils.py              # Model providers and token tracking
-│
-├── memory_pool/
-│   ├── query_tool.py             # Retrieves compatible templates
-│   └── builder/
-│       ├── l2_builder.py         # Sandbox verifier wrapper
-│       ├── sandbox_verifier.py   # Runs verifications under sandbox-exec
-│       └── verification_runtime.py # Runs isolated verification tests
-│
-├── eval/
-│   ├── run_search.py             # Direct method-tree search entrypoint
-│   └── evolve_harness.py         # Proposes prompt/harness improvements
-│
-├── tests/                        # Full test suite covering all modules
-├── evaluation_contract.py        # Compatibility facade for legacy models
-└── runtime_utils.py              # Subprocess environments, limits, and helper tools
-```
-
----
-
-## Installation & Setup
-
-1. **Clone and Navigate**:
-   ```bash
-   git clone <repository-url>
-   cd agent_system
-   ```
-
-2. **Set up Virtual Environment**:
-   ```bash
-   python3 -m venv .venv
-   source .venv/bin/activate
-   ```
-
-3. **Install Dependencies**:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
----
-
-## Execution
-
-To launch an autonomous model search for a specific task under a target experiment budget:
+## Run
 
 ```bash
 python eval/run_search.py playground-series-s6e2 --budget 6
 ```
 
-### Output Artifacts
-Each search run generates a workspace directory structure under `runs/<task_name>/`:
-- `task_inventory.json` and `task_verification.json`: content-first observations and the verification decision made before planning.
-- `resolved_task_spec.json`, `dataset_profile.json`, `dataset_analysis.md`, and, when needed, `dataset_index.jsonl`: Harness-generated task assets used by every root method. The profile owns index metadata, the neutral inventory, verification evidence, and bounded diagnostics.
-- `node_<n>/`: Source code, execution logs, OOF predictions, and metrics for each search-tree node.
-- `ensemble_manifest.json`: Evaluated ensemble configurations and weights.
-- `submission.csv`: Final ensembled predictions ready for deployment.
-- `results.md`: Markdown summary of the best method and execution metadata.
+`--budget 6` funds six successfully scored new root/branch ideas. Tuning does
+not decrement that budget; failed implementations also preserve it.
 
----
+Configure any OpenAI-compatible provider through the environment, for example:
 
-## Configuration
+```bash
+export LLM_PROVIDER=openai
+export OPENAI_API_KEY=your-key
+export LLM_MODEL=your-model
+```
 
-The engine first inspects every supplied task file. An optional `task_config.json` can state facts that cannot be established from the files themselves; it is not required to use conventional basenames or a closed list of task/data identifiers. Ambiguous evidence is rejected before search rather than filled with defaults.
+Web-assisted repair is enabled by default. Set `AIBUILDAI_WEB_SEARCH=0` to turn
+it off. `LLM_MAX_RETRIES` and `LLM_TIMEOUT_SECONDS` control provider recovery.
+
+## Output validation
+
+Validation is evidence-driven rather than tied to a submission type:
+
+- `sample_submission.*`, `sample_output.*`, output-template files, and sample
+  output directories are discovered automatically;
+- complete sample-submission tables enforce columns, row count, finite numeric
+  values, and identifier membership without assuming identifier order;
+- without a sample, recognized files receive safe semantic checks and unknown
+  non-empty formats receive structural checks;
+- arbitrary directory bundles are allowed, but empty directories, filesystem
+  links, malformed recognized files, and artifacts outside the node are rejected;
+- a specialized validator can be registered by file suffix without changing
+  the manager or tree search.
+
+Tasks that need stronger rules may add optional constraints to
+`task_config.json`; no field is required:
 
 ```json
 {
-  "schema_version": 2,
-  "modality": "task-native-records",
-  "problem_type": "next-state-utility",
-  "inputs": {
-    "observed": {
-      "role": "train",
-      "source": "input/observed.jsonl",
-      "format": "jsonl",
-      "id_field": "entity_key"
-    },
-    "requested": {
-      "role": "test",
-      "source": "input/requested.jsonl",
-      "format": "jsonl",
-      "id_field": "entity_key"
-    }
-  },
-  "sample_id_field": "entity_key",
-  "target": {
-    "source": "input/observed.jsonl",
-    "field": "utility"
-  },
-  "output": {
-    "type": "next-state-value"
-  },
-  "metrics": [
-    {"name": "absolute-utility-error", "direction": "minimize"}
-  ],
-  "primary_metric": "absolute-utility-error",
-  "resource_limits": {
-    "preferred_accelerator": "auto",
-    "max_ram_gb": 32
+  "output_contract": {
+    "reference": "example_output.jsonl",
+    "kind": "file",
+    "extension": ".jsonl",
+    "primary_file": "predictions.jsonl",
+    "row_count": 1000,
+    "identifier_column": "record_id",
+    "id_order_required": false
   }
 }
 ```
 
-Task-kind, objective, output, and metric identifiers are open-ended. Registered
-adapters remain optimized decoders for explicitly established storage formats;
-unseen identifiers use the contract-driven generic indexer. With no complete
-contract, deterministic content and relationship checks run first, then the
-task-analysis agent may propose a contract. Every proposed source, target,
-coverage claim, and indexed record is checked against disk. Ambiguity stops the
-run before method-tree construction. Legacy configurations remain supported.
+## Run output
 
-### Environment Settings
-Define your preferred LLM provider and credentials:
+Each `runs/<task>/` contains only:
 
-```bash
-# NVIDIA NIM
-export LLM_PROVIDER="nvidia"
-export NVIDIA_API_KEY="your-key-here"
+- `task_analysis.md`: observed task files/folders, data kinds/counts, goal,
+  target, and expected output;
+- `node1`, `node2`, … directly under the run root. Planning-node folders contain
+  `node_state.json`; implementation-node folders additionally contain
+  `algorithm.py`, `attempt_<n>.log`, the small `result.json`, inputs, and the
+  native deliverable;
+- `submission.csv` or `final_output/` from the selected node;
+- `results.md`: score, pruning, runtime, and token summary;
+- `tree_state.json`: compact final/progress tree state without source code,
+  including new-idea budget and free-tuning counts;
+- `token_usage.json`: aggregate and per-call LLM token metrics;
+- `method_tree.png`: rendered node lineage, status, scores, pruning, merges, and
+  the selected baseline. It uses the reference project's dynamically sized,
+  leaf-span layout with descriptive planning and implementation boxes.
 
-# Google Gemini
-export LLM_PROVIDER="gemini"
-export GEMINI_API_KEY="your-key-here"
-
-# OpenAI or compatible custom endpoint
-export LLM_PROVIDER="openai"
-export OPENAI_API_KEY="your-key-here"
-export LLM_MODEL="your-model-name"
-```
-
----
-
-## Testing
-
-To run the complete suite of unit and contract verification tests:
-
-```bash
-pytest
-```
+No dataset-profile or task-spec JSON is generated or placed in LLM context.

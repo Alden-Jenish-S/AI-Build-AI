@@ -1,852 +1,576 @@
-"""Registry-driven task discovery and profiling."""
+"""Small, read-only task-directory analyzer.
+
+The analyzer deliberately describes observed data and the requested output.  It
+does not prescribe a model family, assess data quality, estimate complexity, or
+build runtime/evaluation contracts.
+"""
 
 from __future__ import annotations
 
-import json
 import csv
-import hashlib
-from dataclasses import dataclass
+import json
+import mimetypes
+import os
+import re
+from collections import Counter, defaultdict
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Mapping
-
-from core.contracts import TaskSpec, normalize_modality
-from core.modality_registry import ModalityRegistry
-from core.runtime_contracts import DatasetBundle
-from evaluation.metrics import (
-    infer_metric_direction,
-    infer_metric_from_description,
-)
-from modalities import build_default_registry
-from modalities.base import ModalityAdapter
-from modalities.generic import GenericAdapter
-from modalities.paired_directory import discover_paired_directory_layout
-from modalities.tabular import discover_dataset_layout
-from .dataset_diagnostics import (
-    build_dataset_diagnostics,
-    render_dataset_analysis_markdown,
-)
-from .task_inventory import build_task_inventory, verify_task_contract
-from .llm_utils import call_llm_json
+from typing import Any
 
 
-class UnresolvedTaskError(ValueError):
-    """Raised when observed files do not establish a safe task contract."""
+_TABLE_EXTENSIONS = {".csv", ".tsv", ".parquet", ".feather"}
+_TEXT_EXTENSIONS = {
+    ".md", ".txt", ".rst", ".yaml", ".yml", ".toml", ".ini", ".cfg"
+}
+_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tif", ".tiff", ".webp"}
+_AUDIO_EXTENSIONS = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac"}
+_VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".mpeg"}
+_ARCHIVE_EXTENSIONS = {".zip", ".tar", ".gz", ".bz2", ".xz", ".7z"}
+_DESCRIPTION_NAMES = {
+    "readme", "task_description", "description", "overview", "instructions", "task"
+}
 
 
-@dataclass(frozen=True)
+def _truncate(value: object, limit: int = 100) -> str:
+    text = " ".join(str(value).split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _goal_from_description(description: str) -> str:
+    """Prefer explicit goal/task sentences over introductory background."""
+    normalized = description.replace("\r", "\n")
+    units = [
+        " ".join(unit.split())
+        for unit in re.split(r"(?:\n+|(?<=[.!?])\s+)", normalized)
+        if unit.strip()
+    ]
+    patterns = (
+        r"\b(?:your|the)\s+(?:task|goal)\b",
+        r"\btasked\s+to\b",
+        r"\byou\s+will\s+be\s+predicting\b",
+        r"\byou\s+must\s+(?:predict|submit|produce|generate)\b",
+        r"\bgoal\s+of\s+(?:the|this)\b",
+    )
+    selected = []
+    seen = set()
+    for unit in units:
+        if any(re.search(pattern, unit, re.IGNORECASE) for pattern in patterns):
+            if unit not in seen:
+                seen.add(unit)
+                selected.append(unit)
+    if selected:
+        return _truncate(" ".join(selected[:2]), 400)
+    return _truncate(" ".join(description.split()[:40]), 400)
+
+
+def _kind(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix in _TABLE_EXTENSIONS:
+        return "table"
+    if suffix in {".json", ".jsonl", ".ndjson"}:
+        return "structured_text"
+    if suffix in _TEXT_EXTENSIONS:
+        return "text"
+    if suffix in _IMAGE_EXTENSIONS:
+        return "image"
+    if suffix in _AUDIO_EXTENSIONS:
+        return "audio"
+    if suffix in _VIDEO_EXTENSIONS:
+        return "video"
+    if suffix in _ARCHIVE_EXTENSIONS:
+        return "archive"
+    guessed, _ = mimetypes.guess_type(path.name)
+    return guessed.split("/", 1)[0] if guessed else "binary_or_unknown"
+
+
+def _line_count(path: Path) -> int | None:
+    """Count rows without loading a delimited file into memory."""
+    try:
+        count = 0
+        final_byte = b""
+        with path.open("rb") as stream:
+            while block := stream.read(1024 * 1024):
+                count += block.count(b"\n")
+                final_byte = block[-1:]
+        if final_byte and final_byte != b"\n":
+            count += 1
+        return max(0, count - 1)
+    except OSError:
+        return None
+
+
+def _delimited_profile(path: Path) -> dict[str, Any]:
+    delimiter = "\t" if path.suffix.lower() == ".tsv" else ","
+    profile: dict[str, Any] = {"rows": _line_count(path)}
+    try:
+        with path.open("r", encoding="utf-8-sig", errors="replace", newline="") as stream:
+            reader = csv.reader(stream, delimiter=delimiter)
+            columns = next(reader, [])
+            samples = []
+            for _, row in zip(range(3), reader):
+                samples.append(
+                    {
+                        str(column): _truncate(row[index] if index < len(row) else "")
+                        for index, column in enumerate(columns[:30])
+                    }
+                )
+        inferred_types: dict[str, str] = {}
+        for index, column in enumerate(columns):
+            values = [row.get(str(column), "") for row in samples]
+            nonempty = [str(value) for value in values if str(value).strip()]
+            observed = "empty"
+            if nonempty:
+                try:
+                    for value in nonempty:
+                        int(value)
+                    observed = "integer"
+                except ValueError:
+                    try:
+                        for value in nonempty:
+                            float(value)
+                        observed = "number"
+                    except ValueError:
+                        lowered = {value.lower() for value in nonempty}
+                        observed = "boolean" if lowered <= {"true", "false", "yes", "no"} else "text"
+            inferred_types[str(column)] = observed
+        profile.update(
+            columns=[str(item) for item in columns],
+            dtypes=inferred_types,
+            sample=samples,
+        )
+    except (OSError, csv.Error) as exc:
+        profile["note"] = f"Could not preview delimited text: {_truncate(exc)}"
+    return profile
+
+
+def _columnar_profile(path: Path) -> dict[str, Any]:
+    try:
+        import pyarrow as pa
+
+        if path.suffix.lower() == ".parquet":
+            import pyarrow.parquet as parquet
+
+            reader = parquet.ParquetFile(path)
+            schema = reader.schema_arrow
+            batch = next(reader.iter_batches(batch_size=3), None)
+            rows = int(reader.metadata.num_rows)
+        else:
+            import pyarrow.ipc as ipc
+
+            source = pa.memory_map(str(path), "r")
+            reader = ipc.open_file(source)
+            schema = reader.schema
+            rows = 0
+            batch = None
+            for index in range(reader.num_record_batches):
+                current_batch = reader.get_batch(index)
+                rows += len(current_batch)
+                if batch is None:
+                    batch = current_batch.slice(0, 3)
+        sample = batch.to_pylist() if batch is not None else []
+        return {
+            "rows": rows,
+            "columns": [str(field.name) for field in schema],
+            "dtypes": {str(field.name): str(field.type) for field in schema},
+            "sample": [
+                {str(key): _truncate(value) for key, value in record.items()}
+                for record in sample[:3]
+            ],
+        }
+    except Exception as exc:
+        return {"note": f"Could not preview columnar table: {_truncate(exc)}"}
+
+
+def _structured_profile(path: Path) -> dict[str, Any]:
+    try:
+        if path.suffix.lower() in {".jsonl", ".ndjson"}:
+            records: list[object] = []
+            rows = 0
+            with path.open("r", encoding="utf-8", errors="replace") as stream:
+                for line in stream:
+                    if line.strip():
+                        rows += 1
+                        if len(records) < 3:
+                            records.append(json.loads(line))
+            keys = sorted({str(key) for record in records if isinstance(record, dict) for key in record})
+            return {"rows": rows, "keys": keys, "sample": records}
+        if path.stat().st_size > 2_000_000:
+            return {"note": "JSON is larger than the bounded analysis preview."}
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(payload, dict):
+            return {"shape": "object", "keys": [str(key) for key in list(payload)[:100]]}
+        if isinstance(payload, list):
+            sample = payload[:3]
+            keys = sorted({str(key) for record in sample if isinstance(record, dict) for key in record})
+            return {"shape": "array", "rows": len(payload), "keys": keys, "sample": sample}
+        return {"shape": type(payload).__name__, "sample": _truncate(payload)}
+    except Exception as exc:
+        return {"note": f"Could not preview JSON: {_truncate(exc)}"}
+
+
+@dataclass
 class TaskAnalysis:
-    """Canonical task contract plus machine and human-readable profiles."""
+    task_name: str
+    task_dir: Path
+    goal: str
+    target: str
+    expected_output: str
+    metric: str = "task score"
+    direction: str = "maximize"
+    files: list[dict[str, Any]] = field(default_factory=list)
+    folders: list[dict[str, Any]] = field(default_factory=list)
+    description: str = ""
+    submission: dict[str, Any] | None = None
+    task_facts: dict[str, Any] = field(default_factory=dict)
 
-    task_spec: TaskSpec
-    profile: Mapping[str, object]
-    report: str
-    bundle: DatasetBundle | None = None
-    inventory: Mapping[str, object] | None = None
-    verification: Mapping[str, object] | None = None
+    @property
+    def report(self) -> str:
+        lines = [
+            f"# Task inventory: {self.task_name}",
+            "",
+            f"Goal: {self.goal}",
+            f"Target: {self.target}",
+            f"Expected output: {self.expected_output}",
+            f"Score: {self.metric} ({self.direction})",
+            "",
+            "## Files & Data Modalities",
+            "",
+        ]
+        displayed_files = self.files
+        if len(self.files) > 250:
+            displayed_files = []
+            seen_groups: Counter[tuple[str, str]] = Counter()
+            for item in self.files:
+                parent = str(Path(str(item["path"])).parent)
+                group = (parent, str(item["kind"]))
+                if parent == "." or seen_groups[group] < 3:
+                    displayed_files.append(item)
+                    seen_groups[group] += 1
+                if len(displayed_files) >= 250:
+                    break
+            lines.append(
+                f"Showing {len(displayed_files)} representative paths; folder counts below cover all {len(self.files)} files."
+            )
+            lines.append("")
+        for item in displayed_files:
+            detail = item.get("profile", {})
+            columns = detail.get("columns") or detail.get("keys") or []
+            if columns:
+                if len(columns) > 8:
+                    suffix = f"; {len(columns)} columns ({', '.join(map(str, columns[:4]))} ... {', '.join(map(str, columns[-2:]))})"
+                else:
+                    suffix = f"; columns: {', '.join(map(str, columns))}"
+            else:
+                suffix = ""
+            rows = detail.get("rows")
+            row_text = f"; rows: {rows}" if rows is not None else ""
+            lines.append(
+                f"- `{item['path']}` — {item['kind']}, {item['bytes']} bytes{row_text}{suffix}"
+            )
+            dtypes = detail.get("dtypes", {})
+            if isinstance(dtypes, dict) and dtypes:
+                by_type: dict[str, list[str]] = defaultdict(list)
+                for col, dt in dtypes.items():
+                    by_type[str(dt)].append(str(col))
+                type_parts = []
+                for dt, cols in by_type.items():
+                    if len(cols) <= 4:
+                        type_parts.append(f"{dt}: {', '.join(cols)}")
+                    else:
+                        type_parts.append(f"{dt} ({len(cols)} cols e.g. {', '.join(cols[:3])}...)")
+                lines.append(f"  - observed types: {'; '.join(type_parts)}")
+            samples = detail.get("sample", [])
+            if isinstance(samples, list) and samples and isinstance(samples[0], dict):
+                sample_dict = samples[0]
+                if len(sample_dict) > 6:
+                    keys = list(sample_dict.keys())[:4]
+                    preview = {k: sample_dict[k] for k in keys}
+                    try:
+                        ex_str = json.dumps(preview, ensure_ascii=False, default=str)[:-1] + ", ...}"
+                    except Exception:
+                        ex_str = str(preview)
+                else:
+                    try:
+                        ex_str = json.dumps(sample_dict, ensure_ascii=False, default=str)
+                    except Exception:
+                        ex_str = str(sample_dict)
+                lines.append(f"  - sample preview: {_truncate(ex_str, 200)}")
+        if self.folders:
+            lines.extend(("", "## Folders", ""))
+            displayed_folders = self.folders[:300]
+            for folder in displayed_folders:
+                kinds = ", ".join(
+                    f"{key}: {value}" for key, value in folder.get("kinds", {}).items()
+                )
+                lines.append(
+                    f"- `{folder['path']}` — {folder['file_count']} files"
+                    + (f" ({kinds})" if kinds else "")
+                )
+            if len(self.folders) > len(displayed_folders):
+                lines.append(
+                    f"- … {len(self.folders) - len(displayed_folders)} additional folders"
+                )
+        if self.description:
+            lines.extend(("", "## Provided instructions", "", self.description.strip()))
+        if self.task_facts:
+            lines.extend(("", "## Explicit task facts", ""))
+            for key, value in self.task_facts.items():
+                lines.append(f"- {key}: {_truncate(value, 800)}")
+        return "\n".join(lines).strip() + "\n"
 
+    def prompt_context(self, max_chars: int = 24000) -> str:
+        """Compact, human-readable context passed to code-writing calls."""
+        text = self.report
+        return text if len(text) <= max_chars else text[:max_chars] + "\n[Inventory truncated]\n"
 
-def _read_task_config(task_dir: Path) -> dict[str, object]:
-    path = Path(task_dir) / "task_config.json"
-    if not path.is_file():
-        return {}
-    with open(path, "r", encoding="utf-8") as stream:
-        loaded = json.load(stream)
-    if not isinstance(loaded, dict):
-        raise ValueError("task_config.json must contain a JSON object")
-    return loaded
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "task_name": self.task_name,
+            "goal": self.goal,
+            "target": self.target,
+            "expected_output": self.expected_output,
+            "metric": self.metric,
+            "direction": self.direction,
+            "files": self.files,
+            "folders": self.folders,
+            "description": self.description,
+            "submission": self.submission,
+            "task_facts": self.task_facts,
+        }
 
 
 class TaskAnalyzer:
-    """Resolve a task through the adapter registered for its modality."""
+    """Inventory arbitrary task files without enforcing a modality schema."""
 
-    def __init__(
-        self,
-        registry: ModalityRegistry | None = None,
-        *,
-        model_name: str | None = None,
-        enable_agent_resolution: bool = False,
-    ) -> None:
-        self.registry = registry or build_default_registry()
+    def __init__(self, *args: object, model_name: str | None = None, **kwargs: object) -> None:
         self.model_name = model_name
-        self.enable_agent_resolution = bool(enable_agent_resolution)
 
-    def _configured_adapter(
-        self, modality: str, config: Mapping[str, object]
-    ) -> ModalityAdapter:
-        """Use a registered decoder or the contract-driven generic indexer."""
-        if modality in self.registry:
-            adapter = self.registry.get(modality)
-        else:
-            adapter = GenericAdapter(config)
-        if not isinstance(adapter, ModalityAdapter):
-            raise TypeError(
-                f"registered {modality!r} adapter does not implement "
-                "the ModalityAdapter contract"
-            )
-        return adapter
-
-    def _adapter_for(
-        self,
-        task_dir: Path,
-        inventory: Mapping[str, object],
-    ) -> ModalityAdapter:
-        config = _read_task_config(task_dir)
-        modality = None
-        adapter = None
-        if config:
-            configured_modality = config.get("modality")
-            if configured_modality is not None:
-                modality = normalize_modality(configured_modality)
-                adapter = self._configured_adapter(modality, config)
-            else:
-                configured_inputs = config.get("inputs")
-                input_modalities = {
-                    normalize_modality(value.get("modality"))
-                    for value in (
-                        configured_inputs.values()
-                        if isinstance(configured_inputs, Mapping)
-                        else ()
-                    )
-                    if isinstance(value, Mapping)
-                    and value.get("modality") is not None
-                }
-                if len(input_modalities) > 1:
-                    modality = "multimodal"
-                    adapter = self._configured_adapter(modality, config)
-                elif len(input_modalities) == 1:
-                    modality = next(iter(input_modalities))
-                    adapter = self._configured_adapter(modality, config)
-                elif any(
-                    config.get(key) is not None
-                    for key in (
-                        "train_file",
-                        "test_file",
-                        "data_file",
-                        "target_column",
-                    )
-                ):
-                    # This is an explicit legacy loader contract, not a default
-                    # inferred from the absence of task information.
-                    modality = "tabular"
-                    adapter = self._configured_adapter(modality, config)
-                elif isinstance(configured_inputs, Mapping) and configured_inputs:
-                    # A non-empty task contract with explicit inputs need not
-                    # name a predefined data family. The generic adapter uses
-                    # the declared paths and roles without category dispatch.
-                    modality = "task_native"
-                    adapter = GenericAdapter(config)
-
-        if adapter is None:
-            paired = discover_paired_directory_layout(task_dir)
-            if paired is not None:
-                modality = paired.modality
-                adapter = self.registry.get(modality)
-            else:
-                multimodal = self.registry.get("multimodal")
-                if (
-                    hasattr(multimodal, "can_auto_discover")
-                    and multimodal.can_auto_discover(task_dir)
-                ):
-                    adapter = multimodal
-                    modality = "multimodal"
-                else:
-                    layout = discover_dataset_layout(task_dir)
-                    roles = layout.get("roles", {})
-                    meaningful_non_text = [
-                        group
-                        for group in inventory.get("file_groups", [])
-                        if isinstance(group, Mapping)
-                        and int(group.get("file_count", 0)) >= 2
-                        and set(group.get("observed_content_kinds", {}))
-                        - {"utf8_text"}
-                    ]
-                    if (
-                        isinstance(roles, Mapping)
-                        and any(role in roles for role in ("train", "data"))
-                        and not meaningful_non_text
-                    ):
-                        modality = "tabular"
-                        adapter = self.registry.get(modality)
-        if adapter is None or modality is None:
-            raise UnresolvedTaskError(
-                "The task could not be verified from its observed files. No "
-                "adapter matched the content and relationships in the neutral "
-                "task inventory; refusing to assume a table, target, split, or "
-                "data family. Supply an explicit task contract or a registered "
-                "content-driven adapter."
-            )
-        if not isinstance(adapter, ModalityAdapter):
-            raise TypeError(
-                f"registered {modality!r} adapter does not implement "
-                "the ModalityAdapter contract"
-            )
-        return adapter
-
-    @staticmethod
-    def _reasoned_contract_schema() -> dict[str, object]:
-        """Schema for an evidence-grounded contract, not a category choice."""
-        input_schema = {
-            "type": "object",
-            "additionalProperties": False,
-            "required": [
-                "name",
-                "role",
-                "source",
-                "format",
-                "id_field",
-                "path_field",
-                "required",
-                "evidence",
-            ],
-            "properties": {
-                "name": {"type": "string"},
-                "role": {"type": "string"},
-                "source": {"type": "string"},
-                "format": {"type": "string"},
-                "id_field": {"type": "string"},
-                "path_field": {"type": "string"},
-                "required": {"type": "boolean"},
-                "evidence": {"type": "string"},
-            },
-        }
-        return {
-            "type": "object",
-            "additionalProperties": False,
-            "required": [
-                "resolved",
-                "summary",
-                "evidence",
-                "uncertainties",
-                "contract",
-            ],
-            "properties": {
-                "resolved": {"type": "boolean"},
-                "summary": {"type": "string"},
-                "evidence": {"type": "array", "items": {"type": "string"}},
-                "uncertainties": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                },
-                "contract": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "required": [
-                        "task_kind",
-                        "objective",
-                        "inputs",
-                        "target",
-                        "sample_id_field",
-                        "output",
-                        "metrics",
-                        "primary_metric",
-                    ],
-                    "properties": {
-                        "task_kind": {"type": "string"},
-                        "objective": {"type": "string"},
-                        "inputs": {
-                            "type": "array",
-                            "minItems": 1,
-                            "items": input_schema,
-                        },
-                        "target": {
-                            "type": "object",
-                            "additionalProperties": False,
-                            "required": [
-                                "present",
-                                "source",
-                                "field",
-                                "format",
-                                "id_field",
-                                "alignment",
-                                "evidence",
-                            ],
-                            "properties": {
-                                "present": {"type": "boolean"},
-                                "source": {"type": "string"},
-                                "field": {"type": "string"},
-                                "format": {"type": "string"},
-                                "id_field": {"type": "string"},
-                                "alignment": {"type": "string"},
-                                "evidence": {"type": "string"},
-                            },
-                        },
-                        "sample_id_field": {"type": "string"},
-                        "output": {
-                            "type": "object",
-                            "additionalProperties": False,
-                            "required": ["type", "shape", "encoding"],
-                            "properties": {
-                                "type": {"type": "string"},
-                                "shape": {"type": "string"},
-                                "encoding": {"type": "string"},
-                            },
-                        },
-                        "metrics": {
-                            "type": "array",
-                            "minItems": 1,
-                            "items": {
-                                "type": "object",
-                                "additionalProperties": False,
-                                "required": ["name", "direction"],
-                                "properties": {
-                                    "name": {"type": "string"},
-                                    "direction": {
-                                        "type": "string",
-                                        "enum": ["maximize", "minimize"],
-                                    },
-                                },
-                            },
-                        },
-                        "primary_metric": {"type": "string"},
-                    },
-                },
-            },
-        }
-
-    def _reasoned_adapter(
-        self,
-        task_dir: Path,
-        inventory: Mapping[str, object],
-    ) -> ModalityAdapter:
-        """Ask the analysis agent to explain a contract from observed facts."""
-        if not self.enable_agent_resolution:
-            raise UnresolvedTaskError(
-                "The task could not be verified from its observed files; "
-                "refusing to assume a table, target, split, or data family."
-            )
-        # Put narrative and schema evidence first so a very large directory
-        # listing cannot push the task statement beyond the bounded prompt.
-        prioritized_inventory = {
-            "task_id": inventory.get("task_id"),
-            "total_files": inventory.get("total_files"),
-            "total_bytes": inventory.get("total_bytes"),
-            "text_documents": inventory.get("text_documents", []),
-            "table_summaries": inventory.get("table_summaries", []),
-            "stem_relationships": inventory.get("stem_relationships", []),
-            "file_groups": inventory.get("file_groups", []),
-            "top_level_entries": inventory.get("top_level_entries", []),
-            "inventory_fingerprint": inventory.get("inventory_fingerprint"),
-        }
-        inventory_text = json.dumps(
-            prioritized_inventory, indent=2, default=str
-        )
-        response = call_llm_json(
-            "You are the task-analysis agent. Resolve an executable ML task "
-            "contract only after inspecting the supplied task-directory "
-            "inventory. Reconcile the task narrative, byte signatures, table "
-            "previews, document contents, counts, and cross-directory stem "
-            "relationships. Do not map the task to a predefined modality or "
-            "objective taxonomy. task_kind, objective, and output.type are "
-            "free descriptive identifiers. Do not infer roles from conventional "
-            "filenames. Every source must be an exact observed file or directory. "
-            "Use role='train' for sources containing examples used to fit or "
-            "derive a method, role='test' only for sources requiring final "
-            "predictions, and descriptive roles for metadata/templates. An empty "
-            "id_field/path_field/target field means it is not established. Set "
-            "resolved=false whenever the files do not establish a single safe "
-            "interpretation; list the ambiguity instead of guessing.",
-            "TASK-DIRECTORY INVENTORY (authoritative observed evidence):\n"
-            + inventory_text[:100_000],
-            model=self.model_name,
-            schema_name="evidence_grounded_task_contract",
-            schema=self._reasoned_contract_schema(),
-        )
-        if not isinstance(response, Mapping) or not response.get("resolved"):
-            uncertainties = (
-                response.get("uncertainties", [])
-                if isinstance(response, Mapping)
-                else []
-            )
-            raise UnresolvedTaskError(
-                "task-analysis agent could not verify one unambiguous contract: "
-                + "; ".join(str(item) for item in uncertainties)
-            )
-        raw_contract = response.get("contract")
-        if not isinstance(raw_contract, Mapping):
-            raise UnresolvedTaskError("task-analysis agent returned no contract")
-        raw_inputs = raw_contract.get("inputs")
-        if not isinstance(raw_inputs, list) or not raw_inputs:
-            raise UnresolvedTaskError("task-analysis agent returned no inputs")
-        inputs: dict[str, object] = {}
-        for raw_input in raw_inputs:
-            if not isinstance(raw_input, Mapping):
-                raise UnresolvedTaskError("task-analysis input must be an object")
-            name = str(raw_input.get("name", "")).strip()
-            if not name or name in inputs:
-                raise UnresolvedTaskError(
-                    "task-analysis inputs require unique non-empty names"
-                )
-            source = str(raw_input.get("source", "")).strip()
-            if self._safe_task_source(task_dir, source) is None:
-                raise UnresolvedTaskError(
-                    f"task-analysis agent cited an unobserved source: {source!r}"
-                )
-            options = {
-                "resolution_evidence": str(raw_input.get("evidence", ""))
-            }
-            path_field = str(raw_input.get("path_field", "")).strip()
-            if path_field:
-                options["path_field"] = path_field
-            inputs[name] = {
-                "modality": str(raw_contract.get("task_kind", "task_native")),
-                "role": str(raw_input.get("role", "")),
-                "source": source,
-                "format": str(raw_input.get("format", "file")),
-                "id_field": str(raw_input.get("id_field", "")).strip() or None,
-                "required": bool(raw_input.get("required", True)),
-                "options": options,
-            }
-        raw_target = raw_contract.get("target")
-        target = None
-        if isinstance(raw_target, Mapping) and raw_target.get("present"):
-            target_source = str(raw_target.get("source", "")).strip()
-            if not target_source:
-                raise UnresolvedTaskError(
-                    "task-analysis agent marked a target present without a source"
-                )
-            resolved_target_source = self._safe_task_source(
-                task_dir, target_source
-            )
-            if resolved_target_source is None:
-                raise UnresolvedTaskError(
-                    "task-analysis agent cited an unobserved target source: "
-                    f"{target_source!r}"
-                )
-            target = {
-                "source": target_source,
-                "field": str(raw_target.get("field", "")).strip() or None,
-                "type": (
-                    "file_reference"
-                    if resolved_target_source.is_dir()
-                    else str(raw_target.get("format", "file"))
-                ),
-                "format": str(raw_target.get("format", "file")),
-                "options": {
-                    "resolution_evidence": str(raw_target.get("evidence", "")),
-                    "id_field": str(raw_target.get("id_field", "")).strip(),
-                    "alignment": str(raw_target.get("alignment", "")).strip(),
-                },
-            }
-        raw_output = raw_contract.get("output")
-        output = dict(raw_output) if isinstance(raw_output, Mapping) else {}
-        mapping = {
-            "schema_version": 2,
-            "modality": str(raw_contract.get("task_kind", "task_native")),
-            "problem_type": str(raw_contract.get("objective", "ml_task")),
-            "inputs": inputs,
-            "target": target,
-            "sample_id_field": str(
-                raw_contract.get("sample_id_field", "sample_id")
-            ),
-            "output": output,
-            "metrics": raw_contract.get("metrics"),
-            "primary_metric": raw_contract.get("primary_metric"),
-            "_resolution": {
-                "resolution_summary": response.get("summary"),
-                "resolution_evidence": response.get("evidence"),
-                "resolution_uncertainties": response.get("uncertainties"),
-            },
-        }
-        adapter = GenericAdapter(mapping)
-        # Parse now so malformed identifiers, roles, metrics, and output facts
-        # fail at the analysis boundary rather than during a method-tree node.
-        adapter.discover(task_dir)
-        return adapter
-
-    @staticmethod
-    def _explicit_metric_config(task_dir: Path) -> bool:
-        config = _read_task_config(task_dir)
-        return any(
-            config.get(key) is not None
-            for key in ("metrics", "metric_name", "primary_metric")
-        )
-
-    @staticmethod
-    def _explicit_sample_id_config(task_dir: Path) -> bool:
-        config = _read_task_config(task_dir)
-        return any(
-            config.get(key) is not None
-            for key in ("sample_id_field", "id_column")
-        )
-
-    @staticmethod
-    def _task_description(task_dir: Path) -> str:
-        path = Path(task_dir) / "task_description.md"
-        return path.read_text(encoding="utf-8") if path.is_file() else ""
-
-    @staticmethod
-    def _safe_task_path(task_dir: Path, source: str) -> Path | None:
+    def analyze(self, task_dir: Path) -> TaskAnalysis:
         root = Path(task_dir).resolve()
-        raw = Path(str(source))
-        candidates = (
-            (raw,)
-            if raw.is_absolute()
-            else (root / raw, root / "input" / raw)
-        )
-        for candidate in candidates:
-            resolved = candidate.resolve()
-            if resolved != root and root not in resolved.parents:
-                continue
-            if resolved.is_file():
-                return resolved
-        return None
+        if not root.is_dir():
+            raise FileNotFoundError(f"Task directory does not exist: {root}")
 
-    @staticmethod
-    def _safe_task_source(task_dir: Path, source: str) -> Path | None:
-        """Resolve a declared file or directory without leaving the task."""
-        root = Path(task_dir).resolve()
-        raw = Path(str(source))
-        candidates = (
-            (raw,)
-            if raw.is_absolute()
-            else (root / raw, root / "input" / raw)
-        )
-        for candidate in candidates:
-            resolved = candidate.resolve()
-            if resolved != root and root not in resolved.parents:
-                continue
-            if resolved.exists():
-                return resolved
-        return None
-
-    @classmethod
-    def _submission_class_names(
-        cls, task_dir: Path, task_spec: TaskSpec
-    ) -> tuple[str, ...]:
-        if (
-            task_spec.output.type != "class_probabilities"
-            or task_spec.output.class_names
+        paths: list[Path] = []
+        ignored_dirs = {".git", ".venv", "__pycache__", "runs", "node_modules", ".tempmediaStorage", "submission"}
+        for current, directory_names, file_names in os.walk(
+            root, followlinks=False, onerror=lambda _error: None
         ):
-            return task_spec.output.class_names
-        candidates = [
-            item.source
-            for item in task_spec.inputs.values()
-            if item.role == "sample_submission"
-        ]
-        for source in candidates:
-            path = cls._safe_task_path(task_dir, source)
-            if path is None:
-                continue
-            delimiter = "\t" if path.suffix.lower() == ".tsv" else ","
-            with path.open("r", encoding="utf-8", newline="") as stream:
-                columns = next(csv.reader(stream, delimiter=delimiter), [])
-            prediction_columns = tuple(
-                str(column) for column in columns[1:] if str(column)
-            )
-            # A single probability column is normally the positive class, not
-            # the complete binary class vocabulary.
-            if len(prediction_columns) > 1:
-                return prediction_columns
-        return ()
-
-    @classmethod
-    def _submission_columns(
-        cls, task_dir: Path, task_spec: TaskSpec
-    ) -> tuple[str, ...]:
-        candidates = [
-            item.source
-            for item in task_spec.inputs.values()
-            if item.role == "sample_submission"
-        ]
-        for source in candidates:
-            path = cls._safe_task_path(task_dir, source)
-            if path is None:
-                continue
-            delimiter = "\t" if path.suffix.lower() == ".tsv" else ","
-            with path.open("r", encoding="utf-8", newline="") as stream:
-                columns = next(csv.reader(stream, delimiter=delimiter), [])
-            if len(columns) >= 2:
-                return tuple(str(column) for column in columns)
-        return ()
-
-    @classmethod
-    def _submission_id_field(
-        cls, task_dir: Path, task_spec: TaskSpec
-    ) -> str:
-        """Infer the final-output ID only when it exists in declared test data."""
-        if cls._explicit_sample_id_config(task_dir):
-            return task_spec.sample_id_field
-        template_sources = [
-            item.source
-            for item in task_spec.inputs.values()
-            if item.role == "sample_submission"
-        ]
-        template_id = None
-        for source in template_sources:
-            path = cls._safe_task_path(task_dir, source)
-            if path is None:
-                continue
-            delimiter = "\t" if path.suffix.lower() == ".tsv" else ","
-            with path.open("r", encoding="utf-8", newline="") as stream:
-                columns = next(csv.reader(stream, delimiter=delimiter), [])
-            if columns:
-                template_id = str(columns[0])
-                break
-        if not template_id:
-            return task_spec.sample_id_field
-        for item in task_spec.inputs.values():
-            if item.role != "test" and item.name != "test":
-                continue
-            path = cls._safe_task_path(task_dir, item.source)
-            if path is None or path.suffix.lower() not in {".csv", ".tsv"}:
-                continue
-            delimiter = "\t" if path.suffix.lower() == ".tsv" else ","
-            with path.open("r", encoding="utf-8", newline="") as stream:
-                columns = next(csv.reader(stream, delimiter=delimiter), [])
-            if template_id in columns:
-                return template_id
-        return task_spec.sample_id_field
-
-    @classmethod
-    def _enrich_discovered_task(
-        cls, task_dir: Path, task_spec: TaskSpec
-    ) -> TaskSpec:
-        mapping = task_spec.to_dict()
-        changed = False
-        if not cls._explicit_metric_config(task_dir):
-            inferred_metric = infer_metric_from_description(
-                cls._task_description(task_dir)
-            )
-            if inferred_metric and inferred_metric != task_spec.primary_metric:
-                mapping["metrics"] = [
-                    {
-                        "name": inferred_metric,
-                        "direction": infer_metric_direction(inferred_metric),
-                    }
-                ]
-                mapping["primary_metric"] = inferred_metric
-                changed = True
-        inferred_classes = cls._submission_class_names(task_dir, task_spec)
-        if inferred_classes and inferred_classes != task_spec.output.class_names:
-            output = dict(mapping["output"])
-            output["class_names"] = list(inferred_classes)
-            mapping["output"] = output
-            changed = True
-        submission_columns = cls._submission_columns(task_dir, task_spec)
-        if submission_columns:
-            output = dict(mapping["output"])
-            options = dict(output.get("options", {}))
-            submission_contract = {
-                "submission_id_column": submission_columns[0],
-                "submission_prediction_columns": list(
-                    submission_columns[1:]
-                ),
-            }
-            if any(
-                options.get(key) != value
-                for key, value in submission_contract.items()
-            ):
-                options.update(submission_contract)
-                output["options"] = options
-                mapping["output"] = output
-                changed = True
-        inferred_id_field = cls._submission_id_field(task_dir, task_spec)
-        if inferred_id_field != task_spec.sample_id_field:
-            mapping["sample_id_field"] = inferred_id_field
-            changed = True
-        return (
-            TaskSpec.from_mapping(task_spec.task_id, mapping)
-            if changed
-            else task_spec
-        )
-
-    def _discover(
-        self, task_dir: Path
-    ) -> tuple[ModalityAdapter, TaskSpec, Mapping[str, object]]:
-        inventory = build_task_inventory(task_dir)
-        try:
-            adapter = self._adapter_for(task_dir, inventory)
-        except UnresolvedTaskError as deterministic_error:
-            try:
-                adapter = self._reasoned_adapter(task_dir, inventory)
-            except Exception as reasoning_error:
-                if reasoning_error is deterministic_error:
-                    raise
-                raise UnresolvedTaskError(
-                    f"{deterministic_error} Task-analysis reasoning also "
-                    f"failed safely: {reasoning_error}"
-                ) from reasoning_error
-        task_spec = self._enrich_discovered_task(
-            task_dir, adapter.discover(task_dir)
-        )
-        return adapter, task_spec, inventory
-
-    def resolve(
-        self, task_dir: Path, *, require_verification: bool = True
-    ) -> TaskSpec:
-        """Resolve only the canonical task contract without profiling data."""
-        task_dir = Path(task_dir)
-        _, task_spec, inventory = self._discover(task_dir)
-        verification = verify_task_contract(task_dir, task_spec, inventory)
-        if require_verification and not verification["verified"]:
-            raise ValueError(
-                "task contract verification failed before method-tree planning: "
-                + "; ".join(verification["errors"])
-            )
-        return task_spec
-
-    @staticmethod
-    def _validate_output_boundary(
-        task_dir: Path, output_dir: Path
-    ) -> None:
-        task_root = Path(task_dir).resolve()
-        output_root = Path(output_dir).resolve()
-        if output_root == task_root or task_root in output_root.parents:
-            raise ValueError(
-                "task analysis output must be outside the read-only task "
-                f"directory: {output_dir}"
-            )
-
-    def analyze(
-        self,
-        task_dir: Path,
-        *,
-        output_dir: Path | None = None,
-        include_index: bool = False,
-        require_verification: bool = True,
-    ) -> TaskAnalysis:
-        """Discover, profile, and optionally persist a canonical task."""
-        task_dir = Path(task_dir)
-        adapter, task_spec, inventory = self._discover(task_dir)
-        if (
-            task_spec.modality != adapter.name
-            and not getattr(adapter, "handles_arbitrary_task_identifiers", False)
-        ):
-            raise ValueError(
-                f"adapter {adapter.name!r} returned modality "
-                f"{task_spec.modality!r}"
-            )
-        profile = dict(adapter.profile(task_dir, task_spec))
-        profile["profile_schema_version"] = 2
-        # Tabular data already has an efficient columnar source (CSV/TSV).
-        # Expanding every row into JSONL duplicates the complete dataset and
-        # can add hundreds of megabytes before the first experiment starts.
-        # Structured modalities still need the record index for path/component
-        # joins, so retain it only for those adapters.
-        direct_tabular = include_index and task_spec.modality == "tabular"
-        bundle = (
-            adapter.build_bundle(task_dir, task_spec)
-            if include_index and not direct_tabular
-            else None
-        )
-        verification = verify_task_contract(
-            task_dir,
-            task_spec,
-            inventory,
-            bundle=bundle,
-        )
-        if require_verification and not verification["verified"]:
-            raise ValueError(
-                "task contract verification failed before method-tree planning: "
-                + "; ".join(verification["errors"])
-            )
-        profile["task_inventory"] = inventory
-        profile["task_verification"] = verification
-        profile["diagnostics"] = build_dataset_diagnostics(
-            task_dir, task_spec, bundle=bundle
-        )
-
-        index_metadata: dict[str, object] | None = None
-        if bundle is not None:
-            index_metadata = {
-                **bundle.to_index_dict(),
-                "storage": "jsonl_index",
-                "row_index_materialized": True,
-            }
-        elif direct_tabular:
-            source_metadata = []
-            for input_spec in task_spec.inputs.values():
-                source_path = self._safe_task_path(
-                    task_dir, input_spec.source
-                )
-                if source_path is None:
+            directory_names[:] = [
+                d for d in directory_names if d not in ignored_dirs and not d.endswith("-previous") and not re.match(r"^node_?\d+$", d)
+            ]
+            directory_names.sort()
+            for name in sorted(file_names):
+                if name in {".DS_Store", "tree_state.json", "task_analysis.md", "method_tree.png"}:
                     continue
-                stat = source_path.stat()
-                source_metadata.append(
-                    {
-                        "name": input_spec.name,
-                        "role": input_spec.role,
-                        "source": input_spec.source,
-                        "size_bytes": int(stat.st_size),
-                        "mtime_ns": int(stat.st_mtime_ns),
-                    }
-                )
-            fingerprint_payload = {
-                "task": task_spec.to_dict(),
-                "sources": source_metadata,
+                candidate = Path(current) / name
+                try:
+                    if candidate.is_file():
+                        paths.append(candidate)
+                except OSError:
+                    continue
+        files: list[dict[str, Any]] = []
+        description_parts: list[str] = []
+        task_facts: dict[str, Any] = {}
+        by_folder: dict[str, list[dict[str, Any]]] = defaultdict(list)
+
+        for path in paths:
+            try:
+                file_size = path.stat().st_size
+            except OSError:
+                continue
+            relative = path.relative_to(root).as_posix()
+            kind = _kind(path)
+            profile: dict[str, Any] = {}
+            if path.suffix.lower() in {".csv", ".tsv"}:
+                profile = _delimited_profile(path)
+            elif path.suffix.lower() in {".parquet", ".feather"}:
+                profile = _columnar_profile(path)
+            elif path.suffix.lower() in {".json", ".jsonl", ".ndjson"}:
+                profile = _structured_profile(path)
+                if path.name.lower() in {"task_config.json", "config.json"} and file_size <= 2_000_000:
+                    try:
+                        configured = json.loads(path.read_text(encoding="utf-8"))
+                        if isinstance(configured, dict):
+                            for key in (
+                                "goal", "objective", "description", "instructions",
+                                "target", "target_column", "label_column", "output",
+                                "submission", "output_contract", "metric", "primary_metric", "direction",
+                            ):
+                                if configured.get(key) is not None:
+                                    task_facts[key] = configured[key]
+                    except (OSError, json.JSONDecodeError):
+                        pass
+            stem = path.stem.lower().replace("-", "_")
+            if (
+                kind == "text"
+                and (stem in _DESCRIPTION_NAMES or "description" in stem or "instruction" in stem)
+                and sum(map(len, description_parts)) < 12000
+            ):
+                try:
+                    text_content = path.read_text(encoding="utf-8", errors="replace")[:6000].strip()
+                    if text_content and text_content not in description_parts:
+                        description_parts.append(text_content)
+                except OSError:
+                    pass
+            item = {
+                "path": relative,
+                "kind": kind,
+                "extension": path.suffix.lower() or "none",
+                "bytes": file_size,
+                "profile": profile,
             }
-            index_metadata = {
-                "schema_version": 2,
-                "storage": "direct_tabular",
-                "dataset_fingerprint": hashlib.sha256(
-                    json.dumps(
-                        fingerprint_payload,
-                        sort_keys=True,
-                        default=str,
-                    ).encode("utf-8")
-                ).hexdigest(),
-                "sources": source_metadata,
-                "row_index_materialized": False,
-            }
-        if index_metadata is not None:
-            # The runtime index contract is part of the canonical machine
-            # profile; a separate manifest duplicated task and source metadata.
-            profile["dataset_index"] = index_metadata
-        report = render_dataset_analysis_markdown(task_spec, profile)
-        report += (
-            "\n## Task verification\n\n"
-            "- Contract verified against task-owned files: "
-            f"{'yes' if verification['verified'] else 'no'}\n"
-            f"- Observed files: {inventory['total_files']}\n"
-            f"- Inventory fingerprint: `{inventory['inventory_fingerprint']}`\n"
-            f"- Indexed training records: {verification['train_record_count']}\n"
-            f"- Indexed test records: {verification['test_record_count']}\n"
+            files.append(item)
+            parent = path.parent.relative_to(root).as_posix()
+            if parent != ".":
+                parts = parent.split("/")
+                for index in range(1, len(parts) + 1):
+                    by_folder["/".join(parts[:index])].append(item)
+
+        folders = []
+        for relative, children in sorted(by_folder.items()):
+            folders.append(
+                {
+                    "path": relative,
+                    "file_count": len(children),
+                    "kinds": dict(sorted(Counter(item["kind"] for item in children).items())),
+                }
+            )
+
+        description = "\n\n".join(description_parts).strip()
+        tables = [item for item in files if item["kind"] == "table"]
+        def output_reference_priority(item: dict[str, Any]) -> tuple[int, str]:
+            stem = Path(str(item["path"])).stem.lower().replace("-", "_")
+            if stem == "sample_submission":
+                return (0, str(item["path"]))
+            if "sample" in stem and ("submission" in stem or "output" in stem):
+                return (1, str(item["path"]))
+            if "template" in stem and ("submission" in stem or "output" in stem):
+                return (2, str(item["path"]))
+            if "submission" in stem:
+                return (3, str(item["path"]))
+            return (99, str(item["path"]))
+
+        reference_candidates = [
+            item for item in files if output_reference_priority(item)[0] < 99
+        ]
+        submission = min(
+            reference_candidates,
+            key=output_reference_priority,
+            default=None,
         )
-        if verification["warnings"]:
-            report += "- Warnings: " + "; ".join(verification["warnings"]) + "\n"
-        analysis = TaskAnalysis(
-            task_spec=task_spec,
-            profile=profile,
-            report=report,
-            bundle=bundle,
-            inventory=inventory,
-            verification=verification,
+        train = next((item for item in tables if "train" in Path(item["path"]).stem.lower()), None)
+        test = next((item for item in tables if "test" in Path(item["path"]).stem.lower()), None)
+        data = next((item for item in tables if Path(item["path"]).stem.lower() == "data"), None)
+
+        submission_columns = list((submission or {}).get("profile", {}).get("columns", []))
+        train_columns = list((train or {}).get("profile", {}).get("columns", []))
+        test_columns = set((test or {}).get("profile", {}).get("columns", []))
+        target_candidates = (
+            [column for column in train_columns if column not in test_columns]
+            if train is not None and test is not None
+            else []
         )
-        if output_dir is not None:
-            output_dir = Path(output_dir)
-            self._validate_output_boundary(task_dir, output_dir)
-            output_dir.mkdir(parents=True, exist_ok=True)
-            (output_dir / "resolved_task_spec.json").write_text(
-                json.dumps(task_spec.to_dict(), indent=2, sort_keys=True)
-                + "\n",
-                encoding="utf-8",
+
+        configured_target = task_facts.get("target") or task_facts.get("target_column") or task_facts.get("label_column")
+        if configured_target is not None:
+            target = _truncate(configured_target, 1000)
+        elif target_candidates:
+            if len(target_candidates) > 8:
+                target = f"{len(target_candidates)} target variables ({', '.join(map(str, target_candidates[:3]))} ... {', '.join(map(str, target_candidates[-2:]))})"
+            else:
+                target = ", ".join(map(str, target_candidates))
+        elif submission_columns:
+            output_columns = submission_columns[1:] if len(submission_columns) > 1 else submission_columns
+            if len(output_columns) > 8:
+                target = f"{len(output_columns)} target variables ({', '.join(map(str, output_columns[:3]))} ... {', '.join(map(str, output_columns[-2:]))})"
+            else:
+                target = ", ".join(map(str, output_columns)) or "the value requested by the submission template"
+        elif data is not None:
+            target = "derive the requested output for the rows/items in the provided data"
+        else:
+            target = "produce the result described by the task instructions"
+
+        if submission is not None and submission.get("kind") == "table":
+            rows = submission.get("profile", {}).get("rows")
+            if len(submission_columns) > 10:
+                col_str = f"{len(submission_columns)} columns ({', '.join(map(str, submission_columns[:3]))} ... {', '.join(map(str, submission_columns[-2:]))})"
+            else:
+                col_str = f"columns {submission_columns}"
+            expected_output = (
+                f"Write `submission/submission.csv` with {col_str}"
+                + (f" and {rows} data rows" if rows is not None else "")
+                + ", following the provided sample submission."
             )
-            (output_dir / "dataset_profile.json").write_text(
-                json.dumps(profile, indent=2, sort_keys=True) + "\n",
-                encoding="utf-8",
+        elif submission is not None:
+            expected_output = (
+                "Write the requested deliverable under `submission/`, matching the observed "
+                f"sample output `{submission['path']}` ({submission['kind']}, "
+                f"{submission['extension']}), and record its path in `result.json`."
             )
-            (output_dir / "dataset_analysis.md").write_text(
-                report, encoding="utf-8"
+        else:
+            expected_output = (
+                "Write the requested deliverable under `submission/` and record its path "
+                "in `result.json`."
             )
-            (output_dir / "task_inventory.json").write_text(
-                json.dumps(inventory, indent=2, sort_keys=True) + "\n",
-                encoding="utf-8",
-            )
-            (output_dir / "task_verification.json").write_text(
-                json.dumps(verification, indent=2, sort_keys=True) + "\n",
-                encoding="utf-8",
-            )
-            if bundle is not None:
-                with open(
-                    output_dir / "dataset_index.jsonl",
-                    "w",
-                    encoding="utf-8",
-                ) as stream:
-                    for record in (
-                        *bundle.train_records,
-                        *bundle.test_records,
-                    ):
-                        stream.write(
-                            json.dumps(record.to_dict(), default=str) + "\n"
-                        )
-        return analysis
+            configured_output = task_facts.get("output") or task_facts.get("submission")
+            if configured_output is not None:
+                expected_output += f" Explicit output instruction: {_truncate(configured_output, 1000)}"
+
+        configured_goal = (
+            task_facts.get("goal") or task_facts.get("objective")
+            or task_facts.get("instructions") or task_facts.get("description")
+        )
+        goal = (
+            _truncate(configured_goal, 1400)
+            if configured_goal is not None
+            else _goal_from_description(description)
+            if description
+            else f"Use the files in this task to predict or produce {target}."
+        )
+
+        lowered = description.lower()
+        metric = "task score"
+        metric_candidates = (
+            (r"\badjusted\s+rand(?:\s+index)?\b", "adjusted Rand index"),
+            (r"\b(?:roc[\s_-]*auc|area\s+under\s+the\s+roc)\b", "ROC AUC"),
+            (r"\bmean\s+average\s+precision\b", "mean average precision"),
+            (r"\b(?:log\s*loss|logarithmic\s+loss|cross[\s_-]*entropy)\b", "log loss"),
+            (r"\b(?:rmse|root\s+mean\s+squared\s+error)\b", "RMSE"),
+            (r"\b(?:mae|mean\s+absolute\s+error)\b", "MAE"),
+            (r"\baccuracy\b", "accuracy"),
+            (r"\bf1(?:[\s_-]*score)?\b", "F1"),
+            (r"\bdice(?:\s+(?:coefficient|score))?\b", "Dice"),
+            (r"\b(?:iou|intersection\s+over\s+union)\b", "IoU"),
+        )
+        for pattern, name in metric_candidates:
+            if re.search(pattern, lowered):
+                metric = name
+                break
+        configured_metric = task_facts.get("primary_metric") or task_facts.get("metric")
+        if configured_metric is not None:
+            metric = _truncate(configured_metric, 200)
+        configured_direction = str(task_facts.get("direction", "")).strip().lower()
+        direction = (
+            configured_direction if configured_direction in {"maximize", "minimize"}
+            else "minimize" if any(word in metric.lower() for word in ("loss", "rmse", "mae", "error"))
+            else "maximize"
+        )
+
+        return TaskAnalysis(
+            task_name=root.name,
+            task_dir=root,
+            goal=goal,
+            target=target,
+            expected_output=expected_output,
+            metric=metric,
+            direction=direction,
+            files=files,
+            folders=folders,
+            description=description,
+            submission=submission,
+            task_facts=task_facts,
+        )
+
+    def resolve(self, task_dir: Path) -> TaskAnalysis:
+        """Compatibility alias for callers that previously resolved a spec."""
+        return self.analyze(task_dir)
