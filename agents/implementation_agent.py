@@ -213,18 +213,26 @@ def _score_from_stdout(stdout: str, metric: str | None, direction: str) -> float
     ending in ``loss: 0.33`` cannot replace an ``accuracy`` value, and loss-like
     patterns are never used as scores for maximize tasks.
     """
-    metric_pattern = _metric_stdout_pattern(metric or "") if metric else None
-    if metric_pattern is not None:
-        candidate = _parse_stdout_score(stdout, metric_pattern)
+    if metric:
+        metric_pattern = _metric_stdout_pattern(metric)
+        if metric_pattern is not None:
+            candidate = _parse_stdout_score(stdout, metric_pattern)
+            if candidate is not None:
+                return candidate
+        
+        # Fallback to literal metric name or generic "score"
+        normalized_metric = re.escape(str(metric).strip().lower())
+        pattern = rf"(?:score|{normalized_metric})"
+        candidate = _parse_stdout_score(stdout, pattern)
         if candidate is not None:
             return candidate
+        return None
+
+    # Generic fallback only if no metric was provided
     pattern = r"(?:score|auc|accuracy|f1|dice|iou|silhouette)"
     if direction != "maximize":
         pattern = r"(?:score|auc|accuracy|f1|dice|iou|silhouette|rmse|mae|loss)"
-    candidate = _parse_stdout_score(stdout, pattern)
-    if candidate is not None:
-        return candidate
-    return None
+    return _parse_stdout_score(stdout, pattern)
 
 
 def _fold_mean_consistency(score: float, fold_scores: list[Any]) -> bool:
@@ -247,22 +255,6 @@ def _env_enabled(name: str, *, default: bool) -> bool:
     return value.strip().casefold() not in {"0", "false", "no", "off"}
 
 
-def _plan_requests_modality_ablation(plan: str | None) -> bool:
-    """Detect a modality-contribution request in a plan without literal markers.
-
-    The council and technique agent phrase this contract several ways; a strict
-    substring match lets a paraphrased plan silently bypass the ablation
-    requirement, so the normalized text is searched instead.
-    """
-    normalized = re.sub(r"[^a-z]+", " ", str(plan or "").casefold())
-    normalized = " ".join(normalized.split())
-    if "modality scope modality ablation" in normalized:
-        return True
-    if "modality ablation" in normalized:
-        return True
-    if "leave one modality out" in normalized:
-        return True
-    return False
 
 
 class ImplementationAgent:
@@ -460,10 +452,7 @@ class ImplementationAgent:
         runtime_paths = [f"input/{path}" for path in runtime_inventory]
         modality_inventory = predictive_modality_inventory(analysis.files)
         modalities = [str(item) for item in modality_inventory["modalities"]]
-        requires_modality_ablation = bool(
-            modality_inventory["is_multimodal"]
-            and _plan_requests_modality_ablation(plan)
-        )
+        requires_modality_ablation = bool(modality_inventory["is_multimodal"])
         displayed_paths: list[str] = []
         displayed_chars = 0
         for path in runtime_paths:
@@ -606,20 +595,19 @@ HARDWARE / DEVICE CONTRACT (mandatory):
 - If CPU training is too slow for the time budget, reduce epochs/batches or subsample instead of
   assuming a GPU exists.
 """
+# Prompt layout is prefix-cache friendly: per-run static content
+        # (analysis, council contract, standing contracts, input paths, rules)
+        # is contiguous and first so provider-side caching covers every node
+        # and attempt; then the per-node block (result contract, plan, parent
+        # code, node-type contracts); attempt-specific repair notes last.
         return f"""
 Write one complete, self-contained Python program for this task.
 
+
 {analysis.prompt_context(6000)}
 
-Implementation plan:
-{plan[:3000]}
-{parent}{companion}{repair}{research}
 {council}
-{architecture_contract}
-{modality_contract}
-{probe_contract}
-{abort_section}
-{tune_contract}
+
 {prediction_contract}
 {hardware_contract}
 Exact runtime input paths available under input/:
@@ -649,13 +637,21 @@ CRITICAL RULES & AGENT REASONING WORKFLOW:
    - Produce the exact requested deliverable under `submission/`. For sample CSV deliverables, preserve row order and exact column headers.
    - A task-provided sample output is a structural contract, regardless of its file type. Without a sample, native non-empty files or directory bundles are allowed.
    - The agent validates the produced artifact independently. A successful process or self-reported score cannot make an invalid output eligible.
-   - {result_contract}
+   - Follow the RESULT/OUTPUT CONTRACT below exactly.
+
+RESULT/OUTPUT CONTRACT (this execution):
+{result_contract}
+
+Implementation plan:
+{plan[:3000]}
+{parent}{companion}
+{architecture_contract}{modality_contract}{probe_contract}{abort_section}{tune_contract}
+{repair}{research}
 
 3. OUTPUT FORMAT:
    First return your step-by-step reasoning in a <thinking> ... </thinking> block.
    Then return your complete Python code in ONE fenced block ```python ... ```.
 """.strip()
-
     @staticmethod
     def _cuda_incompatibility_error(stderr: str) -> bool:
         """Return whether captured stderr shows an unsupported-GPU/accelerator failure.
@@ -911,10 +907,7 @@ CRITICAL RULES & AGENT REASONING WORKFLOW:
             Path(task_dir), node_dir, allowed_paths=allowed_paths
         )
         modality_inventory = predictive_modality_inventory(task_analysis.files)
-        requires_modality_ablation = bool(
-            modality_inventory["is_multimodal"]
-            and _plan_requests_modality_ablation(plan)
-        )
+        requires_modality_ablation = bool(modality_inventory["is_multimodal"])
         self._log(display_name, f"Exposed {len(linked_inputs)} task files under input/.")
         task_input_snapshot = task_dir_snapshot(Path(task_dir))
         if hard_limit_seconds is None:
@@ -1056,17 +1049,27 @@ CRITICAL RULES & AGENT REASONING WORKFLOW:
             try:
                 self._log(display_name, f"Executing {source_file.name}; child logs follow.")
                 
-                # 3. Create node-local venv for true isolation
+                # 3. Create node-local venv for true isolation (with fallback)
                 venv_dir = node_dir / ".venv"
+                node_python = self.python
                 if not venv_dir.exists():
                     self._log(display_name, "Creating isolated virtual environment...")
-                    subprocess.run([self.python, "-m", "venv", str(venv_dir)], check=True, capture_output=True)
-                
-                # Use venv python depending on OS
-                if os.name == "nt":
-                    node_python = str(venv_dir / "Scripts" / "python.exe")
+                    try:
+                        subprocess.run([self.python, "-m", "venv", "--system-site-packages", "--without-pip", str(venv_dir)], check=True, capture_output=True)
+                        if os.name == "nt":
+                            node_python = str(venv_dir / "Scripts" / "python.exe")
+                        else:
+                            node_python = str(venv_dir / "bin" / "python")
+                    except (subprocess.CalledProcessError, OSError) as exc:
+                        self._log(display_name, f"Failed to create venv: {exc}. Falling back to system Python.")
+                        node_python = self.python
+                        if venv_dir.exists():
+                            shutil.rmtree(venv_dir, ignore_errors=True)
                 else:
-                    node_python = str(venv_dir / "bin" / "python")
+                    if os.name == "nt":
+                        node_python = str(venv_dir / "Scripts" / "python.exe")
+                    else:
+                        node_python = str(venv_dir / "bin" / "python")
 
                 install_attempts = 0
                 cuda_fallback_used = False
@@ -1095,12 +1098,16 @@ CRITICAL RULES & AGENT REASONING WORKFLOW:
                             install_attempts += 1
                             pip_env = sanitized_subprocess_env()
                             try:
+                                pip_args = [
+                                    self.python, "-m", "pip", "install", pkg_to_install,
+                                    "--index-url", "https://pypi.org/simple",
+                                    "--disable-pip-version-check", "--no-input",
+                                ]
+                                if node_python != self.python:
+                                    pip_args.extend(["--prefix", str(venv_dir)])
+                                
                                 subprocess.run(
-                                    [
-                                        node_python, "-m", "pip", "install", pkg_to_install,
-                                        "--index-url", "https://pypi.org/simple",
-                                        "--disable-pip-version-check", "--no-input",
-                                    ],
+                                    pip_args,
                                     check=False,
                                     env=pip_env,
                                     timeout=240,

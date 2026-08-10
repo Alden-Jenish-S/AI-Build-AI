@@ -850,6 +850,104 @@ class GatedInteractionNet(nn.Module):
         self.assertIn("single-modality controls", prompt)
         self.assertIn("modality_ablation_scores", prompt)
 
+    def test_implementation_prompt_lays_static_prefix_first_for_caching(self) -> None:
+        analysis = self.analysis()
+        brief = self.brief()
+        attempt_one = ImplementationAgent()._prompt(
+            analysis,
+            "Node-specific plan",
+            "PARENT-CODE",
+            None,
+            "CANDIDATE-1",
+            "attempt-1 feedback",
+            "",
+            brief,
+            "root",
+        )
+        attempt_two = ImplementationAgent()._prompt(
+            analysis,
+            "Node-specific plan",
+            "PARENT-CODE",
+            None,
+            "CANDIDATE-2",
+            "attempt-2 feedback",
+            "",
+            brief,
+            "root",
+        )
+        council_pos = attempt_one.find("ML RESEARCH COUNCIL CONTRACT")
+        plan_pos = attempt_one.find("Implementation plan:")
+        repair_pos = attempt_one.find("Previous attempted program:")
+        self.assertGreater(plan_pos, council_pos)
+        self.assertGreater(repair_pos, plan_pos)
+        self.assertTrue(attempt_one.startswith(attempt_two[: council_pos + 1]))
+        shared_prefix = attempt_two[: council_pos]
+        self.assertEqual(attempt_one[: len(shared_prefix)], shared_prefix)
+
+    def test_member_report_prompt_shares_evidence_prefix_across_members(self) -> None:
+        coordinator = CouncilCoordinator(enable_web=False)
+        fingerprint = {"data_kinds": {"table": 4}}
+        diagnostics = {"diagnostics_hash": "abc", "tables": []}
+        sources = [{"source_id": "S1", "title": "T", "url": "U", "snippet": "S"}]
+        # Capture the member prompts by monkeypatching call_llm_json.
+        captured = []
+
+        def capture(*args, **kwargs):
+            if len(args) >= 2 and isinstance(args[1], str):
+                captured.append(args[1])
+            return {"member_id": "x", "summary": "s", "findings": [],
+                    "hypotheses": [{
+                        "hypothesis_id": "H",
+                        "title": "t",
+                        "model_family": "m",
+                        "rationale": "r",
+                        "evidence_ids": ["local_preflight"],
+                        "experiment": "e",
+                        "expected_signal": "s",
+                        "estimated_cost": "low",
+                        "risks": [],
+                        "stopping_rule": "s",
+                        "compatible_with": [],
+                        "architecture_track": "other",
+                        "architecture_spec": "",
+                        "novelty_test": "",
+                        "modality_scope": "not_applicable",
+                        "modality_ablation": "",
+                    }],
+                    "assumptions": [],
+                    "unresolved_questions": [],
+                    "member_id": "x"}
+
+        with patch("agents.council.coordinator.call_llm_json", side_effect=capture):
+            coordinator._member_report(
+                {"member_id": "member_a", "mandate": "mandate A",
+                 "research_focus": "focus A", "key_uncertainties": ["q"]},
+                fingerprint,
+                diagnostics,
+                {"member_id": "member_a", "status": "ok"},
+                sources,
+            )
+            coordinator._member_report(
+                {"member_id": "member_b", "mandate": "mandate B",
+                 "research_focus": "focus B", "key_uncertainties": ["q"]},
+                fingerprint,
+                diagnostics,
+                {"member_id": "member_b", "status": "ok"},
+                sources,
+            )
+        self.assertEqual(2, len(captured))
+        marker_a = captured[0].find("Focused diagnostic")
+        marker_b = captured[1].find("Focused diagnostic")
+        self.assertGreater(marker_a, -1)
+        self.assertGreater(marker_b, -1)
+        self.assertEqual(captured[0][:marker_a], captured[1][:marker_b])
+        self.assertIn("De-identified fingerprint:", captured[0])
+        self.assertIn("Primary literature evidence:", captured[0])
+        self.assertLess(
+            captured[0].find("De-identified fingerprint:"),
+            captured[0].find("Focused diagnostic"),
+        )
+
     def test_brief_writes_machine_and_human_readable_artifacts(self) -> None:
         council_dir = self.root / "council"
         brief = self.brief()

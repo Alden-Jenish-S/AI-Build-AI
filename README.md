@@ -179,7 +179,18 @@ Web-assisted implementation repair is separately controlled by
 `AIBUILDAI_WEB_SEARCH=0`. `LLM_MAX_RETRIES` and `LLM_TIMEOUT_SECONDS` control
 provider recovery. Providers without `json_schema` response-format support are
 detected automatically and use a schema-visible JSON fallback; set
-`LLM_USE_JSON_SCHEMA=0` to skip the initial capability probe explicitly.
+`LLM_USE_JSON_SCHEMA=0` to skip the initial capability probe explicitly. The
+capability result is remembered on disk (`~/.aibuildai/llm_capabilities.json`,
+overridable with `AIBUILDAI_LLM_CAPABILITY_CACHE`) so every new run skips the
+double-send for providers that reject structured output.
+
+When an NVIDIA GPU is physically present but the child interpreter's torch
+cannot use it (for example a capability-6.0 Tesla P100 under a newer build),
+the agent re-pins a compatible torch automatically before falling back to CPU:
+Pascal-class GPUs get `torch==2.6.0+cu126` from the CUDA 12.6 index, and the
+capability probe performs a real CUDA allocation so warnings alone cannot hide
+an unusable device. Set `AIBUILDAI_GPU_UPGRADE=0` to disable the reinstall and
+always run on CPU; `AIBUILDAI_GPU_UPGRADE_INDEX` overrides the wheel index.
 
 Architecture coverage is enabled by default. Set
 `AIBUILDAI_ARCHITECTURE_EXPLORATION=0` to disable the reserved custom-network

@@ -8,7 +8,7 @@ eval/run_search.py
         -> bounded diagnostics + input allowlist + de-identified fingerprint
         -> adaptive member mandates -> focused diagnostic scripts
         -> precise primary-literature retrieval + query/provenance audit
-        -> independent reports -> adversarial review -> chair synthesis
+        -> independent reports -> adversarial review + chair synthesis in one step
         -> ranked hypotheses + immutable evaluation protocol
      -> TechniqueAgent: council roots, tuning, architecture, and merge plans
      -> Planning Node -> Implementation Node: code -> execute -> error repair

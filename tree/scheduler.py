@@ -28,19 +28,7 @@ class UCB1Scheduler:
         self.total_budget = max(1, int(total_budget))
         self.exploration = max(0.0, float(exploration))
 
-    @staticmethod
-    def _root_branch(
-        node_id: str,
-        root_id: str,
-        all_nodes: dict[str, NodeState],
-    ) -> NodeState:
-        current = all_nodes[node_id]
-        while current.parent_id not in {None, root_id}:
-            parent = all_nodes.get(str(current.parent_id))
-            if parent is None:
-                break
-            current = parent
-        return current
+
 
     def backpropagate(
         self,
@@ -106,7 +94,9 @@ class UCB1Scheduler:
         scores: dict[str, float] = {}
         root_visits = max(root.visits, 1)
         for candidate in pending:
-            branch = self._root_branch(candidate.node_id, root_id, all_nodes)
+            branch = all_nodes.get(str(candidate.parent_id))
+            if branch is None:
+                branch = root
             branch_best = branch.best_reward
             branch_value = branch_best if math.isfinite(branch_best) else 0.0
             exploration = self.exploration * math.sqrt(

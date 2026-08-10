@@ -155,24 +155,6 @@ _CROSS_REVIEW_SCHEMA = _object_schema(
     },
     ["target_hypothesis_id", "strongest_objection", "fatal", "required_test"],
 )
-_CRITIQUE_SCHEMA = _object_schema(
-    {
-        "summary": {"type": "string"},
-        "cross_reviews": {"type": "array", "items": _CROSS_REVIEW_SCHEMA},
-        "missing_evidence": {"type": "array", "items": {"type": "string"}},
-        "requires_additional_member": {"type": "boolean"},
-        "additional_mandate": {"type": "string"},
-        "additional_research_focus": {"type": "string"},
-    },
-    [
-        "summary",
-        "cross_reviews",
-        "missing_evidence",
-        "requires_additional_member",
-        "additional_mandate",
-        "additional_research_focus",
-    ],
-)
 _EVALUATION_SCHEMA = _object_schema(
     {
         "metric": {"type": "string"},
@@ -196,8 +178,16 @@ _REJECTED_SCHEMA = _object_schema(
     },
     ["hypothesis_id", "reason"],
 )
-_SYNTHESIS_SCHEMA = _object_schema(
+_REVIEW_SYNTHESIS_SCHEMA = _object_schema(
     {
+        # Adversarial review fields
+        "summary": {"type": "string"},
+        "cross_reviews": {"type": "array", "items": _CROSS_REVIEW_SCHEMA},
+        "missing_evidence": {"type": "array", "items": {"type": "string"}},
+        "requires_additional_member": {"type": "boolean"},
+        "additional_mandate": {"type": "string"},
+        "additional_research_focus": {"type": "string"},
+        # Chair synthesis fields
         "decision_summary": {"type": "string"},
         "evaluation_protocol": _EVALUATION_SCHEMA,
         "hypotheses": {"type": "array", "minItems": 1, "maxItems": 10, "items": _HYPOTHESIS_SCHEMA},
@@ -212,6 +202,12 @@ _SYNTHESIS_SCHEMA = _object_schema(
         "recommended_root_count": {"type": "integer"},
     },
     [
+        "summary",
+        "cross_reviews",
+        "missing_evidence",
+        "requires_additional_member",
+        "additional_mandate",
+        "additional_research_focus",
         "decision_summary",
         "evaluation_protocol",
         "hypotheses",
@@ -406,6 +402,10 @@ Research focuses:
             for source in sources[:24]
         ]
         local_evidence_id = f"diag_{member['member_id']}"
+        # Prompt layout is prefix-cache friendly: every member call shares one
+        # byte-identical leading block (instructions, fingerprint, preflight,
+        # research) so provider-side caching is effective across the parallel
+        # member calls; only the focused diagnostic and mandate vary at the end.
         prompt = f"""
 Act as one independent senior ML engineer. Build task-specific research hypotheses
 from measurements and cited literature. Do not imitate a known competition solution.
@@ -424,11 +424,7 @@ When the fingerprint is multimodal, every relevant hypothesis must declare
 credible single modality, and leave-one-modality-out variants on identical validation
 indices. Account for the extra parameters of fusion so added capacity is not mistaken
 for modality value. The final recommendation may intentionally use only one modality.
-Separate verified facts from assumptions. Evidence IDs may reference
-`local_preflight`, `{local_evidence_id}`, and supplied source IDs.
-
-Mandate:
-{_bounded_json(member, 5000)}
+Separate verified facts from assumptions from local measurements and from cited sources.
 
 De-identified fingerprint:
 {_bounded_json(fingerprint, 10000)}
@@ -436,11 +432,14 @@ De-identified fingerprint:
 Local preflight evidence:
 {_bounded_json(diagnostics, 14000)}
 
-Focused diagnostic:
-{_bounded_json(investigation, 7000)}
-
 Primary literature evidence:
 {_bounded_json(research_context, 22000)}
+
+Focused diagnostic (yours; evidence id `{local_evidence_id}`):
+{_bounded_json(investigation, 7000)}
+
+Mandate:
+{_bounded_json(member, 5000)}
 """.strip()
         payload = call_llm_json(
             "You are an independent senior ML research engineer. Prefer falsifiable, resource-feasible hypotheses.",
@@ -472,42 +471,18 @@ Primary literature evidence:
         }
         return payload
 
-    def _critique(self, reports: list[dict[str, Any]]) -> dict[str, Any]:
-        prompt = f"""
-Adversarially peer-review these independent ML research reports. Find leakage,
-invalid validation comparisons, unsupported literature claims, resource failures,
-duplicated model families, and experiments that cannot falsify their hypothesis.
-Also flag any report set that never seriously evaluates neural representations or
-task-invented architectures, or that calls a standard named architecture "custom."
-For multimodal tasks, flag unsupported fusion claims, missing single-modality
-controls, unequal validation splits, and conclusions based only on training loss.
-For each important proposal, state its strongest objection and required test.
-Request one additional council member only if a material question remains that the
-current evidence cannot answer; otherwise set requires_additional_member=false and
-return empty additional strings.
-
-Reports:
-{_bounded_json(reports, 36000)}
-""".strip()
-        payload = call_llm_json(
-            "You are the skeptical principal scientist responsible for stopping weak or contaminated ML research directions.",
-            prompt,
-            schema=_CRITIQUE_SCHEMA,
-            schema_name="ml_council_cross_review",
-            model=self.model_name,
-            temperature=0.1,
-        )
-        assert isinstance(payload, dict)
-        return payload
-
-    def _synthesize(
+    def _review_and_synthesize(
         self,
         analysis: TaskAnalysis,
         fingerprint: Mapping[str, Any],
         reports: list[dict[str, Any]],
-        critique: Mapping[str, Any],
         sources: list[dict[str, Any]],
     ) -> dict[str, Any]:
+        """Adversarially review the reports and synthesize the brief in one call.
+
+        The reports are the final prompt section so a gap-specialist re-run
+        (reports appended) shares an identical prompt prefix.
+        """
         source_index = [
             {
                 "source_id": item.get("source_id"),
@@ -518,16 +493,29 @@ Reports:
             for item in sources
         ]
         prompt = f"""
-Synthesize a pre-search ML research brief. Select a Pareto portfolio rather than
-voting: maximize expected score and information gain while controlling compute,
-implementation risk, leakage, and redundancy. A cheap baseline may be selected when
-it is a useful control, but there is no mandatory model progression. Prefer hypotheses
-supported by both local evidence and primary literature. Preserve alternative
-representations that could later ensemble well.
+Adversarially peer-review these independent ML research reports, then synthesize a
+pre-search ML research brief from them.
 
+Review phase: find leakage, invalid validation comparisons, unsupported literature
+claims, resource failures, duplicated model families, and experiments that cannot
+falsify their hypothesis. Also flag any report set that never seriously evaluates
+neural representations or task-invented architectures, or that calls a standard
+named architecture "custom." For multimodal tasks, flag unsupported fusion claims,
+missing single-modality controls, unequal validation splits, and conclusions based
+only on training loss. For each important proposal, state its strongest objection
+and required test. Request one additional council member only if a material question
+remains that the current evidence cannot answer; otherwise set
+requires_additional_member=false and return empty additional strings.
+
+Synthesis phase: select a Pareto portfolio rather than voting: maximize expected
+score and information gain while controlling compute, implementation risk, leakage,
+and redundancy. A cheap baseline may be selected when it is a useful control, but
+there is no mandatory model progression. Prefer hypotheses supported by both local
+evidence and primary literature. Preserve alternative representations that could
+later ensemble well.
 The full hypothesis ledger must explicitly resolve conventional, established-neural,
-and custom-neural counterfactuals. When resources make training feasible, include at
-least one falsifiable neural or custom-architecture hypothesis, even if it is not
+and custom-neural counterfactuals. When resources make training feasible, include
+at least one falsifiable neural or custom-architecture hypothesis, even if it is not
 selected. Set `architecture_track`; for a neural proposal, provide `architecture_spec`
 with inputs, learned transformations, interaction mechanism, output head, loss,
 regularization, optimizer, and stopping rule. For task-invented networks, provide a
@@ -535,14 +523,12 @@ regularization, optimizer, and stopping rule. For task-invented networks, provid
 global novelty from an incomplete search. If the selected portfolio contains only
 conventional library models, give concrete measured evidence for rejecting both
 neural tracks rather than relying on task simplicity.
-
 When `is_multimodal` is true, the portfolio must resolve whether all modalities are
 useful. Include a modality-ablation hypothesis with the full model, credible
 single-modality models, and leave-one-modality-out variants evaluated on the same
 folds. Prefer the smallest modality subset within score uncertainty; select fusion
 only when its repeatable gain justifies its compute and failure modes. Populate
 `modality_scope` and `modality_ablation` for every hypothesis.
-
 Define one fixed validation protocol for every candidate. The split must respect any
 observed entity, group, temporal, spatial, or source dependency. Choose cross-validation
 only when its cost and independence assumptions are credible. Use metric
@@ -551,20 +537,19 @@ only when its cost and independence assumptions are credible. Use metric
 Problem fingerprint:
 {_bounded_json(fingerprint, 10000)}
 
-Member reports:
-{_bounded_json(reports, 38000)}
-
-Adversarial review:
-{_bounded_json(critique, 14000)}
-
 Source index:
 {_bounded_json(source_index, 12000)}
+
+Member reports:
+{_bounded_json(reports, 38000)}
 """.strip()
         payload = call_llm_json(
-            "You chair an ML research council. You may synthesize claims but may not invent facts or uncited results.",
+            "You are the skeptical principal scientist and chair of an ML research council. "
+            "Review adversarially, then synthesize; you may synthesize claims but may not "
+            "invent facts or uncited results.",
             prompt,
-            schema=_SYNTHESIS_SCHEMA,
-            schema_name="ml_council_synthesis",
+            schema=_REVIEW_SYNTHESIS_SCHEMA,
+            schema_name="ml_council_review_and_synthesis",
             model=self.model_name,
             temperature=0.1,
         )
@@ -830,30 +815,65 @@ Source index:
             return brief
 
         try:
-            self._log("Running adversarial cross-review.")
-            critique = self._critique(reports)
+            self._log("Running adversarial cross-review and portfolio synthesis.")
+            review_synthesis = self._review_and_synthesize(
+                analysis, fingerprint, reports, sources
+            )
         except Exception as exc:
             warnings.append(f"Cross-review failed: {type(exc).__name__}: {exc}")
-            critique = {
+            review_synthesis = {
                 "summary": "Cross-review unavailable.",
                 "cross_reviews": [],
                 "missing_evidence": [],
                 "requires_additional_member": False,
                 "additional_mandate": "",
                 "additional_research_focus": "",
+                "decision_summary": (
+                    "Cross-review and synthesis were unavailable; a conservative "
+                    "control portfolio is retained."
+                ),
+                "evaluation_protocol": {
+                    "metric": analysis.metric,
+                    "direction": analysis.direction,
+                    "mode": (
+                        "cross_validation"
+                        if analysis.metric != "task score"
+                        else "holdout"
+                    ),
+                    "folds": 5,
+                    "seed": 42,
+                    "split_strategy": (
+                        "deterministic stratified or dependency-aware split after "
+                        "inspecting labels"
+                    ),
+                    "leakage_unit": "sample or discovered group/entity",
+                    "rationale": (
+                        "Council review/synthesis was degraded; use a conservative "
+                        "shared protocol."
+                    ),
+                },
+                "hypotheses": [],
+                "selected_hypothesis_ids": [],
+                "rejected_hypotheses": [],
+                "unresolved_questions": [],
+                "recommended_root_count": 1,
             }
 
         if (
-            critique.get("requires_additional_member")
+            review_synthesis.get("requires_additional_member")
             and len(members) < self.max_members
-            and str(critique.get("additional_mandate") or "").strip()
+            and str(review_synthesis.get("additional_mandate") or "").strip()
         ):
             extra_id = f"gap_specialist_{len(members) + 1}"
             extra = {
                 "member_id": extra_id,
-                "mandate": str(critique["additional_mandate"]),
-                "research_focus": str(critique.get("additional_research_focus") or ""),
-                "key_uncertainties": list(critique.get("missing_evidence") or []),
+                "mandate": str(review_synthesis["additional_mandate"]),
+                "research_focus": str(
+                    review_synthesis.get("additional_research_focus") or ""
+                ),
+                "key_uncertainties": list(
+                    review_synthesis.get("missing_evidence") or []
+                ),
             }
             self._log(f"Spawning one additional member for unresolved evidence: {extra_id}.")
             investigation: dict[str, Any] = {}
@@ -878,227 +898,227 @@ Source index:
                     )
                 )
                 members.append(extra)
+                # Re-synthesize with the complete report ledger; the shared
+                # prompt prefix stays unchanged so provider caching applies.
+                review_synthesis = self._review_and_synthesize(
+                    analysis, fingerprint, reports, sources
+                )
             except Exception as exc:
                 warnings.append(f"Additional member failed: {type(exc).__name__}: {exc}")
-
-        try:
-            self._log("Synthesizing a Pareto-ranked initial experiment portfolio.")
-            synthesis = self._synthesize(
-                analysis, fingerprint, reports, critique, sources
-            )
-            protocol = EvaluationProtocol.from_mapping(
-                synthesis.get("evaluation_protocol"),
-                metric=analysis.metric,
-                direction=analysis.direction,
-            )
-            hypotheses = [
-                annotate_hypothesis(dict(item))
-                for item in synthesis.get("hypotheses", [])
-                if isinstance(item, dict)
-            ]
-            valid_evidence_ids = {
-                "local_preflight",
-                *(f"diag_{member_id}" for member_id in investigations),
-                *(str(source.get("source_id")) for source in sources),
-            }
-            for hypothesis in hypotheses:
-                claimed = [str(item) for item in hypothesis.get("evidence_ids", [])]
-                hypothesis["evidence_ids"] = [
-                    item for item in claimed if item in valid_evidence_ids
-                ]
-                removed = sorted(set(claimed) - valid_evidence_ids)
-                if removed:
-                    warnings.append(
-                        f"Hypothesis {hypothesis.get('hypothesis_id')} cited unknown evidence IDs: "
-                        + ", ".join(removed)
+            try:
+                protocol = EvaluationProtocol.from_mapping(
+                        review_synthesis.get("evaluation_protocol"),
+                        metric=analysis.metric,
+                        direction=analysis.direction,
                     )
-            if fingerprint.get("is_multimodal") and not any(
-                item.get("modality_scope") == "modality_ablation"
-                for item in hypotheses
-            ):
-                modalities = [
-                    str(item) for item in fingerprint.get("predictive_modalities", [])
-                ]
-                hypotheses.append(
-                    {
-                        "hypothesis_id": "H_modality_contribution_audit",
-                        "title": "Measured modality contribution and fusion audit",
-                        "model_family": (
-                            "task-selected per-modality controls with validation-selected fusion"
-                        ),
-                        "rationale": (
-                            "Providing multiple modalities does not establish that each contributes "
-                            "independent predictive signal. Controlled ablations can select a simpler, "
-                            "stronger, or more robust modality subset."
-                        ),
-                        "evidence_ids": ["local_preflight"],
-                        "experiment": (
-                            "Using identical validation indices, compare the full fusion model, "
-                            "credible models using each modality alone, and leave-one-modality-out "
-                            f"variants for: {', '.join(modalities)}. Match capacity where practical."
-                        ),
-                        "expected_signal": (
-                            "A ranked modality subset showing whether fusion adds repeatable value "
-                            "beyond the strongest single modality."
-                        ),
-                        "estimated_cost": "moderate; reuse cached preprocessing and embeddings",
-                        "risks": [
-                            "Fusion capacity can confound modality contribution.",
-                            "Unequal folds can make ablation scores incomparable.",
-                        ],
-                        "stopping_rule": (
-                            "Prefer the smallest modality subset whose score is within validation "
-                            "uncertainty of the best variant; retain fusion only for repeatable gain."
-                        ),
-                        "compatible_with": [],
-                        "architecture_track": "representation",
-                        "architecture_spec": "",
-                        "novelty_test": "Not a novelty claim; this is a contribution ablation.",
-                        "modality_scope": "modality_ablation",
-                        "modality_ablation": (
-                            "Full fusion, each credible single modality, and every leave-one-out "
-                            "variant on the exact shared folds."
-                        ),
-                        "selection_policy": (
-                            "Injected because multiple predictive modalities require measured "
-                            "necessity rather than an assumption of useful fusion."
-                        ),
-                    }
-                )
-            selected_ids = {
-                str(item) for item in synthesis.get("selected_hypothesis_ids", [])
-            }
-            selected = [
-                item
-                for item in hypotheses
-                if str(item.get("hypothesis_id")) in selected_ids
-                and item.get("evidence_ids")
-            ]
-            if not selected:
-                selected = [item for item in hypotheses if item.get("evidence_ids")][:1]
-                if selected:
-                    warnings.append(
-                        "Chair selected no traceable hypothesis; retained the first evidence-linked proposal."
-                    )
-            if not selected:
-                raise ValueError("Council synthesis produced no evidence-linked hypothesis")
-            selected_tracks = {
-                str(item.get("architecture_track") or "") for item in selected
-            }
-            packages = (
-                fingerprint.get("resource_inventory", {}).get("packages_available", {})
-                if isinstance(fingerprint.get("resource_inventory"), Mapping)
-                else {}
-            )
-            torch_available = bool(
-                packages.get("torch") if isinstance(packages, Mapping) else False
-            )
-            promoted_architecture = False
-            if (
-                torch_available
-                and not selected_tracks.intersection(
-                    {"established_neural", "custom_neural"}
-                )
-            ):
-                architecture_candidate = next(
-                    (
-                        item
-                        for item in hypotheses
-                        if item not in selected
-                        and item.get("evidence_ids")
-                        and item.get("architecture_track")
-                        in {"established_neural", "custom_neural"}
-                    ),
-                    None,
-                )
-                if architecture_candidate is not None:
-                    architecture_candidate["selection_policy"] = (
-                        "Promoted as a bounded architecture counterfactual so the initial "
-                        "portfolio is not restricted to conventional library models."
-                    )
-                    insertion = min(1, len(selected))
-                    selected.insert(insertion, architecture_candidate)
-                    if len(selected) > 4:
-                        selected.pop()
-                    promoted_architecture = True
-            promoted_modality = False
-            if fingerprint.get("is_multimodal") and not any(
-                item.get("modality_scope") == "modality_ablation"
-                for item in selected
-            ):
-                modality_candidate = next(
-                    (
-                        item
-                        for item in hypotheses
-                        if item.get("modality_scope") == "modality_ablation"
-                        and item.get("evidence_ids")
-                    ),
-                    None,
-                )
-                if modality_candidate is not None:
-                    insertion = min(1, len(selected))
-                    selected.insert(insertion, modality_candidate)
-                    if len(selected) > 4:
-                        selected.pop()
-                    promoted_modality = True
-            recommended_roots = int(
-                synthesis.get("recommended_root_count", len(selected)) or 1
-            )
-            if promoted_architecture or promoted_modality:
-                recommended_roots = max(2, recommended_roots)
-            brief = CouncilBrief(
-                task_name=analysis.task_name,
-                status="degraded" if warnings else "completed",
-                problem_fingerprint=fingerprint,
-                allowed_input_paths=allowed,
-                prohibited_inputs=prohibited,
-                evaluation_protocol=protocol,
-                evidence=[
-                    {
-                        "evidence_id": "local_preflight",
-                        "kind": "local_diagnostics",
-                        "hash": diagnostics.get("diagnostics_hash"),
-                        "summary": diagnostics,
-                    },
-                    *[
-                        {
-                            "evidence_id": f"diag_{member_id}",
-                            "kind": "focused_diagnostic",
-                            "hash": content_hash(result),
-                            "summary": result,
-                        }
-                        for member_id, result in sorted(investigations.items())
-                    ],
-                ],
-                sources=sources,
-                member_reports=reports,
-                hypotheses=hypotheses,
-                selected_portfolio=selected,
-                rejected_hypotheses=[
-                    dict(item)
-                    for item in synthesis.get("rejected_hypotheses", [])
+                hypotheses = [
+                    annotate_hypothesis(dict(item))
+                    for item in review_synthesis.get("hypotheses", [])
                     if isinstance(item, dict)
-                ],
-                unresolved_questions=[
-                    str(item) for item in synthesis.get("unresolved_questions", [])
-                ],
-                warnings=warnings,
-                recommended_root_count=recommended_roots,
-            )
-        except Exception as exc:
-            warnings.append(f"Council synthesis failed: {type(exc).__name__}: {exc}")
-            brief = self._fallback_brief(
-                analysis, fingerprint, diagnostics, allowed, prohibited, warnings
-            )
-            brief.sources = sources
-            brief.member_reports = reports
-
+                ]
+                valid_evidence_ids = {
+                    "local_preflight",
+                    *(f"diag_{member_id}" for member_id in investigations),
+                    *(str(source.get("source_id")) for source in sources),
+                }
+                for hypothesis in hypotheses:
+                    claimed = [str(item) for item in hypothesis.get("evidence_ids", [])]
+                    hypothesis["evidence_ids"] = [
+                        item for item in claimed if item in valid_evidence_ids
+                    ]
+                    removed = sorted(set(claimed) - valid_evidence_ids)
+                    if removed:
+                        warnings.append(
+                            f"Hypothesis {hypothesis.get('hypothesis_id')} cited unknown evidence IDs: "
+                            + ", ".join(removed)
+                        )
+                if fingerprint.get("is_multimodal") and not any(
+                    item.get("modality_scope") == "modality_ablation"
+                    for item in hypotheses
+                ):
+                    modalities = [
+                        str(item) for item in fingerprint.get("predictive_modalities", [])
+                    ]
+                    hypotheses.append(
+                        {
+                            "hypothesis_id": "H_modality_contribution_audit",
+                            "title": "Measured modality contribution and fusion audit",
+                            "model_family": (
+                                "task-selected per-modality controls with validation-selected fusion"
+                            ),
+                            "rationale": (
+                                "Providing multiple modalities does not establish that each contributes "
+                                "independent predictive signal. Controlled ablations can select a simpler, "
+                                "stronger, or more robust modality subset."
+                            ),
+                            "evidence_ids": ["local_preflight"],
+                            "experiment": (
+                                "Using identical validation indices, compare the full fusion model, "
+                                "credible models using each modality alone, and leave-one-modality-out "
+                                f"variants for: {', '.join(modalities)}. Match capacity where practical."
+                            ),
+                            "expected_signal": (
+                                "A ranked modality subset showing whether fusion adds repeatable value "
+                                "beyond the strongest single modality."
+                            ),
+                            "estimated_cost": "moderate; reuse cached preprocessing and embeddings",
+                            "risks": [
+                                "Fusion capacity can confound modality contribution.",
+                                "Unequal folds can make ablation scores incomparable.",
+                            ],
+                            "stopping_rule": (
+                                "Prefer the smallest modality subset whose score is within validation "
+                                "uncertainty of the best variant; retain fusion only for repeatable gain."
+                            ),
+                            "compatible_with": [],
+                            "architecture_track": "representation",
+                            "architecture_spec": "",
+                            "novelty_test": "Not a novelty claim; this is a contribution ablation.",
+                            "modality_scope": "modality_ablation",
+                            "modality_ablation": (
+                                "Full fusion, each credible single modality, and every leave-one-out "
+                                "variant on the exact shared folds."
+                            ),
+                            "selection_policy": (
+                                "Injected because multiple predictive modalities require measured "
+                                "necessity rather than an assumption of useful fusion."
+                            ),
+                        }
+                    )
+                selected_ids = {
+                    str(item) for item in review_synthesis.get("selected_hypothesis_ids", [])
+                }
+                selected = [
+                    item
+                    for item in hypotheses
+                    if str(item.get("hypothesis_id")) in selected_ids
+                    and item.get("evidence_ids")
+                ]
+                if not selected:
+                    selected = [item for item in hypotheses if item.get("evidence_ids")][:1]
+                    if selected:
+                        warnings.append(
+                            "Chair selected no traceable hypothesis; retained the first evidence-linked proposal."
+                        )
+                if not selected:
+                    raise ValueError("Council synthesis produced no evidence-linked hypothesis")
+                selected_tracks = {
+                    str(item.get("architecture_track") or "") for item in selected
+                }
+                packages = (
+                    fingerprint.get("resource_inventory", {}).get("packages_available", {})
+                    if isinstance(fingerprint.get("resource_inventory"), Mapping)
+                    else {}
+                )
+                torch_available = bool(
+                    packages.get("torch") if isinstance(packages, Mapping) else False
+                )
+                promoted_architecture = False
+                if (
+                    torch_available
+                    and not selected_tracks.intersection(
+                        {"established_neural", "custom_neural"}
+                    )
+                ):
+                    architecture_candidate = next(
+                        (
+                            item
+                            for item in hypotheses
+                            if item not in selected
+                            and item.get("evidence_ids")
+                            and item.get("architecture_track")
+                            in {"established_neural", "custom_neural"}
+                        ),
+                        None,
+                    )
+                    if architecture_candidate is not None:
+                        architecture_candidate["selection_policy"] = (
+                            "Promoted as a bounded architecture counterfactual so the initial "
+                            "portfolio is not restricted to conventional library models."
+                        )
+                        insertion = min(1, len(selected))
+                        selected.insert(insertion, architecture_candidate)
+                        if len(selected) > 4:
+                            selected.pop()
+                        promoted_architecture = True
+                promoted_modality = False
+                if fingerprint.get("is_multimodal") and not any(
+                    item.get("modality_scope") == "modality_ablation"
+                    for item in selected
+                ):
+                    modality_candidate = next(
+                        (
+                            item
+                            for item in hypotheses
+                            if item.get("modality_scope") == "modality_ablation"
+                            and item.get("evidence_ids")
+                        ),
+                        None,
+                    )
+                    if modality_candidate is not None:
+                        insertion = min(1, len(selected))
+                        selected.insert(insertion, modality_candidate)
+                        if len(selected) > 4:
+                            selected.pop()
+                        promoted_modality = True
+                recommended_roots = int(
+                    review_synthesis.get("recommended_root_count", len(selected)) or 1
+                )
+                if promoted_architecture or promoted_modality:
+                    recommended_roots = max(2, recommended_roots)
+                brief = CouncilBrief(
+                    task_name=analysis.task_name,
+                    status="degraded" if warnings else "completed",
+                    problem_fingerprint=fingerprint,
+                    allowed_input_paths=allowed,
+                    prohibited_inputs=prohibited,
+                    evaluation_protocol=protocol,
+                    evidence=[
+                        {
+                            "evidence_id": "local_preflight",
+                            "kind": "local_diagnostics",
+                            "hash": diagnostics.get("diagnostics_hash"),
+                            "summary": diagnostics,
+                        },
+                        *[
+                            {
+                                "evidence_id": f"diag_{member_id}",
+                                "kind": "focused_diagnostic",
+                                "hash": content_hash(result),
+                                "summary": result,
+                            }
+                            for member_id, result in sorted(investigations.items())
+                        ],
+                    ],
+                    sources=sources,
+                    member_reports=reports,
+                    hypotheses=hypotheses,
+                    selected_portfolio=selected,
+                    rejected_hypotheses=[
+                        dict(item)
+                        for item in review_synthesis.get("rejected_hypotheses", [])
+                        if isinstance(item, dict)
+                    ],
+                    unresolved_questions=[
+                        str(item) for item in review_synthesis.get("unresolved_questions", [])
+                    ],
+                    warnings=warnings,
+                    recommended_root_count=recommended_roots,
+                )
+            except Exception as exc:
+                warnings.append(f"Council synthesis failed: {type(exc).__name__}: {exc}")
+                brief = self._fallback_brief(
+                    analysis, fingerprint, diagnostics, allowed, prohibited, warnings
+                )
+                brief.sources = sources
+                brief.member_reports = reports
+    
         (council_dir / "member_reports.json").write_text(
             json.dumps(reports, indent=2, ensure_ascii=False, default=str) + "\n",
             encoding="utf-8",
         )
         (council_dir / "cross_review.json").write_text(
-            json.dumps(critique, indent=2, ensure_ascii=False, default=str) + "\n",
+            json.dumps(review_synthesis, indent=2, ensure_ascii=False, default=str) + "\n",
             encoding="utf-8",
         )
         (council_dir / "evidence.jsonl").write_text(

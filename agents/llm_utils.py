@@ -30,7 +30,7 @@ _client_cache: dict[tuple[object, ...], object] = {}
 _json_schema_capability_lock = threading.Lock()
 # Structured output capability is provider-scoped: one provider without
 # json_schema support must not disable it for the other providers in the process.
-_json_schema_unavailable: dict[str, bool] = {}
+_json_schema_unavailable: set[str] = set()
 
 
 _PROVIDER_DEFAULTS = {
@@ -93,8 +93,11 @@ def reset_token_usage():
         _response_cache.clear()
     with _client_cache_lock:
         _client_cache.clear()
+    # The json_schema capability set is session state re-seeded from the
+    # persistent capability cache so a provider that rejected structured output
+    # in a previous run does not pay the double-send again.
     with _json_schema_capability_lock:
-        _json_schema_unavailable = {}
+        _json_schema_unavailable = _load_persisted_json_schema_unavailable()
 
 
 def _cache_flag(value: object, *, default: bool = False) -> bool:
@@ -268,10 +271,6 @@ def _resolve_llm_config(
         "cache_deterministic_responses": _cache_flag(
             env.get("LLM_CACHE_DETERMINISTIC_RESPONSES"), default=True
         ),
-        "send_prompt_cache_key": _cache_flag(
-            env.get("LLM_SEND_PROMPT_CACHE_KEY"),
-            default=provider == "openai",
-        ),
     }
 
 
@@ -365,6 +364,7 @@ def call_llm(
     model: Optional[str] = None,
     temperature: float = 0.2,
     response_format: Mapping[str, object] | None = None,
+    bypass_cache: bool = False,
 ) -> str:
     """
     Query any OpenAI-compatible LLM API with bounded retry handling.
@@ -385,7 +385,8 @@ def call_llm(
         response_format=response_format,
     )
     use_response_cache = bool(
-        config["cache_deterministic_responses"]
+        not bypass_cache
+        and config["cache_deterministic_responses"]
         and float(temperature) == 0.0
     )
     if use_response_cache:
@@ -424,12 +425,6 @@ def call_llm(
                 request["temperature"] = temperature
             if response_format is not None:
                 request["response_format"] = dict(response_format)
-            if config["send_prompt_cache_key"]:
-                request["extra_body"] = {
-                    "prompt_cache_key": hashlib.sha256(
-                        system_prompt.encode("utf-8")
-                    ).hexdigest()
-                }
             response = client.chat.completions.create(**request)
 
             if not response.choices:
@@ -571,13 +566,63 @@ def _should_try_json_schema(provider: str | None = None) -> bool:
         except Exception:
             provider = "unknown"
     with _json_schema_capability_lock:
-        return not _json_schema_unavailable.get(provider, False)
+        if provider in _json_schema_unavailable:
+            return False
+    # Relearn the capability across processes: a provider that rejected
+    # json_schema in a previous run must not pay the double-send again.
+    persisted = _load_persisted_json_schema_unavailable()
+    if provider in persisted:
+        with _json_schema_capability_lock:
+            _json_schema_unavailable.add(provider)
+        return False
+    return True
+
+
+def _capability_cache_path() -> Path:
+    configured = os.getenv("AIBUILDAI_LLM_CAPABILITY_CACHE", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".aibuildai" / "llm_capabilities.json"
+
+
+def _load_persisted_json_schema_unavailable() -> set[str]:
+    try:
+        path = _capability_cache_path()
+        if not path.is_file():
+            return set()
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        entries = raw.get("json_schema_unavailable", []) if isinstance(raw, dict) else raw
+        if not isinstance(entries, list):
+            return set()
+        return {str(item) for item in entries if isinstance(item, str) and item.strip()}
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return set()
+
+
+def _persist_json_schema_unavailable(provider: str) -> None:
+    try:
+        path = _capability_cache_path()
+        providers = _load_persisted_json_schema_unavailable()
+        providers.add(provider)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"json_schema_unavailable": sorted(providers)}
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+        temporary.replace(path)
+    except (OSError, TypeError, ValueError):
+        pass
 
 
 def _remember_json_schema_unavailable(provider: str) -> None:
     global _json_schema_unavailable
     with _json_schema_capability_lock:
-        _json_schema_unavailable[provider] = True
+        _json_schema_unavailable.add(provider)
+    if provider == "unknown":
+        # Unresolved providers are typically test doubles; keep the cache clean.
+        return
+    _persist_json_schema_unavailable(provider)
 
 
 def _evict_cached_response(key: str) -> None:
@@ -728,7 +773,12 @@ this JSON Schema:
         _validate_json_schema(payload, schema)
         return payload
     except (TypeError, ValueError, json.JSONDecodeError) as validation_error:
-        evict_poisoned()
+        # A schema-invalid response was retrieved; evict it by robust key reconstruction
+        # or by doing bypass_cache on retry. But here we just evict it so it doesn't linger.
+        try:
+            evict_poisoned()
+        except Exception:
+            pass
         repair_prompt = f"""
 Repair the JSON response below. Return exactly one corrected JSON value with no
 prose or Markdown.
