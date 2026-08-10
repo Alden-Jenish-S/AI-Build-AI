@@ -7,12 +7,25 @@ import math
 import os
 import re
 import shutil
+import statistics
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from runtime_utils import absolute_path_without_symlink_resolution, validate_path_component
+from runtime_utils import (
+    absolute_path_without_symlink_resolution,
+    run_supervised_process,
+    sanitized_subprocess_env,
+    validate_path_component,
+)
+from search_evidence import (
+    family_fingerprint as _family_fingerprint,
+    pearson_correlation,
+    relative_noise_floor,
+    score_noise_estimate,
+    signature_from_result,
+)
 from tree.node import NodeState
 from tree.scheduler import UCB1Scheduler
 
@@ -26,7 +39,23 @@ from .technique_agent import TechniqueAgent
 
 
 class ManagerAgent:
-    """Build only on runnable implementations and stop weak branches early."""
+    """Build only on runnable implementations and stop weak branches early.
+
+    Class-level defaults keep partially-constructed instances (unit tests,
+    partial state restore) functional; __init__ overrides them from the env.
+    """
+
+    improvement_noise_k = 0.35
+    abort_iterative_enabled = True
+    abort_margin_std = 2.0
+    complementarity_weight = 0.4
+    diversify_probe_enabled = True
+    final_ensemble_enabled = True
+    max_architect_iterations = 2
+    probe_attempt_limit = 3
+    probe_attempts = 0
+    ensemble_attempts = 0
+    council_brief = None
 
     def __init__(
         self,
@@ -34,6 +63,7 @@ class ManagerAgent:
         total_budget: int = 10,
         venv_path: str | None = None,
         model_name: str | None = None,
+        resume: bool = False,
     ) -> None:
         self.task_name = validate_path_component(task_name, "task_name")
         if not isinstance(total_budget, int) or isinstance(total_budget, bool) or total_budget < 1:
@@ -48,14 +78,16 @@ class ManagerAgent:
         # A task has one flat active run. Historical runs are placed beside it
         # with readable `-previous` names; no session/timestamp layer is used.
         self.run_root = self.project_root / "runs" / self.task_name
+        self._resumed = bool(resume) and (self.run_root / "tree_state.json").is_file()
         selected_python = absolute_path_without_symlink_resolution(venv_path) if venv_path else Path(sys.executable)
         self.python = str(selected_python if selected_python.is_file() else Path(sys.executable))
         self.task_analyzer = TaskAnalyzer(model_name=model_name)
         self.task_analysis: TaskAnalysis = self.task_analyzer.analyze(self.task_dir)
 
-        # Do not displace a useful prior run until the new task can at least be
-        # inventoried successfully.
-        self._archive_existing_run()
+        # Do not displace a usable prior run until the new task can at least be
+        # inventoried successfully. On explicit resume the run is kept in place.
+        if not self._resumed:
+            self._archive_existing_run()
         self.run_root.mkdir(parents=True, exist_ok=True)
         (self.run_root / "task_analysis.md").write_text(self.task_analysis.report, encoding="utf-8")
 
@@ -103,6 +135,7 @@ class ManagerAgent:
         self._merged_pairs: set[frozenset[str]] = set()
         self._merge_attempts = 0
         self._expanded_nodes: set[str] = set()
+        self._dirty_node_ids: set[str] = set()
         self._backup_plans: list[str] = []
         # Two independent roots are enough to establish diversity for larger
         # searches; additional budget is more valuable on measured refinement.
@@ -128,10 +161,47 @@ class ManagerAgent:
         # guarantee termination under persistent external/generated failures.
         self.tuning_attempt_limit = max(1, self.total_budget)
         self.attempt_limit = max(self.total_budget * 5, self.total_budget + 12)
+        # Cheap screening probes are also budget-free but bounded; they let the
+        # search rank candidates before spending a full idea on them.
+        self.probe_attempt_limit = max(
+            3,
+            int(
+                self.total_budget
+                * self._env_float("AIBUILDAI_PROBE_MULTIPLIER", 2.0)
+            ),
+        )
+        self.probe_attempts = 0
+        # Final OOF ensemble is a single budget-free finalization step.
+        self.ensemble_attempts = 0
+        # Variance-aware decision policies (mode-agnostic: fold scores, repeated
+        # seeds, or a relative floor when neither exists).
+        self.improvement_noise_k = max(
+            0.0, self._env_float("AIBUILDAI_IMPROVEMENT_NOISE_K", 0.35)
+        )
+        self.abort_iterative_enabled = self._env_enabled(
+            "AIBUILDAI_ABORT_ITERATIVE", default=True
+        )
+        self.abort_margin_std = max(
+            0.5, self._env_float("AIBUILDAI_ABORT_MARGIN_STD", 2.0)
+        )
+        self.complementarity_weight = max(
+            0.0, self._env_float("AIBUILDAI_COMPLEMENTARITY_WEIGHT", 0.4)
+        )
+        self.diversify_probe_enabled = self._env_enabled(
+            "AIBUILDAI_DIVERSIFY_PROBE", default=True
+        )
+        self.final_ensemble_enabled = self._env_enabled(
+            "AIBUILDAI_FINAL_ENSEMBLE", default=True
+        )
+        self.max_architect_iterations = max(
+            1, self._env_int("AIBUILDAI_MAX_ARCHITECT_ITERATIONS", 2)
+        )
         self._log(
             f"Prepared task '{self.task_name}' with {len(self.task_analysis.files)} files; "
             f"metric={self.metric_name} ({self.metric_direction}); budget={self.total_budget}."
         )
+        if self._resumed:
+            self._restore_tree_state()
         self._persist_tree_state()
 
     @staticmethod
@@ -171,54 +241,7 @@ class ManagerAgent:
             destination = self.run_root.parent / f"{base.name}-{index}"
             index += 1
         self.run_root.rename(destination)
-        self._normalize_archived_node_folders(destination)
         self._log(f"Archived the previous run as {destination.name}.")
-
-    @staticmethod
-    def _normalize_archived_node_folders(archive: Path) -> None:
-        """Remove legacy timestamp and underscore node directories from an archive."""
-        def legacy_number(name: str) -> int | None:
-            simple = re.fullmatch(r"node_?(\d+)", name)
-            if simple:
-                return int(simple.group(1))
-            timestamped = re.fullmatch(r"node_\d{8}T\d+_(\d+)(?:_.*)?", name)
-            return int(timestamped.group(1)) if timestamped else None
-
-        candidates: list[Path] = [
-            path for path in sorted(archive.iterdir())
-            if path.is_dir() and legacy_number(path.name) is not None
-        ]
-        legacy_root = archive / "nodes"
-        if legacy_root.is_dir():
-            for session in sorted(legacy_root.iterdir()):
-                if session.is_dir():
-                    candidates.extend(
-                        path for path in sorted(session.iterdir())
-                        if path.is_dir() and legacy_number(path.name) is not None
-                    )
-
-        used_numbers = {
-            number
-            for path in archive.iterdir()
-            if path.is_dir()
-            for number in [legacy_number(path.name)]
-            if number is not None and re.fullmatch(r"node\d+", path.name)
-        }
-        for source in candidates:
-            number = legacy_number(source.name)
-            if number is None:
-                continue
-            target = archive / f"node{number}"
-            if target.exists() and target != source:
-                number = max(used_numbers, default=0) + 1
-                while (archive / f"node{number}").exists():
-                    number += 1
-                target = archive / f"node{number}"
-            if source != target:
-                source.rename(target)
-            used_numbers.add(number)
-        if legacy_root.is_dir():
-            shutil.rmtree(legacy_root)
 
     @staticmethod
     def node_label(node_id: str | None) -> str:
@@ -253,7 +276,8 @@ class ManagerAgent:
                     "materialized", "pruned_reason", "replacement",
                     "hypothesis_id", "council_brief_hash",
                     "evaluation_protocol_hash", "architecture_track",
-                    "architecture_trigger",
+                    "architecture_trigger", "probe", "family_fingerprint",
+                    "architect_count",
                 }
             } or None,
             "visits": node.visits,
@@ -277,8 +301,13 @@ class ManagerAgent:
 
     def _persist_tree_state(self) -> Path:
         """Persist a compact progress snapshot; it never gates execution."""
-        for node in self.all_nodes.values():
-            self._persist_node(node)
+        dirty = self._dirty_node_ids
+        if dirty:
+            for node_id in dirty:
+                node = self.all_nodes.get(node_id)
+                if node is not None and node_id != "root":
+                    self._persist_node(node)
+            self._dirty_node_ids.clear()
         path = self.run_root / "tree_state.json"
         payload = {
             "task_name": self.task_name,
@@ -294,6 +323,9 @@ class ManagerAgent:
             "completed_implementations": self.completed_implementations,
             "tuning_attempts": self.tuning_attempts,
             "tuning_attempt_limit": self.tuning_attempt_limit,
+            "probe_attempts": self.probe_attempts,
+            "probe_attempt_limit": self.probe_attempt_limit,
+            "ensemble_attempts": self.ensemble_attempts,
             "architecture_policy": {
                 "enabled": self.architecture_exploration_enabled,
                 "minimum_idea_budget": self.architecture_min_budget,
@@ -327,9 +359,150 @@ class ManagerAgent:
         temporary.replace(path)
         return path
 
+    def _restore_tree_state(self) -> None:
+        """Rebuild mutable state from the on-disk tree_state.json snapshot.
+
+        Node code is reloaded from each node's `algorithm.py` (never from the
+        snapshot), and rewards are re-propagated from stored scores so the
+        scheduler lineage statistics match the measured history.
+        """
+        path = self.run_root / "tree_state.json"
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            self._log(f"Could not resume from {path.name}: {exc}; starting fresh.")
+            self._resumed = False
+            return
+        nodes = payload.get("nodes")
+        if not isinstance(nodes, dict) or not nodes:
+            self._log(f"No nodes in {path.name}; starting fresh.")
+            self._resumed = False
+            return
+
+        restored: dict[str, NodeState] = {}
+        for node_id, raw in nodes.items():
+            if not isinstance(raw, dict):
+                continue
+            code: str | None = None
+            if node_id != "root":
+                source = self.run_root / node_id / "algorithm.py"
+                if source.is_file():
+                    try:
+                        code = source.read_text(encoding="utf-8")
+                    except OSError:
+                        code = None
+            restored[node_id] = NodeState(
+                node_id=node_id,
+                parent_id=raw.get("parent_id"),
+                node_type=raw.get("node_type") or "implementation",
+                plan=raw.get("plan"),
+                code=code,
+                result=raw.get("result"),
+                executed=bool(raw.get("executed")),
+                operator=raw.get("operator"),
+                config=dict(raw.get("config") or {}),
+                visits=int(raw.get("visits", 0)),
+                total_reward=float(raw.get("total_reward", 0.0)),
+                children_ids=list(raw.get("children_ids") or []),
+            )
+        restored.setdefault("root", self.all_nodes["root"])
+        self.all_nodes = restored
+        self._dirty_node_ids.update(
+            node_id for node_id in restored if node_id != "root"
+        )
+        self.experiments_executed = max(0, int(payload.get("budget_used", 0)))
+        self.completed_implementations = max(
+            0, int(payload.get("completed_implementations", 0))
+        )
+        self.implementation_attempts = max(0, int(payload.get("implementation_attempts", 0)))
+        self.tuning_attempts = max(0, int(payload.get("tuning_attempts", 0)))
+        self.probe_attempts = max(0, int(payload.get("probe_attempts", 0)))
+        self.ensemble_attempts = max(0, int(payload.get("ensemble_attempts", 0)))
+        self._node_counter = max(
+            (
+                int(match.group(1))
+                for node_id in restored
+                if (match := re.fullmatch(r"node(\d+)", node_id))
+            ),
+            default=0,
+        )
+        self._expanded_nodes = {
+            node_id for node_id, node in restored.items() if node.children_ids
+        }
+        merged_pairs: set[frozenset[str]] = set()
+        merge_attempts = 0
+        for node in restored.values():
+            if node.operator == "merge" and node.executed:
+                merge_attempts += 1
+                base = (node.config or {}).get("base_node_id")
+                companion = (node.config or {}).get("companion_node_id")
+                if base and companion:
+                    merged_pairs.add(frozenset({base, companion}))
+        self._merged_pairs = merged_pairs
+        self._merge_attempts = merge_attempts
+        stored_best = payload.get("best_node_id")
+        self.best_node_id = (
+            stored_best if stored_best in restored else self._pick_best_from_restored()
+        )
+        final_output = payload.get("final_output")
+        output_path = Path(final_output) if final_output else None
+        self.final_output_path = output_path if output_path and output_path.is_file() else None
+
+        # Re-propagate rewards so scheduler lineage statistics match history.
+        self.scheduler = UCB1Scheduler(self.total_budget)
+        for node in restored.values():
+            if node.node_type != "implementation" or not node.executed:
+                continue
+            result = node.result or {}
+            score_value = result.get("score")
+            if result.get("status") == "completed" and score_value is not None:
+                try:
+                    reward = self._score_to_reward(float(score_value))
+                except (TypeError, ValueError):
+                    reward = -1.0
+            elif result.get("status") == "truncated" and score_value is not None:
+                reward = -0.2
+            else:
+                reward = -1.0
+            if result.get("probe"):
+                reward *= 0.5
+            self.scheduler.backpropagate(node.node_id, reward, restored)
+        self._resumed = True
+        self._log(
+            f"Resumed {len(restored)} nodes from {path.name}; "
+            f"best={self.node_label(self.best_node_id)}; "
+            f"budget={self.experiments_executed}/{self.total_budget}."
+        )
+
+    def _pick_best_from_restored(self) -> str | None:
+        best_id: str | None = None
+        best_score: float | None = None
+        for node in self.all_nodes.values():
+            result = node.result or {}
+            if (
+                node.node_type != "implementation"
+                or result.get("status") != "completed"
+                or result.get("score") is None
+            ):
+                continue
+            try:
+                score = float(result["score"])
+            except (TypeError, ValueError):
+                continue
+            if best_score is None or self._better(score, best_score):
+                best_score = score
+                best_id = node.node_id
+        return best_id
+
     def _new_node_id(self, operator: str) -> str:
         self._node_counter += 1
         return f"node{self._node_counter}"
+
+    def _mark_dirty(self, *node_ids: str | None) -> None:
+        """Schedule per-node state files for the next incremental persist."""
+        self._dirty_node_ids.update(
+            node_id for node_id in node_ids if node_id is not None
+        )
 
     @staticmethod
     def _hypothesis_id(plan: str) -> str | None:
@@ -381,13 +554,34 @@ class ManagerAgent:
     def _better(self, left: float, right: float) -> bool:
         return left < right if self.metric_direction == "minimize" else left > right
 
-    def _improved(self, candidate: float, parent: float) -> bool:
+    def _improved(self, candidate: float, parent: float, noise: float | None = None) -> bool:
         tolerance = max(1e-9, abs(parent) * 1e-6)
+        if noise is not None and noise > 0.0:
+            tolerance = max(tolerance, self.improvement_noise_k * noise)
         return (
             candidate < parent - tolerance
             if self.metric_direction == "minimize"
             else candidate > parent + tolerance
         )
+
+    def _noise_for(self, node: NodeState | None) -> float:
+        """Estimate the evaluation noise of a measured node.
+
+        Fold dispersion, then repeated-seed dispersion, then a conservative
+        relative floor for holdout/task-native tasks without either.
+        """
+        result = (node.result or {}) if node is not None else {}
+        score_value = result.get("score")
+        if score_value is None:
+            return 0.0
+        try:
+            score = float(score_value)
+        except (TypeError, ValueError):
+            return 0.0
+        estimate = score_noise_estimate(result)
+        if estimate is not None:
+            return max(estimate, 1e-8)
+        return relative_noise_floor(score)
 
     def _score_to_reward(self, score: float) -> float:
         oriented = -float(score) if self.metric_direction == "minimize" else float(score)
@@ -399,6 +593,10 @@ class ManagerAgent:
             return False
         if operator == "tune":
             return self.tuning_attempts < self.tuning_attempt_limit
+        if operator == "probe":
+            return self.probe_attempts < self.probe_attempt_limit
+        if operator == "ensemble":
+            return self.ensemble_attempts < 1
         return self.experiments_executed < self.total_budget
 
     def _can_continue_search(self) -> bool:
@@ -419,8 +617,13 @@ class ManagerAgent:
     def _high_performer(self, score: float) -> bool:
         if self.best_node_id is None:
             return True
-        best = float(self.all_nodes[self.best_node_id].result["score"])
-        band = max(0.01, abs(best) * 0.05)
+        best_node = self.all_nodes[self.best_node_id]
+        best = float(best_node.result["score"])
+        band = max(
+            0.01,
+            abs(best) * 0.05,
+            2.0 * self._noise_for(best_node),
+        )
         return (
             score <= best + band
             if self.metric_direction == "minimize"
@@ -442,6 +645,7 @@ class ManagerAgent:
                 node.node_type == "implementation"
                 and result.get("status") == "completed"
                 and not result.get("pruned")
+                and not result.get("probe")
                 and math.isfinite(score)
             ):
                 nodes.append(node)
@@ -458,10 +662,15 @@ class ManagerAgent:
         for node in self.all_nodes.values():
             if node.node_type != "implementation" or not node.executed:
                 continue
-            dedicated_attempted = dedicated_attempted or node.operator == "architect"
             result = node.result or {}
             if result.get("status") != "completed" or result.get("score") is None:
                 continue
+            if result.get("probe"):
+                continue
+            # A completed custom-network measurement counts as coverage; a failed
+            # or invalidated architect attempt must not disable the intervention.
+            if node.operator == "architect":
+                dedicated_attempted = True
             code_track = classify_architecture(node.code or "")
             track = (
                 code_track
@@ -484,6 +693,11 @@ class ManagerAgent:
 
     def _plateau_state(self) -> dict[str, Any]:
         """Detect saturation using material score gains, not exact float equality."""
+        # Noise-aware material-gain detection: an improvement must exceed both
+        # the configured relative tolerance and the candidate's own evaluation
+        # noise (fold/seed dispersion, or a relative floor), otherwise the
+        # measurement is treated as saturation. This prevents the search from
+        # chasing noise on every task type (RL, tiny-N gene data, holdouts...).
         measured: list[tuple[str, float]] = []
         for node in self.all_nodes.values():
             result = node.result or {}
@@ -497,6 +711,7 @@ class ManagerAgent:
             if (
                 node.node_type == "implementation"
                 and result.get("status") == "completed"
+                and not result.get("probe")
                 and math.isfinite(score)
             ):
                 measured.append((node.node_id, score))
@@ -511,8 +726,13 @@ class ManagerAgent:
         last_material_index = 0
         material_improvements: list[dict[str, Any]] = []
         for index, (node_id, candidate) in enumerate(measured[1:], start=1):
+            candidate_noise = self._noise_for(self.all_nodes.get(node_id))
+            threshold = max(
+                1e-9,
+                abs(best) * self.plateau_relative_gain,
+                self.improvement_noise_k * candidate_noise,
+            )
             gain = best - candidate if self.metric_direction == "minimize" else candidate - best
-            threshold = max(1e-9, abs(best) * self.plateau_relative_gain)
             if gain > threshold:
                 material_improvements.append(
                     {
@@ -576,6 +796,83 @@ class ManagerAgent:
             )
         return None
 
+    def _architecture_revision_reason(
+        self, experiments_remaining: int
+    ) -> str | None:
+        """Trigger a residual-driven revision when a custom network already
+        improved the control but overall progress plateaued again."""
+        if (
+            not self.architecture_exploration_enabled
+            or self.total_budget < self.architecture_min_budget
+            or experiments_remaining <= 0
+            or self.best_node_id is None
+        ):
+            return None
+        architecture_nodes = [
+            node
+            for node in self.all_nodes.values()
+            if node.node_type == "implementation"
+            and node.executed
+            and node.operator == "architect"
+            and (node.result or {}).get("status") == "completed"
+            and not (node.result or {}).get("probe")
+        ]
+        if not architecture_nodes:
+            return None
+        if len(architecture_nodes) >= self.max_architect_iterations:
+            return None
+        last = max(
+            architecture_nodes,
+            key=lambda node: float((node.result or {}).get("score", float("-inf"))),
+        )
+        base = self.all_nodes.get(str((last.config or {}).get("base_node_id")))
+        if (
+            base is None
+            or not base.result
+            or base.result.get("score") is None
+        ):
+            return None
+        if not self._improved(
+            float(last.result["score"]),
+            float(base.result["score"]),
+            noise=self._noise_for(base),
+        ):
+            return None
+        plateau = self._plateau_state()
+        if not plateau.get("plateaued"):
+            return None
+        return (
+            f"architecture revision {len(architecture_nodes)} of "
+            f"{self.max_architect_iterations}: the custom network "
+            f"{self.node_label(last.node_id)} improved its control, but measured "
+            "progress plateaued again; run a residual-error-driven revision"
+        )
+
+    def _architect_residual_evidence(self) -> str:
+        """Summarize the latest custom-network measurement for the next revision."""
+        lines: list[str] = []
+        for node in self.all_nodes.values():
+            result = node.result or {}
+            if (
+                node.node_type != "implementation"
+                or not node.executed
+                or node.operator != "architect"
+                or result.get("status") != "completed"
+                or result.get("probe")
+            ):
+                continue
+            base = self.all_nodes.get(str((node.config or {}).get("base_node_id")))
+            base_score = (
+                (base.result or {}).get("score") if base is not None else None
+            )
+            lines.append(
+                f"- {self.node_label(node.node_id)}: score={result.get('score')} "
+                f"(control {base.node_id if base else 'none'}="
+                f"{base_score}); plan: {self._clean_plan_text(node.plan)[:400]}; "
+                f"diagnostics tail: {str(result.get('diagnostics', ''))[-1200:]}"
+            )
+        return "\n".join(lines[-2:])
+
     def _branch_root_id(self, node: NodeState) -> str:
         current = node
         seen: set[str] = set()
@@ -634,6 +931,7 @@ class ManagerAgent:
         summary = " ".join(plan.split())[:240]
         verb = "Created" if executed else "Queued"
         self._log(f"{verb} {self.node_label(node_id)} planning node ({operator}): {summary}")
+        self._mark_dirty(node_id, parent.node_id if parent else None)
         self._persist_tree_state()
         return node
 
@@ -645,8 +943,14 @@ class ManagerAgent:
         parent: NodeState | None = None,
         base: NodeState | None = None,
         companion: NodeState | None = None,
+        probe: bool = False,
     ) -> NodeState:
-        """Execute one scientific experiment with failure isolation."""
+        """Execute one scientific experiment with failure isolation.
+
+        ``probe`` marks a cheap screening run: it never consumes the idea
+        budget, never updates the measured baseline, and its score is only
+        used to decide whether to promote the plan to a full run.
+        """
         node_id = self._new_node_id(operator)
         base_config = dict(base.config or {}) if base else {}
         config = {
@@ -656,6 +960,9 @@ class ManagerAgent:
             "refine_depth": int(base_config.get("refine_depth", 0)) + (operator == "refine"),
             "diversify_depth": int(base_config.get("diversify_depth", 0)) + (operator == "diversify"),
             "architecture_track": classify_architecture(plan),
+            "architect_count": int(base_config.get("architect_count", 0))
+            + (1 if operator == "architect" else 0),
+            "family_fingerprint": _family_fingerprint(plan),
             **self._council_node_config(plan),
         }
         if base_config.get("hypothesis_id") and not config.get("hypothesis_id"):
@@ -671,20 +978,46 @@ class ManagerAgent:
         self.all_nodes[node_id] = node
         if parent is not None:
             parent.children_ids.append(node_id)
+        self._mark_dirty(node_id, parent.node_id if parent else None)
 
         self.implementation_attempts += 1
         if operator == "tune":
             self.tuning_attempts += 1
+        if operator == "probe":
+            self.probe_attempts += 1
+        if operator == "ensemble":
+            self.ensemble_attempts += 1
         display_name = self.node_label(node_id)
         accounting = (
             f"free tuning {self.tuning_attempts}/{self.tuning_attempt_limit}"
             if operator == "tune"
+            else f"free probe {self.probe_attempts}/{self.probe_attempt_limit}"
+            if operator == "probe"
             else f"idea budget {self.experiments_executed}/{self.total_budget}"
         )
         self._log(
             f"Starting {operator} {display_name}; attempt {self.implementation_attempts}/"
             f"{self.attempt_limit}, {accounting}."
         )
+        abort_context = None
+        if (
+            not probe
+            and self.abort_iterative_enabled
+            and self.best_node_id is not None
+        ):
+            best = self.all_nodes[self.best_node_id]
+            if best.result and best.result.get("score") is not None:
+                try:
+                    best_score = float(best.result["score"])
+                    noise = self._noise_for(best)
+                    abort_context = {
+                        "best_score": best_score,
+                        "direction": self.metric_direction,
+                        "margin": max(1e-9, noise * self.abort_margin_std),
+                        "patience": 2,
+                    }
+                except (TypeError, ValueError):
+                    abort_context = None
         try:
             result = self.implementation_agent.run(
                 self.run_root / node_id,
@@ -695,8 +1028,10 @@ class ManagerAgent:
                 companion_code=companion.code if companion else None,
                 operator=operator,
                 node_label=display_name,
-                max_debug_attempts=5,
+                max_debug_attempts=3 if probe else 5,
                 council_brief=self.council_brief,
+                probe=probe,
+                abort_context=abort_context,
             )
         except Exception as exc:
             result = {
@@ -732,16 +1067,53 @@ class ManagerAgent:
                 )
                 completed = False
 
+        truncated = result.get("status") == "truncated" and result.get("score") is not None
+        if truncated:
+            result["budget_charged"] = False
+            result["reward"] = -0.2
+            self.scheduler.backpropagate(node_id, -0.2, self.all_nodes)
+            self._log(
+                f"{display_name} stopped early (truncated) with score="
+                f"{float(result['score']):.8g}; the idea budget is preserved."
+            )
+            self._persist_tree_state()
+            return node
+
+        if probe or operator == "ensemble":
+            if completed:
+                score = float(result["score"])
+                reward = self._score_to_reward(score) * 0.5
+                result["reward"] = reward
+                result["probe"] = bool(probe)
+                result["budget_charged"] = False
+                self.scheduler.backpropagate(node_id, reward, self.all_nodes)
+                self._log(
+                    f"Completed {display_name}: {'probe' if probe else 'ensemble'} "
+                    f"score={score:.8g}; no idea budget charged."
+                )
+            else:
+                result["probe"] = bool(probe)
+                result["budget_charged"] = False
+                diagnostic = (
+                    " ".join(str(result.get("diagnostics", "unknown error")).split())[-500:]
+                )
+                self.scheduler.backpropagate(node_id, -1.0, self.all_nodes)
+                self._log(
+                    f"{display_name} ({'probe' if probe else 'ensemble'}) failed; "
+                    f"budget preserved: {diagnostic}"
+                )
+            self._persist_tree_state()
+            return node
+
         if completed:
             score = float(result["score"])
             reward = self._score_to_reward(score)
             result["reward"] = reward
-            budget_charged = operator != "tune"
+            budget_charged = operator not in {"tune", "probe", "ensemble"}
             result["budget_charged"] = budget_charged
             self.completed_implementations += 1
             if budget_charged:
                 self.experiments_executed += 1
-            self.scheduler.current_step = self.completed_implementations
             self.scheduler.backpropagate(node_id, reward, self.all_nodes)
             previous_best = self.best_node_id
             if self.best_node_id is None:
@@ -753,7 +1125,7 @@ class ManagerAgent:
             self._log(
                 f"Completed {display_name}: score={score:.8g}; "
                 f"idea budget={self.experiments_executed}/{self.total_budget}; "
-                f"budget charged={'yes' if budget_charged else 'no (tuning)'}; "
+                f"budget charged={'yes' if budget_charged else 'no (tuning/probe)'}; "
                 f"output={result.get('output')}."
             )
             if self.best_node_id != previous_best:
@@ -772,6 +1144,7 @@ class ManagerAgent:
         node.result["pruned_reason"] = reason
         node.config = dict(node.config or {})
         node.config["pruned_reason"] = reason
+        self._mark_dirty(node.node_id)
         self._log(f"Pruned {self.node_label(node.node_id)}: {reason}")
 
     def _assess_child(self, child: NodeState, base: NodeState | None) -> bool:
@@ -782,7 +1155,9 @@ class ManagerAgent:
             return True
         child_score = float(child.result["score"])
         base_score = float(base.result["score"])
-        if not self._improved(child_score, base_score):
+        if not self._improved(
+            child_score, base_score, noise=self._noise_for(base)
+        ):
             tune_depth = int((child.config or {}).get("tune_depth", 0))
             if (
                 child.operator != "tune"
@@ -877,6 +1252,8 @@ class ManagerAgent:
             actions = [("tune", 0.75)] if tune_depth < self.max_tune_depth else []
         elif node.operator == "architect":
             actions = [("tune", 0.62), ("refine", 0.3), ("diversify", 0.1)]
+            if int((node.config or {}).get("architect_count", 0)) < self.max_architect_iterations:
+                actions = [("architect", 0.5), *actions]
         elif node.operator == "refine":
             actions = [("tune", 0.52), ("refine", 0.28), ("diversify", 0.14)]
         elif node.operator == "tune":
@@ -904,6 +1281,7 @@ class ManagerAgent:
             queue = list(base.children_ids)
             seen: set[str] = set()
             base_score = float(base.result["score"])
+            base_noise = self._noise_for(base)
             while queue:
                 node_id = queue.pop(0)
                 if node_id in seen:
@@ -918,7 +1296,10 @@ class ManagerAgent:
                     and result.get("status") == "completed"
                     and result.get("score") is not None
                     and not result.get("pruned")
-                    and self._improved(float(result["score"]), base_score)
+                    and not result.get("probe")
+                    and self._improved(
+                        float(result["score"]), base_score, noise=base_noise
+                    )
                 ):
                     return True
                 queue.extend(descendant.children_ids)
@@ -988,8 +1369,9 @@ class ManagerAgent:
                     f"plan_summary={self._clean_plan_text(node.plan)[:350]}"
                     for node in self.all_nodes.values()
                     if node.node_type == "implementation"
-                    and node.result
-                    and node.result.get("status") == "completed"
+                    and node.executed
+                    and (node.result or {}).get("status") == "completed"
+                    and not (node.result or {}).get("probe")
                 )
                 plan = self.technique_agent.propose_architecture_exploration(
                     self.task_analysis,
@@ -998,6 +1380,7 @@ class ManagerAgent:
                     measured_alternatives=measured_context,
                     plateau_evidence=json.dumps(self._plateau_state(), default=str),
                     require_custom=True,
+                    residual_evidence=self._architect_residual_evidence(),
                 )
             else:
                 measured_context = "\n".join(
@@ -1007,8 +1390,9 @@ class ManagerAgent:
                     f"plan_summary={self._clean_plan_text(node.plan)[:300]}"
                     for node in list(self.all_nodes.values())[-16:]
                     if node.node_type == "implementation"
-                    and node.result
-                    and node.result.get("status") == "completed"
+                    and node.executed
+                    and (node.result or {}).get("status") == "completed"
+                    and not (node.result or {}).get("probe")
                 )
                 plan = self.technique_agent.propose_follow_up(
                     self.task_analysis,
@@ -1033,6 +1417,31 @@ class ManagerAgent:
         planning.executed = True
         planning.config["materialized"] = True
         planning.config["architecture_track"] = classify_architecture(plan)
+
+        if planning.operator == "diversify":
+            guarded = self._diversify_gate(plan, base, planning)
+            if guarded is None:
+                planning.result = {
+                    "status": "pruned",
+                    "planning_only": True,
+                    "pruned": True,
+                    "pruned_reason": (
+                        "diversify proposal duplicated a measured family or failed "
+                        "its cheap screening probe"
+                    ),
+                }
+                planning.config["pruned_reason"] = planning.result["pruned_reason"]
+                self._log(
+                    f"Diverted {self.node_label(planning.node_id)}: "
+                    f"{planning.result['pruned_reason']}."
+                )
+                self._persist_tree_state()
+                return None
+            plan = guarded
+            planning.plan = plan
+            planning.config["architecture_track"] = classify_architecture(plan)
+
+        planning.config["family_fingerprint"] = _family_fingerprint(plan)
         planning.result = {"status": "completed", "planning_only": True}
         self._log(
             f"Materialized {self.node_label(planning.node_id)} ({planning.operator}) "
@@ -1048,7 +1457,7 @@ class ManagerAgent:
         )
         if child.result is not None and companion is not None:
             child.result["merged_with"] = companion.node_id
-        if self._assess_child(child, base):
+        if not (child.result or {}).get("probe") and self._assess_child(child, base):
             self._spawn_follow_up_nodes(child)
         self._persist_tree_state()
         return child
@@ -1171,7 +1580,10 @@ class ManagerAgent:
         candidates = list(strongest_by_branch.values())
         if len(candidates) < 2:
             return None
-        return self._merge_two_nodes(candidates[0], candidates[1])
+        pair = self._merge_pair(candidates)
+        if pair is None:
+            return None
+        return self._merge_two_nodes(pair[0], pair[1])
 
     def _run_root_plan(self, plan: str, *, replacement: bool = False) -> NodeState:
         planning = self._create_planning_node(
@@ -1215,14 +1627,199 @@ class ManagerAgent:
             self._spawn_follow_up_nodes(recovered)
         return recovered
 
-    def run_tree_search(self) -> str | None:
-        """Run council-directed planning and measured implementation search."""
-        self._log("=" * 62)
-        self._log(f"Starting adaptive method tree search for {self.task_name}.")
-        self._log("=" * 62)
+    def _run_probe(
+        self,
+        plan: str,
+        *,
+        base: NodeState | None = None,
+        parent: NodeState | None = None,
+    ) -> NodeState | None:
+        """Run one cheap screening implementation; never charges the idea budget."""
+        if not self._can_attempt("probe"):
+            return None
+        planning = self._create_planning_node(
+            plan,
+            operator="probe",
+            parent=(parent or self.all_nodes["root"]),
+            executed=True,
+            priority=0.0,
+            base=base,
+        )
+        child = self._execute(
+            plan,
+            operator="probe",
+            parent=planning,
+            base=base,
+            probe=True,
+        )
+        return child
 
-        self._prepare_research_council()
+    def _promote_probe(self, probe_node: NodeState, plan: str) -> NodeState:
+        """Promote a passed cheap probe to a full budgeted implementation."""
+        planning = self._create_planning_node(
+            plan
+            + "\nThis run replaces a successful cheap screening probe. Use the FULL "
+            "dataset and full iterations/epochs for this implementation while "
+            "preserving the same split, metric, paths, and output schema.",
+            operator="root",
+            parent=probe_node,
+            executed=True,
+            priority=0.0,
+            base=probe_node,
+        )
+        root = self._execute(plan, operator="root", parent=planning, base=probe_node)
+        if root.result and root.result.get("status") == "completed":
+            self._spawn_follow_up_nodes(root)
+        return root
 
+    def _family_collisions(self, fingerprint: str) -> list[str]:
+        """Return measured nodes sharing the same model-family fingerprint."""
+        if not fingerprint:
+            return []
+        hits: list[str] = []
+        for node in self.all_nodes.values():
+            if node.node_type != "implementation" or not node.executed:
+                continue
+            result = node.result or {}
+            if result.get("status") not in {"completed", "truncated"}:
+                continue
+            if result.get("probe"):
+                continue
+            node_fingerprint = (node.config or {}).get("family_fingerprint")
+            if not node_fingerprint:
+                node_fingerprint = _family_fingerprint(node.plan or "")
+            if node_fingerprint and node_fingerprint == fingerprint:
+                hits.append(self.node_label(node.node_id))
+        return hits
+
+    def _diversify_gate(
+        self,
+        plan: str,
+        base: NodeState,
+        planning: NodeState,
+    ) -> str | None:
+        """Enforce family diversity and cheap screening before a full run."""
+        fingerprint = _family_fingerprint(plan)
+        collisions = self._family_collisions(fingerprint)
+        if collisions:
+            guard_message = (
+                "FAMILY GUARD (hard constraint): your proposal repeats an already "
+                f"measured model-family fingerprint '{fingerprint}' seen in nodes "
+                f"{', '.join(collisions[:6])}. Propose a genuinely different model family."
+            )
+            self._log(
+                f"Diversify family collision detected; requesting a re-plan: "
+                f"{guard_message[:300]}"
+            )
+            try:
+                re_plan = self.technique_agent.propose_follow_up(
+                    self.task_analysis,
+                    "diversify",
+                    base.plan or "",
+                    float(base.result["score"]),
+                    str(base.result.get("diagnostics", "")),
+                    search_context=guard_message,
+                    avoid_families=guard_message,
+                )
+            except Exception as exc:
+                self._log(f"Diversify re-plan failed: {exc}")
+                re_plan = ""
+            if (
+                re_plan
+                and _family_fingerprint(re_plan)
+                and not self._family_collisions(_family_fingerprint(re_plan))
+            ):
+                plan = re_plan
+                fingerprint = _family_fingerprint(re_plan)
+                self._log(
+                    "Diversify re-plan passed the family guard "
+                    f"(fingerprint '{fingerprint}')."
+                )
+            else:
+                self._log(
+                    "Diversify proposal could not escape the measured family set; "
+                    "discarding the action."
+                )
+                return None
+        if self.diversify_probe_enabled and self._can_attempt("probe"):
+            probe_node = self._run_probe(plan, base=base, parent=planning)
+            if (
+                probe_node is None
+                or not probe_node.result
+                or probe_node.result.get("status") != "completed"
+            ):
+                self._log(
+                    f"Diversify {self.node_label(planning.node_id)} failed its cheap "
+                    "probe; skipping the full run."
+                )
+                return None
+            probe_score = float(probe_node.result["score"])
+            if not self._improved(
+                probe_score, float(base.result["score"]), noise=self._noise_for(base)
+            ):
+                self._log(
+                    f"Diversify probe score {probe_score:.8g} did not beat base "
+                    f"{base.result.get('score')} within evaluation noise; skipping "
+                    "the full run and saving compute."
+                )
+                return None
+            self._log(
+                f"Diversify probe {probe_score:.8g} cleared the base; running the "
+                "full implementation."
+            )
+        return plan
+
+    def _signature_provider(self, node: NodeState) -> list[float] | None:
+        """Prediction signature of a pending action's measured parent."""
+        base = self.all_nodes.get(str((node.config or {}).get("base_node_id")))
+        if base is None:
+            return None
+        return signature_from_result(base.result)
+
+    def _incumbent_signature(self) -> list[float] | None:
+        if self.best_node_id is None:
+            return None
+        return signature_from_result(self.all_nodes[self.best_node_id].result)
+
+    def _pair_correlation(self, first: NodeState, second: NodeState) -> float:
+        first_signature = signature_from_result(first.result)
+        second_signature = signature_from_result(second.result)
+        if first_signature is None or second_signature is None:
+            return 0.0
+        return pearson_correlation(first_signature, second_signature)
+
+    def _merge_pair(
+        self, candidates: list[NodeState]
+    ) -> tuple[NodeState, NodeState] | None:
+        """Pick the pair with the best score and prediction-complementarity
+        tradeoff; falls back to the top two scores when no signatures exist."""
+        pool = list(candidates)
+        if len(pool) < 2:
+            return None
+        pool.sort(
+            key=lambda node: float(node.result["score"]),
+            reverse=self.metric_direction != "minimize",
+        )
+        pool = pool[:8]
+        best_key = float("-inf")
+        best_pair: tuple[NodeState, NodeState] | None = None
+        for index in range(len(pool)):
+            for other in range(index + 1, len(pool)):
+                first = pool[index]
+                second = pool[other]
+                correlation = self._pair_correlation(first, second)
+                score_sum = float(first.result["score"]) + float(second.result["score"])
+                key = score_sum * (
+                    1.0 + self.complementarity_weight * (1.0 - abs(correlation))
+                )
+                if key > best_key:
+                    best_key = key
+                    best_pair = (first, second)
+        return best_pair
+
+    def _plan_initial_roots(self) -> None:
+        """Probe a broad candidate portfolio, then promote the strongest
+        measured plans to full implementations (successive halving)."""
         if self.council_brief is not None:
             candidate_count = min(
                 self.total_budget,
@@ -1264,18 +1861,60 @@ class ManagerAgent:
             self._log(f"Plan {index} [{role}]: {' '.join(plan.split())[:240]}")
 
         root_nodes: list[NodeState] = []
-        for plan in primary:
-            candidate_plan: str | None = plan
-            replacement = False
-            while candidate_plan is not None and self._can_attempt("root"):
-                root = self._run_root_plan(candidate_plan, replacement=replacement)
-                if root.result and root.result.get("status") == "completed":
-                    root_nodes.append(root)
+        if self._can_attempt("probe"):
+            self._log(
+                f"Probe-first: cheap screening of {len(plans)} candidate root plans "
+                "before spending full budget."
+            )
+            probed: list[tuple[NodeState, str]] = []
+            for root_plan in plans:
+                if not self._can_attempt("probe"):
                     break
-                candidate_plan = self._backup_plans.pop(0) if self._backup_plans else None
-                replacement = True
-                if candidate_plan is not None:
-                    self._log("Promoting a backup root because the prior implementation failed.")
+                probe_node = self._run_probe(root_plan)
+                if (
+                    probe_node is not None
+                    and probe_node.result
+                    and probe_node.result.get("status") == "completed"
+                ):
+                    probed.append((probe_node, root_plan))
+            if probed:
+                probed.sort(
+                    key=lambda pair: float(pair[0].result["score"]),
+                    reverse=self.metric_direction != "minimize",
+                )
+                promote_count = min(self.initial_fanout, len(probed))
+                self._log(
+                    f"Probe screening produced {len(probed)} runnable candidates; "
+                    f"promoting the top {promote_count} to full implementations."
+                )
+                for probe_node, candidate_plan in probed[:promote_count]:
+                    if not self._can_attempt("root"):
+                        break
+                    root = self._promote_probe(probe_node, candidate_plan)
+                    if root.result and root.result.get("status") == "completed":
+                        root_nodes.append(root)
+        if not root_nodes:
+            # All probes failed (or probing was unavailable); fall back to the
+            # direct full baseline path so a screening failure never blocks.
+            self._log(
+                "No probe passed; falling back to direct full root implementations."
+            )
+            for plan in primary:
+                candidate_plan: str | None = plan
+                replacement = False
+                while candidate_plan is not None and self._can_attempt("root"):
+                    root = self._run_root_plan(candidate_plan, replacement=replacement)
+                    if root.result and root.result.get("status") == "completed":
+                        root_nodes.append(root)
+                        break
+                    candidate_plan = (
+                        self._backup_plans.pop(0) if self._backup_plans else None
+                    )
+                    replacement = True
+                    if candidate_plan is not None:
+                        self._log(
+                            "Promoting a backup root because the prior implementation failed."
+                        )
 
         while self.best_node_id is None and self._can_attempt("recovery"):
             if self._backup_plans:
@@ -1294,18 +1933,38 @@ class ManagerAgent:
                 self._log(f"Running mandatory rescue tuning for weak {self.node_label(root.node_id)}.")
                 self._tune(root)
 
+    def run_tree_search(self) -> str | None:
+        """Run council-directed planning and measured implementation search."""
+        self._log("=" * 62)
+        self._log(f"Starting adaptive method tree search for {self.task_name}.")
+        self._log("=" * 62)
+
+        if self._resumed:
+            # The council brief is not serialized for reload; re-running the
+            # council on resume would duplicate costly research work. Existing
+            # nodes already carry their protocol hashes in config.
+            self._log(
+                "Skipping initial root planning; executing the restored frontier instead."
+            )
+        else:
+            self._prepare_research_council()
+            self._plan_initial_roots()
+
         action_guard = self.attempt_limit * 4 + 16
         actions = 0
         while self._can_continue_search() and actions < action_guard:
             actions += 1
             self._prune_stale_frontier()
 
-            # Collect executed node results for LLM evaluation
+            # Collect executed node results for LLM evaluation (cheap screening
+            # probes are internal evidence and are excluded from the LLM history).
             nodes_history = []
             for nid, node in self.all_nodes.items():
                 if nid == "root" or not node.executed:
                     continue
                 res = node.result or {}
+                if res.get("probe"):
+                    continue
                 nodes_history.append(
                     {
                         "node_id": nid,
@@ -1335,8 +1994,9 @@ class ManagerAgent:
             plateau_state = self._plateau_state()
             architecture_coverage = self._architecture_coverage()
 
-            architecture_trigger = self._architecture_intervention_reason(
-                experiments_remaining
+            architecture_trigger = (
+                self._architecture_intervention_reason(experiments_remaining)
+                or self._architecture_revision_reason(experiments_remaining)
             )
             if architecture_trigger and self.best_node_id is not None:
                 self._log(
@@ -1381,11 +2041,13 @@ class ManagerAgent:
                     and self.all_nodes[tid].executed
                     and self.all_nodes[tid].result
                     and self.all_nodes[tid].result.get("status") == "completed"
+                    and not self.all_nodes[tid].result.get("probe")
                 ]
                 if len(target_nodes) < 2:
                     succ = self._successful_nodes()
-                    if len(succ) >= 2:
-                        target_nodes = succ[:2]
+                    pair = self._merge_pair(succ)
+                    if pair is not None:
+                        target_nodes = [pair[0], pair[1]]
                 if len(target_nodes) >= 2:
                     merged = self._merge_two_nodes(target_nodes[0], target_nodes[1], custom_plan=custom_plan)
                     if merged is not None:
@@ -1405,8 +2067,12 @@ class ManagerAgent:
 
             if action in {"tune", "refine"} and target_ids:
                 target_id = target_ids[0]
-                if target_id in self.all_nodes and self.all_nodes[target_id].executed:
-                    target_node = self.all_nodes[target_id]
+                target_node = self.all_nodes.get(target_id)
+                if (
+                    target_node is not None
+                    and target_node.executed
+                    and not (target_node.result or {}).get("probe")
+                ):
                     if action == "tune" and self._can_attempt("tune"):
                         res = self._tune(target_node)
                         if res is not None:
@@ -1416,8 +2082,15 @@ class ManagerAgent:
                         if res is not None:
                             continue
 
-            # Heuristic selection fallback via scheduler
-            frontier_scores = self.scheduler.frontier_scores("root", self.all_nodes)
+            # Heuristic selection fallback via scheduler (lineage UCB plus a
+            # prediction-complementarity bonus toward the incumbent signature).
+            frontier_scores = self.scheduler.frontier_scores(
+                "root",
+                self.all_nodes,
+                best_signature=self._incumbent_signature(),
+                signature_provider=self._signature_provider,
+                complementarity_weight=self.complementarity_weight,
+            )
             eligible_ids = {
                 node_id
                 for node_id in frontier_scores
@@ -1457,21 +2130,214 @@ class ManagerAgent:
                 f"{self.metric_name}={score}; idea budget={self.experiments_executed}/"
                 f"{self.total_budget}; completed implementations="
                 f"{self.completed_implementations}; free tuning attempts="
-                f"{self.tuning_attempts}; total attempts={self.implementation_attempts}."
+                f"{self.tuning_attempts}; screening probes="
+                f"{self.probe_attempts}; total attempts={self.implementation_attempts}."
             )
         self._persist_tree_state()
         return self.best_node_id
+
+    def _verify_final_node(self, node: NodeState) -> None:
+        """Re-run the winning program once and compare the reproduced score.
+
+        The stored score is self-reported by the generated program; re-running it
+        against the same node inputs checks that the reported evaluation is
+        reproducible. A mismatch only warns and preserves the validated deliverable.
+        """
+        if not self._env_enabled("AIBUILDAI_FINAL_VERIFY", default=True):
+            return
+        try:
+            node_dir = self.run_root / node.node_id
+            source = node_dir / "algorithm.py"
+            if not source.is_file():
+                return
+            child_env = sanitized_subprocess_env()
+            child_env.update(
+                {
+                    "PYTHONUNBUFFERED": "1",
+                    "OMP_NUM_THREADS": os.getenv("AIBUILDAI_MODEL_THREADS", "4"),
+                    "MKL_NUM_THREADS": os.getenv("AIBUILDAI_MODEL_THREADS", "4"),
+                }
+            )
+            for proxy in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+                child_env[proxy] = "http://127.0.0.1:9"
+            child_env.pop("NO_PROXY", None)
+            child_env.pop("no_proxy", None)
+            self._log(
+                f"Re-running {self.node_label(node.node_id)} once to verify the reported score."
+            )
+            completed = run_supervised_process(
+                [self.python, str(source)],
+                cwd=node_dir,
+                env=child_env,
+                stall_seconds=1800.0,
+                hard_limit_seconds=7200.0,
+                activity_root=node_dir,
+                label=f"Final verification of {self.node_label(node.node_id)}",
+            )
+            payload = {}
+            result_path = node_dir / "result.json"
+            try:
+                payload = json.loads(result_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                pass
+            verification: dict[str, Any] = {
+                "returncode": completed.returncode,
+                "elapsed_seconds": round(completed.elapsed_seconds, 3),
+                "termination_reason": completed.termination_reason,
+            }
+            if not isinstance(payload, dict) or payload.get("score") is None:
+                verification["outcome"] = "no_reproducible_score"
+                self._log("Final verification produced no score; keeping the stored deliverable.")
+            else:
+                try:
+                    new_score = float(payload["score"])
+                    verification["reported_score"] = new_score
+                except (TypeError, ValueError):
+                    new_score = math.nan
+                stored_score = float(node.result["score"])
+                tolerance = max(1e-4, abs(stored_score) * 0.01)
+                if math.isfinite(new_score) and abs(new_score - stored_score) <= tolerance:
+                    verification["outcome"] = "consistent"
+                    self._log(
+                        f"Final verification reproduced score {new_score:.8g} "
+                        f"(stored {stored_score:.8g})."
+                    )
+                else:
+                    verification["outcome"] = "inconsistent"
+                    self._log(
+                        f"WARNING: final verification reproduced score {new_score:.8g} "
+                        f"but the stored score is {stored_score:.8g}; keeping the stored "
+                        "validated deliverable."
+                    )
+            node.result = dict(node.result or {})
+            node.result["final_verification"] = verification
+            self._mark_dirty(node.node_id)
+            self._persist_tree_state()
+        except Exception as exc:
+            self._log(
+                f"Final verification was skipped: {type(exc).__name__}: {exc}"
+            )
+
+    def _ensemble_candidates(self) -> list[NodeState]:
+        """Completed measured nodes that stored OOF predictions on disk."""
+        candidates: list[NodeState] = []
+        for node in self._successful_nodes():
+            if node.operator == "ensemble":
+                continue
+            oof_path = (node.result or {}).get("oof_predictions")
+            if oof_path and Path(str(oof_path)).is_file():
+                candidates.append(node)
+        return candidates
+
+    def _build_final_ensemble(self) -> NodeState | None:
+        """Blend the stored OOF predictions of the strongest measured nodes."""
+        if not self._can_attempt("ensemble"):
+            return None
+        candidates = self._ensemble_candidates()
+        if len(candidates) < 2:
+            self._log(
+                "Final ensemble skipped: fewer than two measured nodes stored "
+                "OOF predictions (expected when tasks have no labeled validation set)."
+            )
+            return None
+        top = candidates[:5]
+        first = top[0]
+        pair = self._merge_pair(top)
+        second = pair[1] if pair is not None and pair[1] is not first else top[1]
+        path_lines = []
+        for node in top:
+            path_lines.append(
+                f"- ../{node.node_id}/oof_predictions.npz (arrays `oof_pred`, "
+                "`oof_index`, `test_pred`, `test_index`)"
+            )
+        plan = (
+            "FINAL ENSEMBLE STEP (mandatory):\n"
+            "- Each measured parent below saved out-of-fold and test predictions:\n"
+            + "\n".join(path_lines)
+            + "\n- Load every parent's `oof_pred`/`oof_index` and the labels for those "
+            "validation rows from the council-approved inputs exactly as the parents did "
+            "(inspect the parent code).\n"
+            "- Optimize non-negative blend weights over the parents on the shared metric "
+            f"({self.metric_name} {self.metric_direction}) with a bounded search "
+            "(random/grid over the simplex, at most 300 evaluations, early stopping), "
+            "preferring simpler weight vectors.\n"
+            "- Compare the winning blend against every parent on the identical validation "
+            "rows; if it does not beat the best parent, emit the best parent's `test_pred` "
+            "unchanged.\n"
+            f"- Apply the chosen weights to the parents' `test_pred`/`test_index` and write "
+            "the requested deliverable with the same sample schema (inspect each "
+            "`../{node_id}/submission*` directory for the exact contract).\n"
+            "- Write `result.json` with the shared `evaluation_protocol_hash`, `fold_scores`, "
+            "`validation_sample_count`, and the chosen score."
+        )
+        self._log(
+            f"Building final OOF ensemble over {len(top)} stored prediction sets."
+        )
+        planning = self._create_planning_node(
+            plan,
+            operator="ensemble",
+            parent=first,
+            executed=True,
+            priority=0.0,
+            base=first,
+            companion=second,
+            merge_sources=[node.node_id for node in top],
+        )
+        child = self._execute(
+            plan,
+            operator="ensemble",
+            parent=planning,
+            base=first,
+            companion=second,
+        )
+        self._persist_tree_state()
+        return child
 
     def generate_final_submission(self, best_node_id: str) -> bool:
         node = self.all_nodes.get(best_node_id)
         if node is None or not node.result or not node.result.get("output"):
             return False
+        chosen = node
+        if (
+            self.final_ensemble_enabled
+            and self.council_brief is not None
+            and self.council_brief.evaluation_protocol.mode == "cross_validation"
+        ):
+            try:
+                ensemble_node = self._build_final_ensemble()
+            except Exception as exc:
+                self._log(f"Final ensemble failed and was skipped: {exc}")
+                ensemble_node = None
+            if (
+                ensemble_node is not None
+                and ensemble_node.result
+                and ensemble_node.result.get("status") == "completed"
+                and ensemble_node.result.get("score") is not None
+            ):
+                ensemble_score = float(ensemble_node.result["score"])
+                best_score = float(node.result["score"])
+                if self._improved(
+                    ensemble_score, best_score, noise=self._noise_for(node)
+                ):
+                    chosen = ensemble_node
+                    self.best_node_id = ensemble_node.node_id
+                    self._log(
+                        f"Final ensemble {self.node_label(ensemble_node.node_id)} "
+                        f"improved the best deliverable ({best_score:.8g} -> "
+                        f"{ensemble_score:.8g}); using its output."
+                    )
+                else:
+                    self._log(
+                        f"Final ensemble scored {ensemble_score:.8g} without beating "
+                        f"the best node ({best_score:.8g}); keeping the best deliverable."
+                    )
+        self._verify_final_node(chosen)
         validation = self.submission_validator.validate(
-            str(node.result["output"]),
+            str(chosen.result["output"]),
             self.task_analysis,
-            allowed_root=self.run_root / node.node_id,
+            allowed_root=self.run_root / chosen.node_id,
         )
-        node.result["final_submission_validation"] = validation.to_dict()
+        chosen.result["final_submission_validation"] = validation.to_dict()
         if not validation.valid or validation.output_path is None:
             self._log(
                 "Final output validation failed: "
@@ -1557,25 +2423,13 @@ class ManagerAgent:
                     title = "Search Root"
                     desc = "Virtual orchestration node"
                     color, border = "#E0E0E0", "#616161"
-                elif node.node_type in ("technique", "planning"):
-                    node_kind = "Technique" if node.node_type == "technique" else "Planning"
-                    title = f"{self.node_label(node_id)} ({node_kind})"
+                elif node.node_type == "planning":
+                    title = f"{self.node_label(node_id)} (Planning)"
                     if not node.executed:
                         desc = f"PENDING — not executed within budget\n{self._clean_plan_text(node.plan)}"
                         color, border = "#FFF8E1", "#F9A825"
                     else:
-                        tech_record = (node.config or {}).get("technique_record", {})
-                        tech_status = tech_record.get("status", "completed")
-                        artifact_id = tech_record.get("artifact_id")
-                        if tech_status == "pool_hit":
-                            desc = f"Pool hit: {artifact_id}"
-                        elif tech_status == "pool_added":
-                            desc = f"Web artifact added to pool: {artifact_id}"
-                        elif tech_status == "bootstrap_failed":
-                            candidate = tech_record.get("candidate_artifact", {}).get("artifact_id")
-                            desc = f"Candidate failed verification: {candidate}\nFallback plan retained"
-                        else:
-                            desc = self._clean_plan_text(node.plan or tech_record.get("plan", f"{node_kind} completed"))
+                        desc = self._clean_plan_text(node.plan)
                         color, border = "#E3F2FD", "#1565C0"
                 else:  # implementation
                     res = node.result or {}
@@ -1589,17 +2443,8 @@ class ManagerAgent:
                         desc = "FAILED / Crashed"
                         color, border = "#FFEBEE", "#C62828"
                     else:
-                        tech_record = node.config.get("technique_record", {}) if node.config else {}
-                        artifact_id = tech_record.get("artifact_id")
-                        op = node.operator or 'root'
-                        fid = getattr(node, 'fidelity', None)
-                        op_fid = f"{op} / {fid}" if fid else op
-                        if artifact_id:
-                            desc = f"{op_fid}\nUse: {artifact_id}\nScore: {float(score):.5f}"
-                        elif tech_record.get("status") == "bootstrap_failed":
-                            desc = f"{op_fid}\nUse: Self-contained fallback\nScore: {float(score):.5f}"
-                        else:
-                            desc = f"{op_fid}\nScore: {float(score):.5f}"
+                        op = node.operator or "root"
+                        desc = f"{op}\nScore: {float(score):.5f}"
                         color, border = "#E8F5E9", "#2E7D32"
 
                 linewidth = 2.0

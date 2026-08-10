@@ -32,6 +32,7 @@ agents/technique_agent.py     root/refine/diversify/tuning/architect/merge plann
 agents/implementation_agent.py code generation, execution, error repair, web help
 agents/submission_validator.py sample-aware, format-adaptive artifact validation
 agents/manager_agent.py       baseline selection, tuning, pruning, mid-search merges
+search_evidence.py            prediction signatures, noise estimates, family fingerprints
 agents/aggregator_agent.py    final output copying
 agents/llm_utils.py           provider selection, retries, caching, token accounting
 agents/web_search.py          bounded cached documentation search
@@ -67,8 +68,37 @@ eval/run_search.py            command-line entrypoint and Markdown result summar
   implementations consume the configured budget. Tuning is budget-free and is
   bounded independently by tune depth and tuning/implementation attempt caps.
 - Initial coverage follows the council's Pareto portfolio and remains bounded by
-  the configured budget. A failed root promotes a pre-generated backup without
+  the configured budget. The root portfolio is screened first by cheap probes
+  (bounded subsets/epochs, same protocol, budget-free): the top-scoring plans
+  are promoted to full data runs (successive halving), and a probe failure
+  falls back to direct full roots instead of blocking the search.
+- A failed root promotes a pre-generated backup without
   spending completed-experiment budget.
+- Every improvement decision is evaluation-noise aware. Noise is estimated from
+  `fold_scores` dispersion, then repeated `seed_scores` dispersion, then a
+  relative floor (`1.5e-3` of the score) when neither exists; a candidate must
+  exceed its parent by `improvement_noise_k` noise units up front. The
+  high-performer band and plateau detection use the same noise-scaled margins.
+- Completed implementations may store a fixed-size `prediction_signature` (and
+  fold/seed scores) in `result.json`. Pending frontier actions whose measured
+  parent is decorrelated with the incumbent best receive a complementarity
+  bonus (`complementarity_weight x (1 - |pearson|)`), and merge pairs are
+  chosen by score times the same complementarity term. Signature validation is
+  strict; malformed or absent signatures simply disable the term.
+- Model-family diversity is enforced as a hard fingerprint constraint: each
+  plan's family fingerprint is stored in its node config, executed families
+  collide structurally, and a `diversify` proposal repeating a measured family
+  triggers exactly one re-plan before the action is discarded. A
+  `diversify` action that passes the guard must also beat its base within
+  evaluation noise in a cheap probe before the full run starts.
+- Long iterative implementations receive an abort contract: after a warmup,
+  checkpointed mid-run scores are compared with the incumbent best (margin
+  `abort_margin_std` noise units, patience 2 checks). A trailing run may report
+  `status: "truncated"` with an honest score; truncated nodes refund their idea
+  budget and generate no follow-ups.
+- Tuning proposals include an explicit search-space spec and budget (bounded
+  config count, identical protocol, per-config early stopping), so tuning is a
+  searchable dimension rather than a single configuration.
 - A displaced root receives one focused rescue tune. Any completed
   underperforming refinement, diversity, or merge receives one tuner attempt;
   if it still does not improve, that measured branch is pruned.
@@ -83,6 +113,11 @@ eval/run_search.py            command-line entrypoint and Markdown result summar
   one reserved `architect` experiment when conventional progress plateaus or the
   remaining budget reaches the reserve boundary. This intervention runs before
   another merge or finalization decision.
+- The architect loop is iterative: when a completed custom-network run improved
+  its control within noise and a later plateau retriggers, the manager queues
+  another `architect` action (up to `max_architect_iterations`), passing the
+  residual evidence from the prior custom-network result versus its control to
+  the planner.
 - An architecture experiment must derive its trainable graph from observed task
   evidence, implement it from primitive PyTorch operations, and compare the custom
   mechanism with both its measured parent and a plain neural ablation. It may test
@@ -99,6 +134,13 @@ eval/run_search.py            command-line entrypoint and Markdown result summar
   scores and may intentionally retain only the strongest modality subset.
 - Once two candidates are within the high-performance band, the manager may
   request a merge before remaining roots are finished.
+- Before finalization, a single budget-free final ensemble step may run: when
+  the protocol is cross-validation and two or more measured nodes stored
+  `oof_predictions.npz`, the strongest set loads the stored out-of-fold/test
+  predictions, optimizes non-negative blend weights over the simplex on the
+  shared validation rows, and replaces the best node's deliverable only if the
+  blend beats it within evaluation noise. Nodes without stored predictions
+  (holdout, task-native, generation, RL, ...) simply skip this step.
 - Remaining budget is spent on the current best implementation, not on weak
   lineages.
 

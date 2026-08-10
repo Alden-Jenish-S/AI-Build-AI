@@ -7,12 +7,42 @@ import json
 from typing import Any, TYPE_CHECKING
 
 from .architecture_policy import classify_architecture
-from .llm_utils import call_llm
+from .llm_utils import call_llm, call_llm_json
 from .modality_policy import predictive_modality_inventory
 from .task_analyzer import TaskAnalysis
 
 if TYPE_CHECKING:
     from .council.contracts import CouncilBrief
+
+
+def _plan_requests_modality_ablation(plan: str | None) -> bool:
+    """Detect a modality-contribution request without relying on literal markers."""
+    normalized = re.sub(r"[^a-z]+", " ", str(plan or "").casefold())
+    normalized = " ".join(normalized.split())
+    if "modality scope modality ablation" in normalized:
+        return True
+    if "modality ablation" in normalized:
+        return True
+    if "leave one modality out" in normalized:
+        return True
+    return False
+
+
+_DECISION_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["action", "target_node_ids", "reasoning"],
+    "additionalProperties": False,
+    "properties": {
+        "action": {
+            "type": "string",
+            "enum": ["merge", "tune", "refine", "diversify", "architect", "finalize"],
+        },
+        "target_node_ids": {"type": "array", "items": {"type": "string"}},
+        "thinking": {"type": "string"},
+        "reasoning": {"type": "string"},
+        "plan": {"type": "string"},
+    },
+}
 
 
 class TechniqueAgent:
@@ -79,7 +109,7 @@ class TechniqueAgent:
                 unique.append(plan[:4000])
         return unique[:count]
 
-    def search_for_new_ideas(self, analysis: TaskAnalysis, query_extra: str = "") -> str:
+    def search_for_new_ideas(self, analysis: TaskAnalysis) -> str:
         """Query web search for competitive ML strategies and novel literature ideas tailored to this task."""
         if self.council_brief is not None:
             return "\n\n".join(
@@ -94,7 +124,6 @@ class TechniqueAgent:
                 "Based on the task description and data properties above, formulate a highly effective "
                 "web search query to find state-of-the-art machine learning architectures, novel literature, "
                 f"or general ML strategies specific to this problem type. The target metric is {analysis.metric}.\n"
-                f"Additional context: {query_extra}\n\n"
                 "CRITICAL ANTI-PLAGIARISM RULE: Do NOT search for 'Kaggle winning solutions', 'notebooks', or exact answers for this specific dataset. "
                 "Search ONLY for general ML techniques, architectures, or strategies that apply to this modality.\n\n"
                 "Return ONLY the exact search query string to use, without quotes, explanations, or introductory text. Keep it concise (under 150 characters)."
@@ -153,6 +182,7 @@ class TechniqueAgent:
             "2. PROPOSAL REQUIREMENTS:\n"
             f"   Propose {count} executable approaches for this task. Each approach must explain how to load observed paths dynamically from input/, build an honest local validation score matching {analysis.metric} ({analysis.direction}), fit/train, tune, and write the requested deliverable.\n"
             "   STRICT REQUIREMENT: Use a materially DIFFERENT model family / algorithm in each plan. "
+            "Start each plan with a `Model family: <name>` line naming the family you select. "
             "When two or more plans are requested and neural training is resource-feasible, at least one plan must measure a compact neural or custom-neural counterfactual rather than returning only tree ensembles. A custom plan must describe the actual computation graph and ablation; naming TabNet, an MLP, or a transformer alone is not custom architecture design. "
             "DO NOT repeat the same model family across plans. Return sections labelled "
             "PLAN 1:, PLAN 2:, and so on, preceded by your <thinking> ... </thinking> block."
@@ -201,8 +231,7 @@ class TechniqueAgent:
             )
         modality_inventory = predictive_modality_inventory(analysis.files)
         if modality_inventory["is_multimodal"] and not any(
-            "modality scope: modality_ablation" in plan.casefold()
-            for plan in plans
+            _plan_requests_modality_ablation(plan) for plan in plans
         ):
             modalities = ", ".join(modality_inventory["modalities"])
             audit_plan = (
@@ -227,8 +256,8 @@ class TechniqueAgent:
         score: float,
         diagnostics: str = "",
     ) -> str:
-        """Turn a successful implementation into one focused improvement plan."""
-        print(f"TechniqueAgent: Requesting focused tuning for score {score}.", flush=True)
+        """Turn a successful implementation into a bounded hyperparameter search."""
+        print(f"TechniqueAgent: Requesting focused tuning search for score {score}.", flush=True)
         prompt = (
             f"{analysis.prompt_context(10000)}\n\n"
             f"{self._council_context(9000)}\n\n"
@@ -239,14 +268,19 @@ class TechniqueAgent:
             "1. THINK BEFORE YOU DECIDE:\n"
             "   Begin your response with a <thinking> ... </thinking> block where you step-by-step:\n"
             "   a. Evaluate the current plan, local score, and execution diagnostics.\n"
-            "   b. Model Suitability & Performance Assessment: Verify if this current model architecture actually suits the task given and data properties. Assess whether focused tuning (hyperparameters, layer depth, feature engineering/scaling, regularization) will realistically improve validation performance.\n"
-            "   c. Determine the highest-leverage tuning changes without switching the core algorithm family.\n\n"
-            "2. PROPOSAL:\n"
-            "   Propose one focused improvement to this working model: tune hyperparameter settings, add feature engineering/scaling modules, or tune layer structure. Preserve the core algorithm, working data paths, and output behavior. Return the revised implementation plan after your <thinking> block."
+            "   b. Model Suitability & Performance Assessment: Verify if this current model architecture actually suits the task and data properties. Assess whether a bounded hyperparameter search (rather than structural changes) is the highest-leverage next step.\n"
+            "   c. Choose the 2-6 hyperparameters most likely to move the metric. Prefer axes that matter for this data size and estimator: e.g. regularization, learning rate, tree depth/leaves, feature subsampling, embedding dim, batch size, weight decay, augmentation strength.\n\n"
+            "2. SEARCH SPACE SPECIFICATION (mandatory):\n"
+            "   Return ONE executable plan that:\n"
+            "   a. Preserves the core estimator family, the working data paths, validation protocol, and output behavior of the current plan.\n"
+            "   b. Defines a `Search space:` section listing every selected hyperparameter with concrete ranges or choices (uniform/int/log ranges, or discrete candidates).\n"
+            "   c. Defines a `Search budget:` section: a bounded configuration count (at most 40, scale down for expensive/deep models or small data) and an early-stopping rule per configuration.\n"
+            "   d. Evaluates every candidate configuration on the IDENTICAL validation protocol, keeps the best configuration honestly, reports the final score and the winning configuration.\n"
+            "   Do not settle for a single hand-picked configuration; the plan must actually search."
         )
         try:
             response = call_llm(
-                "You are an expert AI ML Optimization Engineer improving working models without destabilizing them.",
+                "You are an expert AI ML Optimization Engineer defining bounded hyperparameter searches over working models without destabilizing them.",
                 prompt,
                 model=self.model_name,
                 temperature=0.15,
@@ -255,9 +289,11 @@ class TechniqueAgent:
             return cleaned[:6000]
         except Exception as exc:
             return (
-                f"Keep the working implementation described here: {plan}. Perform a small, "
-                f"bounded hyperparameter search around its current values and retain the best "
-                f"local setting. Planning service note: {exc}"
+                f"Keep the working implementation described here: {plan}. Perform a bounded "
+                f"internal hyperparameter search around its current values: define a `Search space:` "
+                f"of 2-5 hyperparameters with concrete ranges, run 20-40 configurations evaluated on "
+                f"the identical validation protocol with per-config early stopping, keep the best "
+                f"configuration, and report the final score and winning settings. Planning service note: {exc}"
             )[:6000]
 
     def propose_architecture_exploration(
@@ -269,10 +305,20 @@ class TechniqueAgent:
         measured_alternatives: str = "",
         plateau_evidence: str = "",
         require_custom: bool = True,
+        residual_evidence: str = "",
     ) -> str:
         """Design one measured neural counterfactual from task evidence, not a template."""
         mode = "custom, task-invented neural architecture" if require_custom else "neural architecture"
         track = "custom_neural" if require_custom else "established_neural"
+        revision = (
+            "\n# Residual error analysis from the previous custom-network measurement\n"
+            + residual_evidence[-4000:]
+            + "\nExplain which validation samples/behaviors the previous custom network solved "
+            "or failed on relative to the conventional control, and design THIS revision around "
+            "the residual errors rather than repeating the same computation graph.\n"
+            if residual_evidence
+            else ""
+        )
         print(
             f"TechniqueAgent: Designing a {mode} experiment after measured model-family saturation.",
             flush=True,
@@ -284,6 +330,7 @@ class TechniqueAgent:
             f"Control score: {score} ({analysis.direction}).\n"
             f"Plateau evidence:\n{plateau_evidence[-3000:]}\n\n"
             f"Previously measured alternatives:\n{measured_alternatives[-5000:]}\n\n"
+            f"{revision}"
             "ARCHITECTURE-LAB INSTRUCTIONS:\n"
             "1. Re-inspect the observed modality, sample count, feature geometry, missingness, "
             "cardinality, dependency structure, metric, CPU/GPU inventory, and time budget.\n"
@@ -347,6 +394,7 @@ class TechniqueAgent:
         score: float,
         diagnostics: str = "",
         search_context: str = "",
+        avoid_families: str = "",
     ) -> str:
         """Materialize one score-selected refinement or diversity action."""
         if operator not in {"refine", "diversify"}:
@@ -357,6 +405,13 @@ class TechniqueAgent:
             web_insights = self.search_for_new_ideas(analysis)
 
         web_section = f"\n\nWeb Search Discovery Insights:\n{web_insights}" if web_insights else ""
+        avoid_section = (
+            f"\n\nFAMILY GUARD (hard constraint):\n{avoid_families[:2500]}\n"
+            "Your proposal MUST choose a different model family. Start the returned plan with a "
+            "`Model family: <name>` line naming the family you select."
+            if avoid_families
+            else ""
+        )
 
         guidance = {
             "refine": (
@@ -382,7 +437,8 @@ class TechniqueAgent:
             f"Parent local score: {score} ({analysis.direction}).\n"
             f"Bounded execution notes:\n{diagnostics[-3000:]}\n\n"
             f"Recent measured alternatives to avoid repeating:\n{search_context[-2000:]}"
-            f"{web_section}\n\n"
+            f"{web_section}"
+            f"{avoid_section}\n\n"
             "CRITICAL REASONING INSTRUCTIONS:\n\n"
             "1. THINK BEFORE YOU DECIDE:\n"
             "   Begin your response with a <thinking> ... </thinking> block where you step-by-step:\n"
@@ -550,27 +606,36 @@ class TechniqueAgent:
         )
 
         try:
-            response = call_llm(
+            decision = call_llm_json(
                 "You are an expert AI Search Manager orchestrating an adaptive machine learning search tree.",
                 prompt,
                 model=self.model_name,
                 temperature=0.2,
+                schema=_DECISION_SCHEMA,
+                schema_name="search_decision",
             )
-            json_match = re.search(r"\{.*\}", response, re.DOTALL)
-            if json_match:
-                decision = json.loads(json_match.group(0))
-                if isinstance(decision, dict) and "action" in decision:
-                    action = str(decision.get("action", "")).lower()
-                    if action in {"merge", "tune", "refine", "diversify", "architect", "finalize"}:
-                        decision["action"] = action
-                        if not isinstance(decision.get("target_node_ids"), list):
-                            decision["target_node_ids"] = [best_node_id] if best_node_id else []
-                        return decision
+            if isinstance(decision, dict) and "action" in decision:
+                action = str(decision.get("action", "")).lower()
+                if action in {"merge", "tune", "refine", "diversify", "architect", "finalize"}:
+                    decision["action"] = action
+                    if not isinstance(decision.get("target_node_ids"), list):
+                        decision["target_node_ids"] = [best_node_id] if best_node_id else []
+                    return dict(decision)
         except Exception as exc:
             print(f"TechniqueAgent: decision call failed; using resilient default: {exc}", flush=True)
 
+        # A parse failure must not silently burn the budget on repeated diversify
+        # plans; pick the least costly action that addresses the evidence gap.
+        fallback_action = "finalize"
+        if experiments_remaining > 0:
+            if best_node_id is None:
+                fallback_action = "diversify"
+            elif not architecture_coverage.get("custom_neural_attempted"):
+                fallback_action = "architect"
+            else:
+                fallback_action = "refine"
         return {
-            "action": "diversify" if experiments_remaining > 0 else "finalize",
+            "action": fallback_action,
             "target_node_ids": [best_node_id] if best_node_id else [],
             "reasoning": "Fallback search decision.",
             "plan": "Continue adaptive search or finalize.",

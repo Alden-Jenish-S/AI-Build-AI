@@ -23,6 +23,10 @@ best locally scored deliverable.
    modality-contribution hypothesis instead of assuming full fusion is necessary.
 4. `TechniqueAgent` converts the selected hypotheses into initial roots. Root
    count is adaptive and budget-bounded; it is no longer fixed at two.
+   Cheap, budget-free screening probes are run first (bounded subsets/epochs),
+   the candidate portfolio is ranked by measured score, and only the strongest
+   plans are promoted to full-data implementations (successive halving).
+   If every probe fails, the search falls back to direct full roots.
 5. Each root, tuning, architecture, merge, or recovery proposal is stored as a planning node;
    its following numbered child is the implementation node.
 6. `ImplementationAgent` writes one self-contained `algorithm.py` per
@@ -40,33 +44,62 @@ best locally scored deliverable.
    deliverables are removed between attempts, documentation search is available
    during repair, and transient provider responses are retried with backoff.
 10. `ManagerAgent` uses a lineage-aware UCB frontier over lazy `refine`, `tune`,
-   and `diversify` planning nodes. It separately tracks measured architecture
-   families and detects plateaus using a configurable material-gain tolerance,
-   rather than exact score equality. Before another merge or early finalization,
-   a plateau with no custom-neural evidence triggers one dedicated `architect`
-   experiment when at least three idea slots were supplied. The strongest runnable node becomes the
-   baseline. A displaced root receives one model-locked rescue tune and is
-   pruned if it remains weak. Any later underperforming refinement, diversity,
-   or merge candidate also receives one focused rescue tune before pruning.
-   Improving descendants receive new actions; stale ancestors do not expand.
-   Root, recovery, refinement, diversity, architecture, and merge implementations consume the
-   configured new-idea budget. Tuning implementations are free and use separate
-   depth/attempt safety limits.
-11. An `architect` node derives a compact computation graph from observed data
-   geometry and resource evidence. Its implementation must use a custom PyTorch
-   `nn.Module`, compare against the measured parent and a plain neural ablation,
-   and cannot silently substitute another tree library or named tabular network.
-   The system treats novelty as a testable hypothesis and does not claim that a
-   generated design is unprecedented without prior-art evidence.
-12. A multimodal contribution experiment compares full fusion, credible models
-   for each modality alone, and every leave-one-modality-out variant on identical
-   validation indices. The smallest modality subset within validation uncertainty
-   of the best score is preferred, so a single modality may legitimately win.
-13. Two competitive, independent lineages may be merged during the search. Both
-   measured parent implementations are supplied to the merge, and an improving
-   merge becomes the new baseline.
-14. The selected node's native deliverable is validated again, then copied to
-   `submission.csv` or `final_output/` at the run root.
+    and `diversify` planning nodes. Every "is this an improvement?" decision is
+    evaluation-noise aware: fold-score dispersion, then repeated-seed dispersion,
+    then a conservative relative floor are used as the margin that a candidate
+    must beat. It separately tracks measured architecture
+    families and detects plateaus using a configurable material-gain tolerance,
+    rather than exact score equality. Before another merge or early finalization,
+    a plateau with no custom-neural evidence triggers one dedicated `architect`
+    experiment when at least three idea slots were supplied. The strongest runnable node becomes the
+    baseline. A displaced root receives one model-locked rescue tune and is
+    pruned if it remains weak. Any later underperforming refinement, diversity,
+    or merge candidate also receives one focused rescue tune before pruning.
+    Improving descendants receive new actions; stale ancestors do not expand.
+    Root, recovery, refinement, diversity, architecture, and merge implementations consume the
+    configured new-idea budget. Tuning implementations are free and use separate
+    depth/attempt safety limits.
+11. Model-family diversity is a hard constraint: every plan is fingerprinted
+    with the model family it proposes, and a `diversify` proposal that repeats
+    an already measured family is sent back to the planner once before being
+    discarded. A passing `diversify` proposal must also clear a cheap probe
+    (its bounded run must beat the base within evaluation noise) before the
+    full run is started. Every implementation node stores the fingerprint in
+    its node config so resumed searches retain the constraint.
+12. Long-running iterative implementations receive an abort contract: they
+    checkpoint periodically and may report `status: "truncated"` with an honest
+    score when they fall behind the incumbent by at least `2x` its evaluation
+    noise for two consecutive checks. Truncated runs refund their idea budget,
+    so early-aborting a losing run always saves a full idea slot.
+13. An `architect` node derives a compact computation graph from observed data
+    geometry and resource evidence. Its implementation must use a custom PyTorch
+    `nn.Module`, compare against the measured parent and a plain neural ablation,
+    and cannot silently substitute another tree library or named tabular network.
+    The architect loop is iterative: when a completed custom-network run improves
+    its control within noise and the plateau triggers again, the manager queues
+    a second `architect` experiment seeded with the residual evidence, up to
+    `AIBUILDAI_MAX_ARCHITECT_ITERATIONS` iterations.
+    The system treats novelty as a testable hypothesis and does not claim that a
+    generated design is unprecedented without prior-art evidence.
+14. A multimodal contribution experiment compares full fusion, credible models
+    for each modality alone, and every leave-one-modality-out variant on identical
+    validation indices. The smallest modality subset within validation uncertainty
+    of the best score is preferred, so a single modality may legitimately win.
+15. Two competitive, independent lineages may be merged during the search. Both
+    measured parent implementations are supplied to the merge, and an improving
+    merge becomes the new baseline. Merge pairs are chosen by score and by
+    prediction complementarity: stored OOF signatures with low pairwise
+    correlation are preferred, so merges blend genuinely different signal.
+16. Pending frontier actions whose measured parent is decorrelated with the
+    incumbent best receive a complementarity bonus, steering remaining budget
+    toward new signal rather than more of the same representation.
+17. Before finalization, when two or more measured nodes stored out-of-fold
+    predictions, a single budget-free final ensemble step loads the stored
+    predictions, optimizes non-negative blend weights on the shared validation
+    rows, and replaces the best node only if the blend beats it within noise.
+    Otherwise the best node's deliverable is kept.
+18. The selected node's native deliverable is validated again, then copied to
+    `submission.csv` or `final_output/` at the run root.
 
 Manager, planner, implementation-attempt, generated-program stdout/stderr,
 tuning, pruning, merging, promotion, web-repair, and finalization progress are
@@ -80,6 +113,46 @@ evidence. Bounded inputs are copied read-only; larger collections use allowliste
 links to avoid multiplying benchmark storage.
 The generated implementation still owns task-native training and output
 construction, but every search node shares the council's validation contract.
+
+## How the search flows
+
+```mermaid
+flowchart TD
+    Start[Task directory] --> Analyze[TaskAnalyzer: inventory, goal, output discovery]
+    Analyze --> Council[CouncilCoordinator: diagnostics, literature, peer review]
+    Council --> Brief[Ranked hypotheses + one hashed evaluation protocol]
+    Brief --> Plans[TechniqueAgent: candidate root portfolio]
+    Plans --> Probing{"Cheap screening probes\nbounded subsets / epochs"}
+    Probing -->|top-scoring plans ranked| Promote[Promote to full budgeted runs]
+    Probing -->|all probes fail| Promote
+
+    Promote --> Frontier["Lineage-aware UCB frontier\n+ prediction-complementarity bonus"]
+    Frontier --> Decide{Which action next?}
+
+    Decide -->|tune| Tuning["Tuning as a real search:\nsearch-space spec + budget,\nper-config early stopping"]
+    Decide -->|diversify| Diversify{"Family fingerprint guard\n+ cheap probe gate"}
+    Diversify -->|repeats a measured family| Replan[One re-plan to a new family]
+    Replan -->|still collides| Discard[Action discarded]
+    Diversify -->|probe does not beat base within noise| Discard
+    Diversify -->|family clear + probe passes| FullRun[Full implementation]
+    Decide -->|refine / root| FullRun
+    Decide -->|architect| Architect["Custom-network experiment\nvs parent + plain neural ablation"]
+    Architect -->|improved within noise,\nplateau repeats| Iterate["Iterative architect revision\nwith residual evidence"]
+    Decide -->|merge| Merge["Complementarity-aware\npair selection + merge run"]
+
+    FullRun --> EarlyAbort{Trailing behind incumbent?}
+    EarlyAbort -->|yes, 2 consecutive checks| Truncate["Report truncated,\nrefund idea budget"]
+    EarlyAbort -->|no| Measure[Score + OOF predictions]
+    Measure --> Better{"Improved within\nevaluation noise?"}
+    Better -->|yes| Baseline["New measured baseline,\nspawn follow-ups"]
+    Better -->|no| Rescue["One focused rescue tune,\nthen prune the branch"]
+    Baseline --> Frontier
+
+    Frontier --> Done[Frontier exhausted or budget spent]
+    Done --> Ensemble["Final OOF ensemble over stored predictions\nsimplex weight blend, beat-or-keep"]
+    Ensemble --> Validate[Final validation]
+    Validate --> Output[AggregatorAgent: submission.csv / final_output]
+```
 
 ## Run
 
@@ -113,8 +186,30 @@ Architecture coverage is enabled by default. Set
 experiment. `AIBUILDAI_ARCHITECTURE_MIN_BUDGET` controls its minimum idea budget
 (default `3`), while `AIBUILDAI_PLATEAU_PATIENCE` and
 `AIBUILDAI_PLATEAU_RELATIVE_GAIN` control saturation detection (defaults `1` and
-`0.0005`). These settings affect when an architecture experiment is required;
-they do not preselect a network template.
+`0.0005`). `AIBUILDAI_MAX_ARCHITECT_ITERATIONS` bounds the iterative architect
+revision loop (default `2`). These settings affect when an architecture
+experiment is required; they do not preselect a network template.
+
+The supervised-search mechanics are task-type agnostic and degrade gracefully
+when a task has no labeled validation set, fold scores, or repeated seeds:
+
+- `AIBUILDAI_PROBE_MULTIPLIER` — probe capacity as a multiple of the idea budget
+  (default `2.0`). Probes are cheap bounding runs that never charge the budget.
+- `AIBUILDAI_IMPROVEMENT_NOISE_K` — how many noise standard deviations a
+  candidate must beat to count as an improvement (default `0.35`).
+- `AIBUILDAI_ABORT_ITERATIVE=0` disables early-aborting of losing iterative runs
+  (enabled by default); `AIBUILDAI_ABORT_MARGIN_STD` sets the trailing margin in
+  noise standard deviations (default `2.0`).
+- `AIBUILDAI_COMPLEMENTARITY_WEIGHT` — how strongly decorrelated (vs. the
+  incumbent) pending branches are favored (default `0.4`); `0` disables it.
+- `AIBUILDAI_DIVERSIFY_PROBE=0` disables the cheap-probe gate before full
+  `diversify` runs (enabled by default). The model-family fingerprint guard is
+  always on.
+- `AIBUILDAI_FINAL_ENSEMBLE=0` disables the final out-of-fold blending step
+  (enabled by default); it only runs for cross-validation protocols when two or
+  more measured nodes stored OOF predictions.
+- `AIBUILDAI_FINAL_VERIFY=0` disables re-running the winning program (or the
+  final ensemble) during finalization.
 
 Council literature retrieval is rate-aware by default: it schedules at most 12
 deduplicated queries with two workers, uses one search-provider attempt per
@@ -182,7 +277,11 @@ Each `runs/<task>/` contains only:
   `node_state.json`; implementation-node folders additionally contain
   `algorithm.py`, `attempt_<n>.log`, the small `result.json`, inputs, and the
   native deliverable. Council runs also include `evaluation_protocol.json` and a
-  brief reference in every implementation node;
+  brief reference in every implementation node. Supervised nodes may store
+  `oof_predictions.npz` (out-of-fold and test prediction arrays) and a
+  `prediction_signature` / `seed_scores` in `result.json`; these power
+  complementarity-aware selection and the final ensemble, and their absence for
+  other task types is expected.
 - `submission.csv` or `final_output/` from the selected node;
 - `results.md`: score, pruning, runtime, and token summary;
 - `tree_state.json`: compact final/progress tree state without source code,

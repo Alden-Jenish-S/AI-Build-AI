@@ -41,6 +41,8 @@ _IDENTIFIER_NAMES = {
     "id", "ids", "index", "key", "row_id", "sample_id", "record_id",
     "entity_id", "image_id", "sequence_id", "episode_id",
 }
+# Upper bound on sample-submission rows for the identifier-subset check.
+_IDENTIFIER_SUBSET_MAX_REFERENCE_ROWS = 200_000
 _JSON_SUFFIXES = {".json", ".geojson"}
 _JSONL_SUFFIXES = {".jsonl", ".ndjson"}
 _IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff", ".webp"}
@@ -123,29 +125,7 @@ class SubmissionValidator:
         self.max_semantic_files = max(1, int(max_semantic_files))
         self.max_parse_bytes = max(1024, int(max_parse_bytes))
         self._custom: dict[str, ValidatorFunction] = {}
-        self._delimited_cache: dict[tuple[str, int, int], _DelimitedProfile] = {}
-
-    @staticmethod
-    def _try_auto_fix_csv(path: Path, reference: Path) -> bool:
-        """Attempt to automatically fix trivial CSV mismatches using pandas."""
-        try:
-            import pandas as pd
-            sub = pd.read_csv(path)
-            ref = pd.read_csv(reference)
-            if len(sub) == len(ref):
-                # Same columns, wrong order
-                if set(sub.columns) == set(ref.columns) and list(sub.columns) != list(ref.columns):
-                    sub = sub[ref.columns]
-                    sub.to_csv(path, index=False)
-                    return True
-                # Same column count, wrong names
-                if len(sub.columns) == len(ref.columns) and list(sub.columns) != list(ref.columns):
-                    sub.columns = ref.columns
-                    sub.to_csv(path, index=False)
-                    return True
-        except Exception:
-            pass
-        return False
+        self._delimited_cache: dict[tuple[str, int, int, tuple[int, ...], str | None], _DelimitedProfile] = {}
 
     def register(self, suffix: str, validator: ValidatorFunction) -> None:
         """Register a domain validator without changing the core validator."""
@@ -236,11 +216,17 @@ class SubmissionValidator:
             final_path = None
 
         if errors and final_path is not None and reference is not None and final_path.suffix.lower() == ".csv" and reference.is_file() and reference.suffix.lower() == ".csv":
-            if self._try_auto_fix_csv(final_path, reference):
-                # If auto-fixed, clear errors and rerun validation on the fixed file
-                errors.clear()
-                warnings.clear()
-                self._validate_file(final_path, reference, constraints, errors, warnings, checks)
+            hint = (
+                " The expected column names and order can be declared explicitly in "
+                "task_config.json (output_contract.columns); the deliverable is never "
+                "rewritten to match the sample."
+            )
+            column_mismatch = [
+                message for message in errors
+                if message.startswith("Output columns do not match")
+            ]
+            if column_mismatch:
+                errors = [message + hint for message in errors]
 
         return ValidationResult(
             not errors,
@@ -565,6 +551,62 @@ class SubmissionValidator:
             except OverflowError:
                 limit //= 10
 
+    @staticmethod
+    def _validate_identifier_subset(
+        reference: Path | None,
+        candidate: Path,
+        reference_profile: _DelimitedProfile,
+        candidate_profile: _DelimitedProfile,
+        errors: list[str],
+    ) -> None:
+        """Require every sample identifier to appear in the output.
+
+        A sample submission template may cover fewer rows than the full test set,
+        so the exact-set fingerprint check would reject valid full-length outputs.
+        The subset check streams the candidate and stops as soon as every sample
+        identifier has been observed, so memory is bounded by the sample size.
+        """
+        if reference is None:
+            return
+        reference_index = reference_profile.identifier_column
+        candidate_index = candidate_profile.identifier_column
+        if reference_index is None or candidate_index is None:
+            return
+        if reference_profile.rows > _IDENTIFIER_SUBSET_MAX_REFERENCE_ROWS:
+            return
+        try:
+            reference_delimiter = "\t" if reference.suffix.lower() == ".tsv" else ","
+            with reference.open("r", encoding="utf-8-sig", errors="strict", newline="") as stream:
+                reader = csv.reader(stream, delimiter=reference_delimiter, strict=True)
+                header = tuple(str(value) for value in next(reader, []))
+                if reference_index >= len(header):
+                    return
+                missing = {
+                    row[reference_index]
+                    for row in reader
+                    if row and reference_index < len(row)
+                }
+            if not missing:
+                return
+            candidate_delimiter = "\t" if candidate.suffix.lower() == ".tsv" else ","
+            with candidate.open("r", encoding="utf-8-sig", errors="strict", newline="") as stream:
+                reader = csv.reader(stream, delimiter=candidate_delimiter, strict=True)
+                header = tuple(str(value) for value in next(reader, []))
+                if candidate_index >= len(header):
+                    return
+                for row in reader:
+                    if row and candidate_index < len(row):
+                        missing.discard(row[candidate_index])
+                    if not missing:
+                        return
+        except (OSError, UnicodeError, csv.Error):
+            return
+        if missing:
+            errors.append(
+                "Output identifiers are missing sample-submission identifiers "
+                f"(missing {len(missing)}; e.g. {sorted(missing)[:5]})."
+            )
+
     def _profile_delimited(
         self,
         path: Path,
@@ -574,9 +616,16 @@ class SubmissionValidator:
         identifier_hint: str | None = None,
     ) -> _DelimitedProfile:
         stat_result = path.stat()
-        cache_key = (str(path.resolve()), stat_result.st_size, stat_result.st_mtime_ns)
-        if not numeric_hint and identifier_hint is None and cache_key in self._delimited_cache:
-            return self._delimited_cache[cache_key]
+        cache_key = (
+            str(path.resolve()),
+            stat_result.st_size,
+            stat_result.st_mtime_ns,
+            numeric_hint,
+            identifier_hint,
+        )
+        cached = self._delimited_cache.get(cache_key)
+        if cached is not None:
+            return cached
         self._raise_csv_limit()
         with path.open("r", encoding="utf-8-sig", errors="strict", newline="") as stream:
             reader = csv.reader(stream, delimiter=delimiter, strict=True)
@@ -649,10 +698,8 @@ class SubmissionValidator:
                 if identifier_column is not None else None,
                 identifier_order_hash=order_hash.hexdigest() if identifier_column is not None else None,
             )
-        if not numeric_hint and identifier_hint is None:
-            self._delimited_cache[cache_key] = profile
+        self._delimited_cache[cache_key] = profile
         return profile
-
     def _validate_delimited(
         self,
         path: Path,
@@ -703,8 +750,16 @@ class SubmissionValidator:
             )
 
         configured_rows = self._coerce_int(constraints.get("row_count"), "row_count", errors)
+        # A reference named "sample_submission" is a template: it may cover only a
+        # subset of the test rows, so only its identifiers must be present. A
+        # reference without "sample"/"example" in the stem is treated as the full
+        # submission template and requires the exact identifier set.
+        reference_stem = reference.stem.lower() if reference is not None else ""
         reference_is_complete = bool(
-            reference is not None and "submission" in reference.stem.lower()
+            reference is not None
+            and "submission" in reference_stem
+            and "sample" not in reference_stem
+            and "example" not in reference_stem
         )
         expected_rows = configured_rows
         if expected_rows is None and reference_profile is not None and reference_is_complete:
@@ -716,12 +771,21 @@ class SubmissionValidator:
 
         if (
             reference_profile is not None
-            and reference_is_complete
+            and "submission" in reference_stem
             and reference_profile.identifier_column is not None
             and candidate.identifier_column is not None
-            and reference_profile.identifier_fingerprint != candidate.identifier_fingerprint
         ):
-            errors.append("Output identifiers do not match the identifiers in the sample submission.")
+            if reference_is_complete:
+                if reference_profile.identifier_fingerprint != candidate.identifier_fingerprint:
+                    errors.append("Output identifiers do not match the identifiers in the sample submission.")
+            else:
+                self._validate_identifier_subset(
+                    reference,
+                    path,
+                    reference_profile,
+                    candidate,
+                    errors,
+                )
         if (
             constraints.get("id_order_required") is True
             and reference_profile is not None

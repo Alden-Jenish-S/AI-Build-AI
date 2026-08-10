@@ -146,10 +146,10 @@ def _write_results(
     return path
 
 
-def run_method_tree(task_name: str, budget: int) -> dict[str, Any]:
+def run_method_tree(task_name: str, budget: int, resume: bool = False) -> dict[str, Any]:
     load_project_environment(PROJECT_ROOT)
     reset_token_usage()
-    manager = ManagerAgent(task_name=task_name, total_budget=budget)
+    manager = ManagerAgent(task_name=task_name, total_budget=budget, resume=resume)
     started = time.monotonic()
     failure: Exception | None = None
     best_node_id: str | None = None
@@ -232,13 +232,21 @@ def main() -> None:
             "preserve this budget (default: 6)."
         ),
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Resume the interrupted search in runs/<task> instead of archiving "
+            "it and starting fresh."
+        ),
+    )
     args = parser.parse_args()
     if not args.task_name:
         parser.error("task_name is required when AIBUILDAI_TASK is not set")
     if args.budget < 1:
         parser.error("--budget must be positive")
 
-    result = run_method_tree(args.task_name, args.budget)
+    result = run_method_tree(args.task_name, args.budget, resume=args.resume)
     usage = result["token_usage"]
     print(
         f"Search completed: best={result['best_node']}, "

@@ -19,7 +19,6 @@ logger = logging.getLogger(__name__)
 token_usage = {
     "input_tokens": 0,
     "output_tokens": 0,
-    "cost": 0.0,
     "calls": [],
 }
 _token_usage_lock = threading.Lock()
@@ -29,7 +28,9 @@ _MAX_RESPONSE_CACHE_ENTRIES = 128
 _client_cache_lock = threading.Lock()
 _client_cache: dict[tuple[object, ...], object] = {}
 _json_schema_capability_lock = threading.Lock()
-_json_schema_unavailable = False
+# Structured output capability is provider-scoped: one provider without
+# json_schema support must not disable it for the other providers in the process.
+_json_schema_unavailable: dict[str, bool] = {}
 
 
 _PROVIDER_DEFAULTS = {
@@ -86,7 +87,6 @@ def reset_token_usage():
         token_usage = {
             "input_tokens": 0,
             "output_tokens": 0,
-            "cost": 0.0,
             "calls": [],
         }
     with _response_cache_lock:
@@ -94,7 +94,7 @@ def reset_token_usage():
     with _client_cache_lock:
         _client_cache.clear()
     with _json_schema_capability_lock:
-        _json_schema_unavailable = False
+        _json_schema_unavailable = {}
 
 
 def _cache_flag(value: object, *, default: bool = False) -> bool:
@@ -561,18 +561,29 @@ def _response_format_is_unavailable(error: Exception) -> bool:
     )
 
 
-def _should_try_json_schema() -> bool:
+def _should_try_json_schema(provider: str | None = None) -> bool:
     configured = os.getenv("LLM_USE_JSON_SCHEMA", "auto").strip().casefold()
     if configured in {"0", "false", "no", "off"}:
         return False
+    if provider is None:
+        try:
+            provider = _resolve_llm_config()["provider"]
+        except Exception:
+            provider = "unknown"
     with _json_schema_capability_lock:
-        return not _json_schema_unavailable
+        return not _json_schema_unavailable.get(provider, False)
 
 
-def _remember_json_schema_unavailable() -> None:
+def _remember_json_schema_unavailable(provider: str) -> None:
     global _json_schema_unavailable
     with _json_schema_capability_lock:
-        _json_schema_unavailable = True
+        _json_schema_unavailable[provider] = True
+
+
+def _evict_cached_response(key: str) -> None:
+    """Drop one cached response so a rejected JSON value cannot poison retries."""
+    with _response_cache_lock:
+        _response_cache.pop(key, None)
 
 
 def _validate_json_schema(value: object, schema: Mapping[str, object], path: str = "$") -> None:
@@ -649,8 +660,13 @@ def call_llm_json(
             "schema": dict(schema),
         },
     }
+    try:
+        provider = _resolve_llm_config(model)["provider"]
+    except Exception:
+        provider = "unknown"
     response: str | None = None
-    if _should_try_json_schema():
+    used_structured = False
+    if _should_try_json_schema(provider):
         try:
             response = call_llm(
                 system_prompt,
@@ -659,9 +675,10 @@ def call_llm_json(
                 temperature=temperature,
                 response_format=structured_format,
             )
+            used_structured = True
         except Exception as structured_error:
             if _response_format_is_unavailable(structured_error):
-                _remember_json_schema_unavailable()
+                _remember_json_schema_unavailable(provider)
             logger.warning(
                 "Provider rejected structured output for %s; using JSON-only fallback: %s",
                 normalized_name,
@@ -685,11 +702,33 @@ this JSON Schema:
             temperature=temperature,
         )
 
+    def evict_poisoned() -> None:
+        # A schema-invalid response was cached under the exact request key; remove
+        # it so the next identical call does not re-enter the repair loop.
+        try:
+            resolved = _resolve_llm_config(model)
+            key = _request_cache_key(
+                provider=str(resolved["provider"]),
+                model=str(resolved["model"]),
+                system_prompt=(
+                    system_prompt
+                    if used_structured
+                    else system_prompt + " Return only the requested JSON value."
+                ),
+                user_prompt=user_prompt if used_structured else fallback_prompt,
+                temperature=float(temperature),
+                response_format=structured_format if used_structured else None,
+            )
+            _evict_cached_response(key)
+        except Exception:
+            pass
+
     try:
         payload = _extract_json_payload(response)
         _validate_json_schema(payload, schema)
         return payload
     except (TypeError, ValueError, json.JSONDecodeError) as validation_error:
+        evict_poisoned()
         repair_prompt = f"""
 Repair the JSON response below. Return exactly one corrected JSON value with no
 prose or Markdown.

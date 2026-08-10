@@ -25,6 +25,11 @@ _SENSITIVE_ENV_EXACT = {
     "AWS_PROFILE", "GOOGLE_APPLICATION_CREDENTIALS", "KAGGLE_CONFIG_DIR", "NETRC",
 }
 
+# Bounded in-memory capture for supervised child output; a runaway generator
+# must not grow the parent's memory without limit. Console streaming continues
+# after capture truncation.
+_OUTPUT_CAPTURE_LIMIT_CHARS = 1_000_000
+
 
 @dataclass(frozen=True)
 class SupervisedProcessResult:
@@ -176,6 +181,10 @@ def run_supervised_process(
 
     stdout_parts: list[str] = []
     stderr_parts: list[str] = []
+    stdout_chars = 0
+    stderr_chars = 0
+    stdout_truncated = False
+    stderr_truncated = False
     started = time.monotonic()
     last_progress = started
     last_source = "process_started"
@@ -187,6 +196,7 @@ def run_supervised_process(
 
     def collect() -> None:
         nonlocal last_progress, last_source, events
+        nonlocal stdout_chars, stderr_chars, stdout_truncated, stderr_truncated
         found = False
         while True:
             try:
@@ -195,12 +205,32 @@ def run_supervised_process(
                 break
             text = raw.decode("utf-8", errors="replace")
             if name == "stdout":
-                stdout_parts.append(text)
+                if not stdout_truncated:
+                    keep = max(0, _OUTPUT_CAPTURE_LIMIT_CHARS - stdout_chars)
+                    if keep < len(text):
+                        stdout_parts.append(text[:keep])
+                        stdout_parts.append(
+                            "\n[stdout capture truncated; live console streaming continues]\n"
+                        )
+                        stdout_truncated = True
+                    else:
+                        stdout_parts.append(text)
+                stdout_chars += len(text)
                 if stdout_stream:
                     stdout_stream.write(text)
                     stdout_stream.flush()
             else:
-                stderr_parts.append(text)
+                if not stderr_truncated:
+                    keep = max(0, _OUTPUT_CAPTURE_LIMIT_CHARS - stderr_chars)
+                    if keep < len(text):
+                        stderr_parts.append(text[:keep])
+                        stderr_parts.append(
+                            "\n[stderr capture truncated; live console streaming continues]\n"
+                        )
+                        stderr_truncated = True
+                    else:
+                        stderr_parts.append(text)
+                stderr_chars += len(text)
                 if stderr_stream:
                     stderr_stream.write(text)
                     stderr_stream.flush()
@@ -290,20 +320,72 @@ def task_data_files(task_dir: Path) -> list[Path]:
     return files
 
 
+def task_dir_snapshot(task_dir: Path) -> dict[str, tuple[int, int]]:
+    """Capture ``(size, mtime_ns)`` per task file for integrity verification."""
+    root = Path(task_dir)
+    snapshot: dict[str, tuple[int, int]] = {}
+    if not root.is_dir():
+        return snapshot
+    for current, directory_names, file_names in os.walk(
+        root, followlinks=False, onerror=lambda _error: None
+    ):
+        directory_names.sort()
+        for name in sorted(file_names):
+            path = Path(current) / name
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            snapshot[path.relative_to(root).as_posix()] = (
+                stat.st_size,
+                stat.st_mtime_ns,
+            )
+    return snapshot
+
+
+def verify_task_dir_unchanged(
+    task_dir: Path, snapshot: dict[str, tuple[int, int]]
+) -> list[str]:
+    """Return the task files whose size or mtime changed since the snapshot."""
+    changed: list[str] = []
+    root = Path(task_dir)
+    current = task_dir_snapshot(root)
+    for relative, (size, mtime_ns) in snapshot.items():
+        observed = current.get(relative)
+        if observed is None or observed != (size, mtime_ns):
+            changed.append(relative)
+    for relative in sorted(set(current) - set(snapshot)):
+        changed.append(relative)
+    return changed
+
+
+def _default_copy_limit_bytes() -> int | None:
+    configured = os.getenv("AIBUILDAI_INPUT_COPY_LIMIT_BYTES", "").strip()
+    if configured.isdigit():
+        return int(configured)
+    return 64 * 1024 * 1024
+
+
 def expose_task_data(
     task_dir: Path,
     run_dir: Path,
     *,
     allowed_paths: Sequence[str] | None = None,
     copy_files: bool = False,
+    copy_limit_bytes: int | None = None,
 ) -> list[Path]:
     """Expose approved task files through file-level links in ``run_dir/input``.
 
     Without ``allowed_paths`` this retains the historical all-files behavior.
     Council-guided runs provide an explicit allowlist so held-out labels and
-    grading artifacts are not made visible to generated programs. Focused
-    diagnostic workers use read-only copies instead of links so a faulty script
-    cannot modify task-owned files through a link.
+    grading artifacts are not made visible to generated programs.
+
+    Read-only copies are the default whenever the approved input set fits under
+    ``copy_limit_bytes`` (default 64 MiB) so a faulty script cannot modify
+    task-owned files through a writable link. Larger collections fall back to
+    links to avoid multiplying benchmark storage; callers that use links should
+    verify the task directory with ``task_dir_snapshot`` / ``verify_task_dir_unchanged``
+    around child execution.
     """
     task_root = Path(task_dir).resolve()
     destination = Path(run_dir) / "input"
@@ -326,27 +408,29 @@ def expose_task_data(
                 raise ValueError(f"Allowed task path escapes task root: {raw!r}")
             if resolved.is_file():
                 sources.append(resolved)
+    if copy_limit_bytes is None:
+        copy_limit_bytes = _default_copy_limit_bytes()
+    should_copy = bool(copy_files)
+    if not should_copy and copy_limit_bytes is not None and sources:
+        total_bytes = 0
+        for source in sources:
+            try:
+                total_bytes += source.stat().st_size
+            except OSError:
+                continue
+            if total_bytes > copy_limit_bytes:
+                break
+        should_copy = total_bytes <= copy_limit_bytes
     for source in sources:
         target = destination / source.relative_to(task_root)
         target.parent.mkdir(parents=True, exist_ok=True)
-        if target.is_symlink() and target.resolve() == source.resolve():
-            linked.append(target)
-            continue
         if target.exists() or target.is_symlink():
             raise FileExistsError(f"Node input path is already occupied: {target}")
-        if copy_files:
-            shutil.copy2(source, target)
-            try:
-                target.chmod(0o444)
-            except OSError:
-                pass
-        else:
-            try:
-                os.symlink(str(source.resolve()), str(target))
-            except OSError:
-                # Windows often denies symlink creation to ordinary users. A
-                # private node-local copy keeps the workflow operational there.
-                shutil.copy2(source, target)
+        shutil.copy2(source, target)
+        try:
+            target.chmod(0o444)
+        except OSError:
+            pass
         linked.append(target)
     return linked
 

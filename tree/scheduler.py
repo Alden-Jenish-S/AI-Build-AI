@@ -3,17 +3,30 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
+from typing import Any
+
+from search_evidence import pearson_correlation
 
 from .node import NodeState
 
+#: How much a frontier action is boosted when its measured parent's
+#: predictions are decorrelated with the incumbent best. 0.0 disables the term.
+_COMPLEMENTARITY_WEIGHT = float(0.4)
+
 
 class UCB1Scheduler:
-    """Favor strong lineages while retaining bounded exploration."""
+    """Favor strong lineages while retaining bounded exploration.
+
+    Pending actions under the same measured parent are alternatives with the
+    same prior, so within one lineage selection reduces to operator priority;
+    across lineages the value term uses the best reward measured anywhere in
+    that lineage rather than a mean diluted by weak roots.
+    """
 
     def __init__(self, total_budget: int, exploration: float = 1.15) -> None:
         self.total_budget = max(1, int(total_budget))
         self.exploration = max(0.0, float(exploration))
-        self.current_step = 0
 
     @staticmethod
     def _root_branch(
@@ -45,14 +58,26 @@ class UCB1Scheduler:
                 break
             current.visits += 1
             current.total_reward += float(reward)
+            current.best_reward = max(current.best_reward, float(reward))
             current_id = current.parent_id
 
     def frontier_scores(
         self,
         root_id: str,
         all_nodes: dict[str, NodeState],
+        *,
+        best_signature: list[float] | None = None,
+        signature_provider: Callable[[NodeState], list[float] | None] | None = None,
+        complementarity_weight: float = _COMPLEMENTARITY_WEIGHT,
     ) -> dict[str, float]:
-        """Return pending reachable nodes and their lineage-level UCB scores."""
+        """Return pending reachable nodes and their lineage-level UCB scores.
+
+        ``best_signature`` / ``signature_provider`` optionally add a
+        prediction-complementarity bonus: pending actions whose measured
+        parent is decorrelated with the incumbent best are favored, which
+        steers exploration toward genuinely new signal rather than more of
+        the same representation.
+        """
         root = all_nodes.get(root_id)
         if root is None:
             return {}
@@ -73,18 +98,28 @@ class UCB1Scheduler:
                 continue
             queue.extend(child for child in node.children_ids if child in all_nodes)
 
+        use_complementarity = (
+            complementarity_weight > 0.0
+            and best_signature is not None
+            and signature_provider is not None
+        )
         scores: dict[str, float] = {}
         root_visits = max(root.visits, 1)
         for candidate in pending:
             branch = self._root_branch(candidate.node_id, root_id, all_nodes)
-            branch_mean = (
-                branch.total_reward / branch.visits if branch.visits else 0.0
-            )
+            branch_best = branch.best_reward
+            branch_value = branch_best if math.isfinite(branch_best) else 0.0
             exploration = self.exploration * math.sqrt(
                 math.log(root_visits + 2.0) / (branch.visits + 1.0)
             )
             priority = float((candidate.config or {}).get("priority", 0.0) or 0.0)
-            scores[candidate.node_id] = branch_mean + exploration + priority
+            score = branch_value + exploration + priority
+            if use_complementarity:
+                signature = signature_provider(candidate)
+                if signature is not None:
+                    correlation = pearson_correlation(best_signature, signature)
+                    score += complementarity_weight * (1.0 - abs(correlation))
+            scores[candidate.node_id] = score
         return scores
 
     def select_next_node(
@@ -92,8 +127,9 @@ class UCB1Scheduler:
         root_id: str,
         all_nodes: dict[str, NodeState],
         eligible_node_ids: set[str] | None = None,
+        **selection_kwargs: Any,
     ) -> str | None:
-        scores = self.frontier_scores(root_id, all_nodes)
+        scores = self.frontier_scores(root_id, all_nodes, **selection_kwargs)
         if eligible_node_ids is not None:
             scores = {
                 node_id: score

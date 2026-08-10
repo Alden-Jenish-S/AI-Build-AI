@@ -8,12 +8,20 @@ import math
 import os
 import re
 import shutil
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from runtime_utils import expose_task_data, run_supervised_process, sanitized_subprocess_env
+from runtime_utils import (
+    expose_task_data,
+    run_supervised_process,
+    sanitized_subprocess_env,
+    task_dir_snapshot,
+    verify_task_dir_unchanged,
+)
+from search_evidence import valid_signature
 
 from .council.contracts import CouncilBrief, EvaluationProtocol
 from .llm_utils import call_llm
@@ -159,6 +167,104 @@ def _architecture_source_errors(code: str) -> list[str]:
     return errors
 
 
+_STDOUT_SCORE_PATTERNS: dict[str, str] = {
+    "accuracy": r"accuracy",
+    "roc_auc": r"\bauc\b",
+    "auc": r"\bauc\b",
+    "f1": r"\bf1\b",
+    "dice": r"\bdice\b",
+    "iou": r"\biou\b",
+    "silhouette": r"silhouette",
+    "log_loss": r"log[\s_-]?loss",
+    "cross_entropy": r"cross[\s_-]?entropy",
+    "rmse": r"\brmse\b",
+    "mae": r"\bmae\b",
+    "mean_average_precision": r"\bmap\b",
+    "adjusted_rand_index": r"adjusted[\s_-]?rand",
+}
+
+
+def _metric_stdout_pattern(metric: str) -> str | None:
+    normalized = re.sub(r"[^a-z0-9]+", "_", str(metric or "").strip().lower()).strip("_")
+    for key, pattern in _STDOUT_SCORE_PATTERNS.items():
+        if key in normalized or normalized in key:
+            return pattern
+    return None
+
+
+def _parse_stdout_score(stdout: str, pattern: str) -> float | None:
+    matches = re.findall(
+        rf"(?i){pattern}\s*[:=]\s*(-?\d+(?:\.\d+)?(?:e[+-]?\d+)?)",
+        stdout,
+    )
+    if not matches:
+        return None
+    try:
+        score = float(matches[-1])
+        return score if math.isfinite(score) else None
+    except ValueError:
+        return None
+
+
+def _score_from_stdout(stdout: str, metric: str | None, direction: str) -> float | None:
+    """Extract the last plausible score from program output.
+
+    The task metric's own stdout pattern is preferred so that a training log
+    ending in ``loss: 0.33`` cannot replace an ``accuracy`` value, and loss-like
+    patterns are never used as scores for maximize tasks.
+    """
+    metric_pattern = _metric_stdout_pattern(metric or "") if metric else None
+    if metric_pattern is not None:
+        candidate = _parse_stdout_score(stdout, metric_pattern)
+        if candidate is not None:
+            return candidate
+    pattern = r"(?:score|auc|accuracy|f1|dice|iou|silhouette)"
+    if direction != "maximize":
+        pattern = r"(?:score|auc|accuracy|f1|dice|iou|silhouette|rmse|mae|loss)"
+    candidate = _parse_stdout_score(stdout, pattern)
+    if candidate is not None:
+        return candidate
+    return None
+
+
+def _fold_mean_consistency(score: float, fold_scores: list[Any]) -> bool:
+    """Return whether ``score`` agrees with the mean of the reported fold scores."""
+    try:
+        numeric = [float(value) for value in fold_scores]
+    except (TypeError, ValueError):
+        return False
+    if not numeric or not all(math.isfinite(value) for value in numeric):
+        return False
+    mean = sum(numeric) / len(numeric)
+    tolerance = max(1e-3, abs(score) * 0.01)
+    return abs(score - mean) <= tolerance
+
+
+def _env_enabled(name: str, *, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().casefold() not in {"0", "false", "no", "off"}
+
+
+def _plan_requests_modality_ablation(plan: str | None) -> bool:
+    """Detect a modality-contribution request in a plan without literal markers.
+
+    The council and technique agent phrase this contract several ways; a strict
+    substring match lets a paraphrased plan silently bypass the ablation
+    requirement, so the normalized text is searched instead.
+    """
+    normalized = re.sub(r"[^a-z]+", " ", str(plan or "").casefold())
+    normalized = " ".join(normalized.split())
+    if "modality scope modality ablation" in normalized:
+        return True
+    if "modality ablation" in normalized:
+        return True
+    if "leave one modality out" in normalized:
+        return True
+    return False
+
+
 class ImplementationAgent:
     """One compact code-writing call followed by bounded execution repairs."""
 
@@ -204,30 +310,6 @@ class ImplementationAgent:
             return payload if isinstance(payload, dict) else {}
         except (OSError, json.JSONDecodeError):
             return {}
-
-    @staticmethod
-    def _score(payload: dict[str, Any], stdout: str, direction: str) -> float:
-        score_value = payload.get("score")
-        try:
-            if isinstance(score_value, bool):
-                raise ValueError("boolean score")
-            score = float(str(score_value))
-            if math.isfinite(score):
-                return score
-        except (TypeError, ValueError):
-            pass
-        matches = re.findall(
-            r"(?i)(?:score|auc|accuracy|f1|dice|iou|silhouette|rmse|mae|loss)\s*[:=]\s*(-?\d+(?:\.\d+)?(?:e[+-]?\d+)?)",
-            stdout,
-        )
-        if matches:
-            try:
-                score = float(matches[-1])
-                if math.isfinite(score):
-                    return score
-            except ValueError:
-                pass
-        return 1e30 if direction == "minimize" else -1e30
 
     @staticmethod
     def _validate_reported_evaluation(
@@ -276,8 +358,42 @@ class ImplementationAgent:
                     for value in fold_scores
                 ):
                     errors.append("fold_scores contains a non-finite value")
+                elif isinstance(reported_score, (int, float, str)) and not isinstance(
+                    reported_score, bool
+                ):
+                    try:
+                        numeric_score = float(str(reported_score))
+                    except (TypeError, ValueError):
+                        numeric_score = math.nan
+                    if math.isfinite(numeric_score) and not _fold_mean_consistency(
+                        numeric_score, fold_scores
+                    ):
+                        errors.append(
+                            "reported score does not match the mean of the reported fold_scores"
+                        )
             except (TypeError, ValueError):
                 errors.append("fold_scores must contain only numeric values")
+        signature = payload.get("prediction_signature")
+        if signature is not None and not valid_signature(signature):
+            errors.append(
+                "prediction_signature must be a list of finite floats "
+                "between 8 and 8192 entries"
+            )
+        seed_scores = payload.get("seed_scores")
+        if seed_scores is not None:
+            seed_values: list[float] = []
+            if isinstance(seed_scores, list):
+                for value in seed_scores:
+                    if isinstance(value, bool):
+                        continue
+                    try:
+                        seed_value = float(value)
+                    except (TypeError, ValueError):
+                        continue
+                    if math.isfinite(seed_value):
+                        seed_values.append(seed_value)
+            if len(seed_values) < 2:
+                errors.append("seed_scores must contain at least 2 finite values")
         return errors
 
     def _prompt(
@@ -291,6 +407,10 @@ class ImplementationAgent:
         web_notes: str,
         council_brief: CouncilBrief | None,
         operator: str,
+        *,
+        probe: bool = False,
+        abort_context: dict[str, Any] | None = None,
+        tune_search: bool = False,
     ) -> str:
         parent = ""
         if parent_code:
@@ -342,7 +462,7 @@ class ImplementationAgent:
         modalities = [str(item) for item in modality_inventory["modalities"]]
         requires_modality_ablation = bool(
             modality_inventory["is_multimodal"]
-            and "modality scope: modality_ablation" in plan.casefold()
+            and _plan_requests_modality_ablation(plan)
         )
         displayed_paths: list[str] = []
         displayed_chars = 0
@@ -381,6 +501,11 @@ protocol is invalid even if it is numerically better.
                 f"`{protocol.protocol_hash}`. `fold_scores` must have exactly "
                 f"{protocol.folds} numeric value(s), and `validation_sample_count` must be positive."
             )
+            result_contract += (
+                " Optionally report `status` ('completed' or 'truncated'), "
+                "`prediction_signature` (up to 2048 finite floats), and `seed_scores` "
+                "(at least 2 finite floats when using repeated-seed evaluations)."
+            )
         if requires_modality_ablation:
             result_contract += (
                 " Also include `modality_ablation_scores`, a list of objects containing "
@@ -418,7 +543,53 @@ MULTIMODAL CONTRIBUTION CONTRACT (mandatory):
   `{{"modalities": ["modality", ...], "score": finite_number,
   "fold_scores": [...], "validation_indices_hash": "same-hash-for-all-variants"}}`.
 - Select the smallest modality subset within validation uncertainty of the best score.
-  It is valid—and preferred when supported—for one modality to beat full fusion.
+   It is valid—and preferred when supported—for one modality to beat full fusion.
+"""
+        probe_contract = ""
+        if probe:
+            probe_contract = """
+PROBE MODE (cheap screening pass — mandatory):
+- This is a cheap screening run, not the final submission run. Keep the SAME split,
+  metric, evaluation_protocol_hash, and deliverable schema as the plan, but bound the work:
+  * Tabular / in-memory data: cap the training rows at 30% (random subset) when a full fit is expensive.
+  * Iterative learners (neural, boosting, RL): use roughly 30-40% of the iterations/epochs/episodes.
+  * Cheap one-shot fits may simply run as-is.
+- Do NOT tune. Record the honest screening score in result.json. Still write the requested deliverable.
+"""
+        abort_section = ""
+        if abort_context and not probe:
+            abort_section = f"""
+COMPUTE-SAVING EARLY-ABORT (recommended for iterative learners):
+- The current measured incumbent is {abort_context.get('best_score', 'n/a')} ({abort_context.get('direction', '')}).
+- If training is iterative (epochs, boosting rounds, RL episodes), monitor a small fixed
+  checkpoint set roughly every 15-25% of progress after a warmup of the first 20%.
+- If the running score trails the incumbent by more than {abort_context.get('margin', 0.0):.6g}
+  for {abort_context.get('patience', 2)} consecutive checks, stop training early. Still write result.json
+  with the honest `score`, `fold_scores`, `evaluation_protocol_hash`, and `status: "truncated"`,
+  and write the deliverable when practical.
+- One-shot predictors (.fit() style) or tasks where early stopping is meaningless: ignore this section.
+"""
+        tune_contract = ""
+        if tune_search:
+            tune_contract = """
+TUNING SEARCH (mandatory):
+- The plan defines a bounded hyperparameter search space. Actually SEARCH it: sample the
+  specified configurations (bounded count per the plan), train each on the identical validation
+  protocol with per-config early stopping, keep the best configuration honestly, report the final
+  score in result.json, and record the winning configuration in diagnostics.
+- Do not run a single hand-picked configuration and call it a search.
+"""
+        prediction_contract = """
+PREDICTION EVIDENCE (optional, task-dependent):
+- Supervised tasks with a labeled validation set: also save `oof_predictions.npz` in the node
+  directory with arrays `oof_pred` (predictions for the validation rows), `oof_index` (the
+  validation row indices), `test_pred` (predictions for all submission rows), and `test_index`
+  (submission row ids). Include `prediction_signature` in result.json: up to 2048 finite floats
+  sampling those predictions (strided or aggregated), always aligned to the same fixed validation rows.
+- Tasks without a labeled validation set (RL, control, generation, unsupervised) or where such
+  files are impractical: omit them entirely. Never invent labels or validation rows.
+- For holdout-style or task-native protocols, optionally report `seed_scores`: at least 2 finite
+  scores from independent repeated-seed evaluations.
 """
         return f"""
 Write one complete, self-contained Python program for this task.
@@ -431,6 +602,10 @@ Implementation plan:
 {council}
 {architecture_contract}
 {modality_contract}
+{probe_contract}
+{abort_section}
+{tune_contract}
+{prediction_contract}
 Exact runtime input paths available under input/:
 {exact_paths}
 
@@ -485,6 +660,8 @@ CRITICAL RULES & AGENT REASONING WORKFLOW:
         stall_seconds: float = 1200.0,
         hard_limit_seconds: float | None = None,
         council_brief: CouncilBrief | None = None,
+        probe: bool = False,
+        abort_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         node_dir = Path(node_dir)
         display_name = node_label or node_dir.name
@@ -496,9 +673,16 @@ CRITICAL RULES & AGENT REASONING WORKFLOW:
         modality_inventory = predictive_modality_inventory(task_analysis.files)
         requires_modality_ablation = bool(
             modality_inventory["is_multimodal"]
-            and "modality scope: modality_ablation" in plan.casefold()
+            and _plan_requests_modality_ablation(plan)
         )
         self._log(display_name, f"Exposed {len(linked_inputs)} task files under input/.")
+        task_input_snapshot = task_dir_snapshot(Path(task_dir))
+        if hard_limit_seconds is None:
+            configured_hard_limit = os.getenv("AIBUILDAI_HARD_LIMIT_SECONDS", "").strip()
+            try:
+                hard_limit_seconds = float(configured_hard_limit) if configured_hard_limit else 21600.0
+            except ValueError:
+                hard_limit_seconds = 21600.0
         if council_brief is not None:
             (node_dir / "evaluation_protocol.json").write_text(
                 json.dumps(
@@ -543,6 +727,12 @@ CRITICAL RULES & AGENT REASONING WORKFLOW:
                 web_notes,
                 council_brief,
                 operator,
+                probe=probe,
+                abort_context=abort_context,
+                tune_search=(
+                    operator == "tune"
+                    and _env_enabled("AIBUILDAI_TUNE_SEARCH", default=True)
+                ),
             )
             try:
                 response = call_llm(
@@ -607,9 +797,17 @@ CRITICAL RULES & AGENT REASONING WORKFLOW:
                     "MKL_NUM_THREADS": os.getenv("AIBUILDAI_MODEL_THREADS", "4"),
                 }
             )
+            if not _env_enabled("AIBUILDAI_ALLOW_NETWORK", default=False):
+                # Generated programs run without network egress; only the parent
+                # performs pip installs and web-assisted repair.
+                for proxy in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+                    child_env[proxy] = "http://127.0.0.1:9"
+                child_env.pop("NO_PROXY", None)
+                child_env.pop("no_proxy", None)
             try:
                 self._log(display_name, f"Executing {source_file.name}; child logs follow.")
                 install_attempts = 0
+                cuda_fallback_used = False
                 while True:
                     completed = run_supervised_process(
                         [self.python, source_file.name],
@@ -632,10 +830,22 @@ CRITICAL RULES & AGENT REASONING WORKFLOW:
                             pkg_to_install = pkg_map.get(missing_module, missing_module)
                             
                             self._log(display_name, f"Missing module '{missing_module}' detected. Auto-installing {pkg_to_install}...")
-                            import subprocess
-                            subprocess.run([self.python, "-m", "pip", "install", pkg_to_install], check=False)
-                            self._log(display_name, f"Retrying execution after installing '{pkg_to_install}'...")
                             install_attempts += 1
+                            pip_env = sanitized_subprocess_env()
+                            try:
+                                subprocess.run(
+                                    [
+                                        self.python, "-m", "pip", "install", pkg_to_install,
+                                        "--index-url", "https://pypi.org/simple",
+                                        "--disable-pip-version-check", "--no-input",
+                                    ],
+                                    check=False,
+                                    env=pip_env,
+                                    timeout=240,
+                                )
+                                self._log(display_name, f"Retrying execution after installing '{pkg_to_install}'...")
+                            except (OSError, subprocess.SubprocessError) as exc:
+                                self._log(display_name, f"Package install failed ({exc}); continuing without it.")
                             continue
                             
                         # 2. Handle CUDA compatibility/GPU errors
@@ -643,7 +853,7 @@ CRITICAL RULES & AGENT REASONING WORKFLOW:
                             if child_env.get("CUDA_VISIBLE_DEVICES") != "":
                                 self._log(display_name, "CUDA GPU compatibility error detected. Forcing CPU fallback and retrying...")
                                 child_env["CUDA_VISIBLE_DEVICES"] = ""
-                                install_attempts += 1
+                                cuda_fallback_used = True
                                 continue
                     break
 
@@ -656,8 +866,26 @@ CRITICAL RULES & AGENT REASONING WORKFLOW:
                 self._log(display_name, feedback)
                 continue
 
+            changed_inputs = verify_task_dir_unchanged(Path(task_dir), task_input_snapshot)
+            if changed_inputs:
+                feedback = (
+                    "INPUT INTEGRITY VIOLATION: the generated program modified task-owned "
+                    f"files ({', '.join(changed_inputs[:5])}). Inputs under input/ must be "
+                    "opened read-only; the task data is shared with every other search node."
+                )
+                diagnostics.append(f"attempt {attempt}: {feedback}")
+                (node_dir / f"attempt_{attempt}.log").write_text(
+                    feedback + "\n", encoding="utf-8"
+                )
+                self._log(display_name, feedback)
+                continue
+
             output = self._output_path(node_dir)
             payload = self._read_result(node_dir)
+            payload_status = payload.get("status")
+            status = str(payload_status or "completed")
+            if status not in {"completed", "truncated"}:
+                status = "completed"
             combined = "\n".join(part for part in (completed.stdout, completed.stderr) if part)
             (node_dir / f"attempt_{attempt}.log").write_text(
                 "\n".join(
@@ -683,25 +911,27 @@ CRITICAL RULES & AGENT REASONING WORKFLOW:
                 f"Attempt {attempt} exited {completed.returncode} after {completed.elapsed_seconds:.1f}s.",
             )
 
-            if completed.returncode == 0 and output is not None:
-                validation = self.submission_validator.validate(
-                    output,
-                    task_analysis,
-                    allowed_root=node_dir,
-                )
-                if not validation.valid:
-                    feedback = _tail(validation.feedback())
-                    diagnostics.append(
-                        f"attempt {attempt}: output validation failed\n{feedback}"
+            if completed.returncode == 0 and (output is not None or status == "truncated"):
+                validation = None
+                if output is not None:
+                    validation = self.submission_validator.validate(
+                        output,
+                        task_analysis,
+                        allowed_root=node_dir,
                     )
-                    with (node_dir / f"attempt_{attempt}.log").open(
-                        "a", encoding="utf-8"
-                    ) as stream:
-                        stream.write(f"\nSUBMISSION VALIDATION:\n{feedback}\n")
-                    self._log(display_name, "Generated output failed submission validation.")
-                    for message in validation.errors:
-                        self._log(display_name, f"Validation error: {message}")
-                    continue
+                    if not validation.valid:
+                        feedback = _tail(validation.feedback())
+                        diagnostics.append(
+                            f"attempt {attempt}: output validation failed\n{feedback}"
+                        )
+                        with (node_dir / f"attempt_{attempt}.log").open(
+                            "a", encoding="utf-8"
+                        ) as stream:
+                            stream.write(f"\nSUBMISSION VALIDATION:\n{feedback}\n")
+                        self._log(display_name, "Generated output failed submission validation.")
+                        for message in validation.errors:
+                            self._log(display_name, f"Validation error: {message}")
+                        continue
                 if council_brief is not None:
                     evaluation_errors = self._validate_reported_evaluation(
                         payload, council_brief.evaluation_protocol
@@ -721,7 +951,7 @@ CRITICAL RULES & AGENT REASONING WORKFLOW:
                             "Generated score failed the shared evaluation contract.",
                         )
                         continue
-                if requires_modality_ablation:
+                if requires_modality_ablation and status == "completed":
                     modality_errors = validate_modality_ablation_report(
                         payload,
                         modality_inventory["modalities"],
@@ -746,19 +976,48 @@ CRITICAL RULES & AGENT REASONING WORKFLOW:
                             "Generated result did not prove modality contribution on comparable variants.",
                         )
                         continue
-                output = validation.output_path
-                score = self._score(payload, completed.stdout, task_analysis.direction)
+                output = validation.output_path if output is not None else None
+                reported_metric = str(payload.get("metric") or task_analysis.metric)
+                reported_direction = str(payload.get("direction") or task_analysis.direction)
+                payload_score = payload.get("score")
+                score: float | None = None
+                if not isinstance(payload_score, bool):
+                    try:
+                        candidate = float(str(payload_score))
+                        if math.isfinite(candidate):
+                            score = candidate
+                    except (TypeError, ValueError):
+                        pass
+                if score is None:
+                    score = _score_from_stdout(
+                        completed.stdout, reported_metric, reported_direction
+                    )
+                if score is None:
+                    score = _score_from_stdout(completed.stdout, None, reported_direction)
+                if score is None:
+                    if status == "truncated":
+                        feedback = (
+                            "The truncated run reported no usable score in result.json or stdout."
+                        )
+                        diagnostics.append(f"attempt {attempt}: {feedback}")
+                        self._log(display_name, feedback)
+                        continue
+                    score = 1e30 if reported_direction == "minimize" else -1e30
                 self._log(display_name, f"Accepted runnable output {output}; score={score:.8g}.")
+                oof_path = node_dir / "oof_predictions.npz"
+                test_pred_path = node_dir / "test_predictions.npz"
                 return {
-                    "status": "completed",
+                    "status": status,
                     "score": score,
-                    "metric": str(payload.get("metric") or task_analysis.metric),
-                    "direction": str(payload.get("direction") or task_analysis.direction),
-                    "output": str(output),
+                    "metric": reported_metric,
+                    "direction": reported_direction,
+                    "output": str(output) if output is not None else None,
                     "diagnostics": "\n\n".join(diagnostics)[-10000:],
                     "attempts": attempt,
                     "operator": operator,
-                    "submission_validation": validation.to_dict(),
+                    "submission_validation": (
+                        validation.to_dict() if validation is not None else {}
+                    ),
                     "evaluation_protocol_hash": (
                         council_brief.evaluation_protocol.protocol_hash
                         if council_brief is not None
@@ -768,6 +1027,12 @@ CRITICAL RULES & AGENT REASONING WORKFLOW:
                     "validation_sample_count": payload.get("validation_sample_count"),
                     "modality_ablation_scores": payload.get(
                         "modality_ablation_scores"
+                    ),
+                    "prediction_signature": payload.get("prediction_signature"),
+                    "seed_scores": payload.get("seed_scores"),
+                    "oof_predictions": str(oof_path) if oof_path.is_file() else None,
+                    "test_predictions": (
+                        str(test_pred_path) if test_pred_path.is_file() else None
                     ),
                     "code": last_code,
                 }

@@ -17,4 +17,5 @@ class NodeState:
     config: dict[str, Any] = field(default_factory=dict)
     visits: int = 0
     total_reward: float = 0.0
+    best_reward: float = float("-inf")
     children_ids: list[str] = field(default_factory=list)
