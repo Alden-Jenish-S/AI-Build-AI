@@ -668,6 +668,58 @@ Path('input/train.csv').write_text('changed')
             )
         )
 
+    def test_gpu_compute_capability_parsing(self) -> None:
+        instance = ImplementationAgent("unused-node-dir", "unused-task-dir")
+        with patch(
+            "agents.implementation_agent.subprocess.run",
+            return_value=unittest.mock.Mock(
+                returncode=0, stdout="6.0\n", stderr=""
+            ),
+        ):
+            self.assertEqual(instance._gpu_compute_capability(), 6.0)
+        with patch(
+            "agents.implementation_agent.subprocess.run",
+            return_value=unittest.mock.Mock(
+                returncode=0, stdout="8.6\n", stderr=""
+            ),
+        ):
+            self.assertEqual(instance._gpu_compute_capability(), 8.6)
+        with patch(
+            "agents.implementation_agent.subprocess.run",
+            return_value=unittest.mock.Mock(
+                returncode=1, stdout="", stderr="No devices found"
+            ),
+        ):
+            self.assertIsNone(instance._gpu_compute_capability())
+
+    def test_cuda_probe_treats_capability_warnings_as_incompatible(self) -> None:
+        instance = ImplementationAgent("unused-node-dir", "unused-task-dir")
+        instance._cuda_probe_cache = {}
+        warning = (
+            "Found GPU0 Tesla P100-PCIE-16GB which is of cuda capability 6.0.\n"
+            "Minimum and Maximum cuda capability supported by this version of "
+            "PyTorch is (7.0) - (12.0)"
+        )
+
+        def fake_run(command, *args, **kwargs):
+            stdout = "1\n"
+            stderr = warning if "synchronize" in command[-1] else ""
+            return unittest.mock.Mock(returncode=0, stdout=stdout, stderr=stderr)
+
+        with patch(
+            "agents.implementation_agent.subprocess.run", side_effect=fake_run
+        ):
+            self.assertTrue(instance._cuda_incompatible_environment())
+
+        instance._cuda_probe_cache = {}
+        with patch(
+            "agents.implementation_agent.subprocess.run",
+            return_value=unittest.mock.Mock(
+                returncode=0, stdout="1\n", stderr=""
+            ),
+        ):
+            self.assertFalse(instance._cuda_incompatible_environment())
+
     def test_architecture_source_gate_rejects_library_or_plain_mlp_fallbacks(self) -> None:
         tree_only = "from lightgbm import LGBMClassifier\nmodel = LGBMClassifier()\n"
         self.assertTrue(_architecture_source_errors(tree_only))

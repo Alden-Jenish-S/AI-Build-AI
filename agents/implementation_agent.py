@@ -678,11 +678,13 @@ CRITICAL RULES & AGENT REASONING WORKFLOW:
     def _cuda_incompatible_environment(self) -> bool:
         """True when the child interpreter's torch cannot use any local GPU.
 
-        Probes `torch.cuda.is_available()` once per interpreter and caches the
-        result. When it is False (no GPU, or an incompatible GPU such as a
-        capability-6.0 Tesla P100 under a sm_70+ build), the child runs are
-        started with `CUDA_VISIBLE_DEVICES=""`, which prevents both the crash
-        and the repeated capability warnings before they ever appear.
+        Probes the interpreter once per process and caches the result. The
+        probe performs a real CUDA allocation and sync, and treats capability
+        warnings (for example a capability-6.0 Tesla P100 under a sm_70+ torch
+        build) as incompatibility even when ``is_available`` reports True.
+        When True, child runs start with ``CUDA_VISIBLE_DEVICES=""``, which
+        prevents both the crash and the repeated capability warnings before
+        they ever appear.
         """
         cache = getattr(self, "_cuda_probe_cache", None)
         if cache is None:
@@ -690,19 +692,30 @@ CRITICAL RULES & AGENT REASONING WORKFLOW:
         if self.python not in cache:
             incompatible = False
             try:
+                probe_script = (
+                    "import sys\n"
+                    "import torch\n"
+                    "usable = torch.cuda.is_available()\n"
+                    "if usable:\n"
+                    "    x = torch.zeros(8, device='cuda')\n"
+                    "    torch.cuda.synchronize()\n"
+                    "    sys.stdout.write('1' if usable else '0')\n"
+                )
                 completed = subprocess.run(
-                    [
-                        self.python,
-                        "-c",
-                        "import torch, sys;"
-                        "sys.stdout.write('1' if torch.cuda.is_available() else '0')",
-                    ],
+                    [self.python, "-c", probe_script],
                     capture_output=True,
                     text=True,
                     timeout=120,
                 )
-                incompatible = bool(
-                    completed.returncode == 0 and completed.stdout.strip() != "1"
+                usable = bool(
+                    completed.returncode == 0 and completed.stdout.strip() == "1"
+                )
+                incompatible = (
+                    completed.returncode == 0
+                    and (
+                        not usable
+                        or self._cuda_incompatibility_error(completed.stderr)
+                    )
                 )
             except (OSError, subprocess.SubprocessError, ValueError):
                 incompatible = False
@@ -731,23 +744,54 @@ CRITICAL RULES & AGENT REASONING WORKFLOW:
             cache = getattr(self, "_cuda_probe_cache", None)
         return bool(cache and cache.get(self.python) is False)
 
+    @staticmethod
+    def _gpu_compute_capability() -> float | None:
+        """Return the primary GPU's CUDA compute capability (e.g. 6.0) or None."""
+        try:
+            completed = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=compute_cap",
+                    "--format=csv,noheader,nounits",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            if completed.returncode != 0:
+                return None
+            for line in completed.stdout.splitlines():
+                line = line.strip()
+                if line:
+                    try:
+                        return float(line)
+                    except ValueError:
+                        continue
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return None
+        return None
+
     def _attempt_gpu_upgrade(self, display_name: str) -> bool:
-        """Optionally reinstall a Pascal-compatible torch to unlock a GPU.
+        """Reinstall a GPU-compatible torch to unlock an unusable local GPU.
 
         Modern torch CUDA 12.8+ wheels omit Pascal (sm_60/sm_61); the official
-        CUDA 12.6 build still includes them. When a GPU is physically present
-        but the current torch reports CUDA unusable, reinstall torch (and any
-        installed torchvision/torchaudio) from a configurable index so the run
-        can use the GPU instead of silently falling back to CPU. Opt-in via
-        ``AIBUILDAI_GPU_UPGRADE``; runs at most once per process.
+        CUDA 12.6 build still includes them. When an NVIDIA GPU is physically
+        present but the current torch reports CUDA unusable, reinstall torch
+        (and any installed torchvision/torchaudio) so the run can use the GPU
+        instead of silently falling back to CPU. A pinned version is used so
+        pip downgrades a newer incompatible build (``pip install --upgrade``
+        alone never downgrades). Runs at most once per process; ``AIBUILDAI_GPU_UPGRADE=0``
+        disables it while ``AIBUILDAI_GPU_UPGRADE_INDEX`` overrides the index.
         """
         if not getattr(self, "_gpu_upgrade_attempted", False):
             self._gpu_upgrade_attempted = True
             if (
-                _env_enabled("AIBUILDAI_GPU_UPGRADE", default=False)
+                _env_enabled("AIBUILDAI_GPU_UPGRADE", default=True)
                 and self._nvidia_gpu_present()
                 and not self._torch_cuda_usable()
             ):
+                capability = self._gpu_compute_capability()
+                use_pascal_build = capability is not None and capability < 7.0
                 index = os.getenv(
                     "AIBUILDAI_GPU_UPGRADE_INDEX",
                     "https://download.pytorch.org/whl/cu126",
@@ -772,12 +816,30 @@ CRITICAL RULES & AGENT REASONING WORKFLOW:
                     ]
                 except (OSError, subprocess.SubprocessError, ValueError):
                     extras = []
-                self._log(
-                    display_name,
-                    "GPU is present but the current torch cannot use it; reinstalling "
-                    f"torch (+{', '.join(extras) or 'none'}) from {index} to enable "
-                    "CUDA. This downloads a large package and may take several minutes.",
-                )
+                if use_pascal_build:
+                    pins = {
+                        "torch": "torch==2.6.0+cu126",
+                        "torchvision": "torchvision==0.21.0+cu126",
+                        "torchaudio": "torchaudio==2.6.0+cu126",
+                    }
+                    packages = [pins["torch"]]
+                    for name in extras:
+                        packages.append(pins.get(name, name))
+                    self._log(
+                        display_name,
+                        f"GPU is a pre-7.0 capability device (Pascal-class, {capability}); "
+                        f"reinstalling torch {packages} from {index} to enable CUDA. "
+                        "This downloads a large package and may take several minutes.",
+                    )
+                else:
+                    packages = ["torch", *extras]
+                    self._log(
+                        display_name,
+                        "GPU is present but the current torch cannot use it; "
+                        f"reinstalling torch (+{', '.join(extras) or 'none'}) from "
+                        f"{index} to enable CUDA. This downloads a large package and "
+                        "may take several minutes.",
+                    )
                 try:
                     subprocess.run(
                         [
@@ -786,8 +848,7 @@ CRITICAL RULES & AGENT REASONING WORKFLOW:
                             "pip",
                             "install",
                             "--upgrade",
-                            "torch",
-                            *extras,
+                            *packages,
                             "--index-url",
                             index,
                             "--disable-pip-version-check",
@@ -859,9 +920,9 @@ CRITICAL RULES & AGENT REASONING WORKFLOW:
         if hard_limit_seconds is None:
             configured_hard_limit = os.getenv("AIBUILDAI_HARD_LIMIT_SECONDS", "").strip()
             try:
-                hard_limit_seconds = float(configured_hard_limit) if configured_hard_limit else 21600.0
+                hard_limit_seconds = float(configured_hard_limit) if configured_hard_limit else 3600.0
             except ValueError:
-                hard_limit_seconds = 21600.0
+                hard_limit_seconds = 3600.0
         if council_brief is not None:
             (node_dir / "evaluation_protocol.json").write_text(
                 json.dumps(
@@ -976,7 +1037,7 @@ CRITICAL RULES & AGENT REASONING WORKFLOW:
                     "MKL_NUM_THREADS": os.getenv("AIBUILDAI_MODEL_THREADS", "4"),
                 }
             )
-            if _env_enabled("AIBUILDAI_GPU_UPGRADE", default=False):
+            if _env_enabled("AIBUILDAI_GPU_UPGRADE", default=True):
                 self._attempt_gpu_upgrade(display_name)
             if self._cuda_incompatible_environment():
                 child_env["CUDA_VISIBLE_DEVICES"] = ""
@@ -994,11 +1055,24 @@ CRITICAL RULES & AGENT REASONING WORKFLOW:
                 child_env.pop("no_proxy", None)
             try:
                 self._log(display_name, f"Executing {source_file.name}; child logs follow.")
+                
+                # 3. Create node-local venv for true isolation
+                venv_dir = node_dir / ".venv"
+                if not venv_dir.exists():
+                    self._log(display_name, "Creating isolated virtual environment...")
+                    subprocess.run([self.python, "-m", "venv", str(venv_dir)], check=True, capture_output=True)
+                
+                # Use venv python depending on OS
+                if os.name == "nt":
+                    node_python = str(venv_dir / "Scripts" / "python.exe")
+                else:
+                    node_python = str(venv_dir / "bin" / "python")
+
                 install_attempts = 0
                 cuda_fallback_used = False
                 while True:
                     completed = run_supervised_process(
-                        [self.python, source_file.name],
+                        [node_python, source_file.name],
                         cwd=node_dir,
                         env=child_env,
                         stall_seconds=stall_seconds,
@@ -1023,7 +1097,7 @@ CRITICAL RULES & AGENT REASONING WORKFLOW:
                             try:
                                 subprocess.run(
                                     [
-                                        self.python, "-m", "pip", "install", pkg_to_install,
+                                        node_python, "-m", "pip", "install", pkg_to_install,
                                         "--index-url", "https://pypi.org/simple",
                                         "--disable-pip-version-check", "--no-input",
                                     ],
