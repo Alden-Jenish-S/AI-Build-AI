@@ -331,6 +331,8 @@ def task_dir_snapshot(task_dir: Path) -> dict[str, tuple[int, int]]:
     ):
         directory_names.sort()
         for name in sorted(file_names):
+            if name == ".DS_Store":
+                continue
             path = Path(current) / name
             try:
                 stat = path.stat()

@@ -626,6 +626,48 @@ Path('input/train.csv').write_text('changed')
         self.assertIn("DO NOT retain its conventional estimator", prompt)
         self.assertIn("plain MLP may appear only as an ablation", prompt)
 
+    def test_hardware_device_contract_is_always_included(self) -> None:
+        prompt = ImplementationAgent()._prompt(
+            self.analysis(),
+            "Train a gradient boosted model.",
+            None,
+            None,
+            None,
+            "",
+            "",
+            self.brief(),
+            "root",
+        )
+        self.assertIn("HARDWARE / DEVICE CONTRACT", prompt)
+        self.assertIn("torch.cuda.is_available()", prompt)
+        self.assertIn("not compatible with the current PyTorch installation", prompt)
+        self.assertIn("Run on CPU", prompt)
+
+    def test_cuda_incompatibility_error_detection(self) -> None:
+        p100_warning = (
+            "Found GPU0 Tesla P100-PCIE-16GB which is of cuda capability 6.0.\n"
+            "Minimum and Maximum cuda capability supported by this version of "
+            "PyTorch is (7.0) - (12.0)\n"
+            "Tesla P100-PCIE-16GB with CUDA capability sm_60 is not compatible "
+            "with the current PyTorch installation."
+        )
+        self.assertTrue(ImplementationAgent._cuda_incompatibility_error(p100_warning))
+        self.assertTrue(
+            ImplementationAgent._cuda_incompatibility_error(
+                "RuntimeError: CUDA error: out of memory"
+            )
+        )
+        self.assertTrue(
+            ImplementationAgent._cuda_incompatibility_error(
+                "AssertionError: Torch not compiled with CUDA enabled"
+            )
+        )
+        self.assertFalse(
+            ImplementationAgent._cuda_incompatibility_error(
+                "ValueError: bad input shape"
+            )
+        )
+
     def test_architecture_source_gate_rejects_library_or_plain_mlp_fallbacks(self) -> None:
         tree_only = "from lightgbm import LGBMClassifier\nmodel = LGBMClassifier()\n"
         self.assertTrue(_architecture_source_errors(tree_only))

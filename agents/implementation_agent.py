@@ -591,6 +591,21 @@ PREDICTION EVIDENCE (optional, task-dependent):
 - For holdout-style or task-native protocols, optionally report `seed_scores`: at least 2 finite
   scores from independent repeated-seed evaluations.
 """
+        hardware_contract = """
+HARDWARE / DEVICE CONTRACT (mandatory):
+- Accelerators (CUDA/MPS) are OPTIONAL, never a requirement. Select the device by probing:
+  `device = "cuda" if torch.cuda.is_available() else "cpu"` (Apple hardware:
+  `torch.backends.mps.is_available()`). Never hard-code a device.
+- Never call `torch.cuda.*` APIs (set_device, empty_cache, device_count, synchronize, ...) unless
+  `torch.cuda.is_available()` returned True. Gate every CUDA-specific call behind that check.
+- Warnings like "GPU0 ... is of cuda capability X", "Minimum and Maximum cuda capability
+  supported", "not compatible with the current PyTorch installation", or "no kernel image is
+  available" mean the installed PyTorch cannot use this GPU: `torch.cuda.is_available()` returns
+  False. Run on CPU. Such warnings are NON-FATAL: continue normally, do not treat them as a
+  failure, and do not spend repair attempts "fixing" them.
+- If CPU training is too slow for the time budget, reduce epochs/batches or subsample instead of
+  assuming a GPU exists.
+"""
         return f"""
 Write one complete, self-contained Python program for this task.
 
@@ -606,6 +621,7 @@ Implementation plan:
 {abort_section}
 {tune_contract}
 {prediction_contract}
+{hardware_contract}
 Exact runtime input paths available under input/:
 {exact_paths}
 
@@ -620,6 +636,7 @@ CRITICAL RULES & AGENT REASONING WORKFLOW:
    e. Lightweight vs Heavy Models: Keep in mind that well-tailored compact models with custom modules, custom augmentations, or domain features often outperform heavy generic off-the-shelf models. Choose the optimal tradeoff for validation score and execution efficiency.
    f. If repairing a failed run or tuning, analyze the execution traceback, diagnose why it failed, and verify if fixing/tuning the current model will improve performance vs refactoring the approach.
    g. Outline your end-to-end data pipeline, validation split strategy, model training, and exact output generation.
+   h. If more than one modality data is available, test them individually before combined analysis. Also do not convert one modality to another. 
 
 2. RUNTIME & SUBMISSION CONSTRAINTS:
    - For your first debug attempt, aggressively subsample the training dataset (e.g. 5%) to quickly verify end-to-end execution without wasting GPU time on full training loops. You can scale to 100% data once the pipeline logic is proven to work.
@@ -638,6 +655,168 @@ CRITICAL RULES & AGENT REASONING WORKFLOW:
    First return your step-by-step reasoning in a <thinking> ... </thinking> block.
    Then return your complete Python code in ONE fenced block ```python ... ```.
 """.strip()
+
+    @staticmethod
+    def _cuda_incompatibility_error(stderr: str) -> bool:
+        """Return whether captured stderr shows an unsupported-GPU/accelerator failure.
+
+        Matches the Tesla P100 sm_60-style capability warnings, missing-kernel
+        crashes, and builds whose torch was compiled without CUDA, so the caller
+        can retry with `CUDA_VISIBLE_DEVICES=""` before spending a repair attempt.
+        """
+        text = str(stderr or "")
+        patterns = (
+            r"is not compatible with the current PyTorch installation",
+            r"no kernel image is available",
+            r"not compiled with CUDA enabled",
+            r"cuda capability",
+            r"cuda runtime error",
+            r"cuda error:",
+        )
+        return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in patterns)
+
+    def _cuda_incompatible_environment(self) -> bool:
+        """True when the child interpreter's torch cannot use any local GPU.
+
+        Probes `torch.cuda.is_available()` once per interpreter and caches the
+        result. When it is False (no GPU, or an incompatible GPU such as a
+        capability-6.0 Tesla P100 under a sm_70+ build), the child runs are
+        started with `CUDA_VISIBLE_DEVICES=""`, which prevents both the crash
+        and the repeated capability warnings before they ever appear.
+        """
+        cache = getattr(self, "_cuda_probe_cache", None)
+        if cache is None:
+            cache = self._cuda_probe_cache = {}
+        if self.python not in cache:
+            incompatible = False
+            try:
+                completed = subprocess.run(
+                    [
+                        self.python,
+                        "-c",
+                        "import torch, sys;"
+                        "sys.stdout.write('1' if torch.cuda.is_available() else '0')",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+                incompatible = bool(
+                    completed.returncode == 0 and completed.stdout.strip() != "1"
+                )
+            except (OSError, subprocess.SubprocessError, ValueError):
+                incompatible = False
+            cache[self.python] = incompatible
+        return cache[self.python]
+
+    @staticmethod
+    def _nvidia_gpu_present() -> bool:
+        """Return whether an NVIDIA GPU is physically visible on this host."""
+        try:
+            completed = subprocess.run(
+                ["nvidia-smi", "-L"],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            return bool(completed.returncode == 0 and "GPU" in completed.stdout)
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return False
+
+    def _torch_cuda_usable(self) -> bool:
+        """Return whether the child interpreter's torch can currently use CUDA."""
+        cache = getattr(self, "_cuda_probe_cache", None)
+        if cache is None or self.python not in cache:
+            self._cuda_incompatible_environment()
+            cache = getattr(self, "_cuda_probe_cache", None)
+        return bool(cache and cache.get(self.python) is False)
+
+    def _attempt_gpu_upgrade(self, display_name: str) -> bool:
+        """Optionally reinstall a Pascal-compatible torch to unlock a GPU.
+
+        Modern torch CUDA 12.8+ wheels omit Pascal (sm_60/sm_61); the official
+        CUDA 12.6 build still includes them. When a GPU is physically present
+        but the current torch reports CUDA unusable, reinstall torch (and any
+        installed torchvision/torchaudio) from a configurable index so the run
+        can use the GPU instead of silently falling back to CPU. Opt-in via
+        ``AIBUILDAI_GPU_UPGRADE``; runs at most once per process.
+        """
+        if not getattr(self, "_gpu_upgrade_attempted", False):
+            self._gpu_upgrade_attempted = True
+            if (
+                _env_enabled("AIBUILDAI_GPU_UPGRADE", default=False)
+                and self._nvidia_gpu_present()
+                and not self._torch_cuda_usable()
+            ):
+                index = os.getenv(
+                    "AIBUILDAI_GPU_UPGRADE_INDEX",
+                    "https://download.pytorch.org/whl/cu126",
+                ).strip()
+                extras: list[str] = []
+                try:
+                    probe = subprocess.run(
+                        [
+                            self.python,
+                            "-c",
+                            "import importlib.util, sys, torch;"
+                            "names=[n for n in ('torchvision','torchaudio') "
+                            "if importlib.util.find_spec(n) is not None];"
+                            "sys.stdout.write(','.join(names))",
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=120,
+                    )
+                    extras = [
+                        name for name in probe.stdout.split(",") if name.strip()
+                    ]
+                except (OSError, subprocess.SubprocessError, ValueError):
+                    extras = []
+                self._log(
+                    display_name,
+                    "GPU is present but the current torch cannot use it; reinstalling "
+                    f"torch (+{', '.join(extras) or 'none'}) from {index} to enable "
+                    "CUDA. This downloads a large package and may take several minutes.",
+                )
+                try:
+                    subprocess.run(
+                        [
+                            self.python,
+                            "-m",
+                            "pip",
+                            "install",
+                            "--upgrade",
+                            "torch",
+                            *extras,
+                            "--index-url",
+                            index,
+                            "--disable-pip-version-check",
+                            "--no-input",
+                        ],
+                        env=sanitized_subprocess_env(),
+                        check=False,
+                        timeout=1800,
+                    )
+                except (OSError, subprocess.SubprocessError) as exc:
+                    self._log(
+                        display_name,
+                        f"GPU upgrade failed ({exc}); will run on CPU instead.",
+                    )
+                cache = getattr(self, "_cuda_probe_cache", None)
+                if cache is not None:
+                    cache.pop(self.python, None)
+                if self._torch_cuda_usable():
+                    self._log(
+                        display_name,
+                        "GPU enabled via a compatible torch build; proceeding on CUDA.",
+                    )
+                    return True
+                self._log(
+                    display_name,
+                    "GPU upgrade did not enable CUDA (driver/index mismatch?); "
+                    "running on CPU.",
+                )
+        return self._torch_cuda_usable()
 
     @staticmethod
     def _web_query(stderr: str) -> str:
@@ -797,6 +976,15 @@ CRITICAL RULES & AGENT REASONING WORKFLOW:
                     "MKL_NUM_THREADS": os.getenv("AIBUILDAI_MODEL_THREADS", "4"),
                 }
             )
+            if _env_enabled("AIBUILDAI_GPU_UPGRADE", default=False):
+                self._attempt_gpu_upgrade(display_name)
+            if self._cuda_incompatible_environment():
+                child_env["CUDA_VISIBLE_DEVICES"] = ""
+                self._log(
+                    display_name,
+                    "Child torch cannot use the local GPU (incompatible capability "
+                    "or no GPU); preemptively disabling CUDA for this node.",
+                )
             if not _env_enabled("AIBUILDAI_ALLOW_NETWORK", default=False):
                 # Generated programs run without network egress; only the parent
                 # performs pip installs and web-assisted repair.
@@ -849,7 +1037,7 @@ CRITICAL RULES & AGENT REASONING WORKFLOW:
                             continue
                             
                         # 2. Handle CUDA compatibility/GPU errors
-                        if "is not compatible with the current PyTorch installation" in completed.stderr or "no kernel image is available" in completed.stderr:
+                        if self._cuda_incompatibility_error(completed.stderr):
                             if child_env.get("CUDA_VISIBLE_DEVICES") != "":
                                 self._log(display_name, "CUDA GPU compatibility error detected. Forcing CPU fallback and retrying...")
                                 child_env["CUDA_VISIBLE_DEVICES"] = ""
