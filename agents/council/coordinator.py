@@ -412,7 +412,7 @@ from measurements and cited literature. Do not imitate a known competition solut
 Do not recommend a model because it is fashionable. Every hypothesis needs a cheap,
 discriminating first experiment, expected signal, cost, risks, and stopping rule.
 Explicitly evaluate three counterfactuals: an established non-neural method, a
-resource-bounded neural representation, and a custom neural architecture assembled
+pretrained-fine-tune transfer neural network (if applicable to the modalities), and a custom neural architecture assembled
 from primitive trainable operations around the observed inductive biases. A custom
 architecture must specify its computation graph and an ablation against a simpler
 control; do not merely rename an MLP, TabNet, transformer, or another library model.
@@ -515,7 +515,7 @@ evidence and primary literature. Preserve alternative representations that could
 later ensemble well.
 The full hypothesis ledger must explicitly resolve conventional, established-neural,
 and custom-neural counterfactuals. When resources make training feasible, include
-at least one falsifiable neural or custom-architecture hypothesis, even if it is not
+at least one falsifiable pretrained-fine-tune (established-neural) or custom-architecture hypothesis, even if it is not
 selected. Set `architecture_track`; for a neural proposal, provide `architecture_spec`
 with inputs, learned transformations, interaction mechanism, output head, loss,
 regularization, optimizer, and stopping rule. For task-invented networks, provide a
@@ -599,7 +599,7 @@ Member reports:
             "architecture_spec": "",
             "novelty_test": (
                 "After the control is measured, test a resource-bounded task-tailored neural "
-                "architecture if the main search has enough idea budget."
+                "architecture or pretrained transfer model if the main search has enough idea budget."
             ),
             "modality_scope": (
                 "modality_ablation"
@@ -630,7 +630,7 @@ Member reports:
             hypotheses=[hypothesis],
             selected_portfolio=[hypothesis],
             unresolved_questions=[
-                "Would a learned representation or task-tailored neural computation graph "
+                "Would a learned representation, pretrained backbone, or task-tailored neural computation graph "
                 "outperform the measured control under the available compute budget?"
             ],
             warnings=warnings,

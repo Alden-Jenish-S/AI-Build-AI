@@ -59,7 +59,7 @@ def _compact_code(code: str, limit: int) -> str:
     return code[:head] + "\n# ... middle omitted from prompt ...\n" + code[-(limit - head):]
 
 
-def _architecture_source_errors(code: str) -> list[str]:
+def _architecture_source_errors(code: str, operator: str = "architect") -> list[str]:
     """Reject an `architect` response that silently falls back to a library model."""
     try:
         tree = ast.parse(code)
@@ -150,6 +150,10 @@ def _architecture_source_errors(code: str) -> list[str]:
         errors.append("the custom candidate does not import PyTorch")
     if module_classes < 1 or not has_forward:
         errors.append("the custom candidate has no explicit nn.Module subclass with forward()")
+
+    if operator == "transfer":
+        return errors
+
     if not has_custom_composition:
         errors.append(
             "the network exposes no custom interaction, gating, routing, residual, "
@@ -406,12 +410,12 @@ class ImplementationAgent:
     ) -> str:
         parent = ""
         if parent_code:
-            if operator == "architect":
+            if operator in ("architect", "transfer"):
                 parent = (
                     "\nA working measured control is included below. Reuse its proven input "
                     "discovery, preprocessing contract, validation indices, metric, and output "
                     "behavior, but DO NOT retain its conventional estimator as the primary "
-                    "candidate. The architecture experiment must train and evaluate the custom "
+                    "candidate. The architecture/transfer experiment must train and evaluate the custom "
                     "neural predictor requested by the plan. Keep the parent only as the reported "
                     "control/fallback.\n"
                     f"```python\n{_compact_code(parent_code, 20000)}\n```\n"
@@ -517,6 +521,14 @@ ARCHITECTURE EXPERIMENT CONTRACT (mandatory):
   by that comparison. Never blend merely to avoid reporting a failed architecture.
 - Bound epochs and parameter count, use deterministic seeds and early stopping, select
   CUDA/MPS only when available, and always provide a CPU path.
+"""
+        elif operator == "transfer":
+            architecture_contract = """
+ARCHITECTURE EXPERIMENT CONTRACT (mandatory):
+- Implement the primary candidate as an explicit custom PyTorch `nn.Module` that wraps a pretrained backbone (e.g. EfficientNet) and adds a custom head/attention layer.
+- Ensure weights can be downloaded safely. Implement a fallback mechanism if downloads fail (e.g. catch Exception and fall back to a dummy network or cached model).
+- Reuse identical validation indices for the measured parent/control and custom network. Report scores in diagnostics and choose the final predictor by that comparison.
+- Bound epochs and parameter count, use deterministic seeds and early stopping, select CUDA/MPS only when available, and always provide a CPU path.
 """
         modality_contract = ""
         if requires_modality_ablation:
@@ -990,8 +1002,8 @@ Implementation plan:
                 feedback = _tail(str(exc))
                 continue
 
-            if operator == "architect":
-                architecture_errors = _architecture_source_errors(code)
+            if operator in ("architect", "transfer"):
+                architecture_errors = _architecture_source_errors(code, operator)
                 if architecture_errors:
                     feedback = (
                         "ARCHITECTURE CONTRACT FAILURE:\n- "

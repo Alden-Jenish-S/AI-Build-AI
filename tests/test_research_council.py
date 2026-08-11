@@ -134,6 +134,37 @@ class ResearchCouncilTests(unittest.TestCase):
         self.assertTrue((run_dir / "input" / "train.csv").exists())
         self.assertFalse((run_dir / "input" / "test_labels.csv").exists())
 
+    def test_expose_task_data_large_input_symlinks(self) -> None:
+        (self.task_dir / "large.csv").write_text("x\n1\n", encoding="utf-8")
+        run_dir = self.root / "node"
+        linked = expose_task_data(
+            self.task_dir,
+            run_dir,
+            allowed_paths=("large.csv",),
+            copy_limit_bytes=0,  # Force symlink
+        )
+        self.assertEqual(1, len(linked))
+        target = run_dir / "input" / "large.csv"
+        self.assertTrue(target.exists())
+        self.assertTrue(target.is_symlink())
+        self.assertEqual(target.read_text(encoding="utf-8"), "x\n1\n")
+
+    @patch("os.symlink")
+    def test_expose_task_data_symlink_fallback(self, mock_symlink) -> None:
+        mock_symlink.side_effect = OSError("Privilege not held")
+        (self.task_dir / "large.csv").write_text("x\n1\n", encoding="utf-8")
+        run_dir = self.root / "node"
+        linked = expose_task_data(
+            self.task_dir,
+            run_dir,
+            allowed_paths=("large.csv",),
+            copy_limit_bytes=0,  # Force symlink, but it fails
+        )
+        self.assertEqual(1, len(linked))
+        target = run_dir / "input" / "large.csv"
+        self.assertTrue(target.exists())
+        self.assertFalse(target.is_symlink())  # Fell back to copy
+        self.assertEqual(target.read_text(encoding="utf-8"), "x\n1\n")
     def test_diagnostic_gate_allows_only_the_declared_output_write(self) -> None:
         safe = """
 import json

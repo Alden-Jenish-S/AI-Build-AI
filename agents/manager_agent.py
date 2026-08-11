@@ -36,6 +36,7 @@ from .implementation_agent import ImplementationAgent
 from .submission_validator import SubmissionValidator
 from .task_analyzer import TaskAnalysis, TaskAnalyzer
 from .technique_agent import TechniqueAgent
+from .modality_policy import transfer_learning_applicable
 
 
 class ManagerAgent:
@@ -1382,6 +1383,26 @@ class ManagerAgent:
                     require_custom=True,
                     residual_evidence=self._architect_residual_evidence(),
                 )
+            elif planning.operator == "transfer":
+                measured_context = "\n".join(
+                    f"- {self.node_label(node.node_id)}: operator={node.operator}; "
+                    f"score={(node.result or {}).get('score')}; "
+                    f"pruned={bool((node.result or {}).get('pruned'))}; "
+                    f"plan_summary={self._clean_plan_text(node.plan)[:300]}"
+                    for node in self.all_nodes.values()
+                    if node.node_type == "implementation"
+                    and node.executed
+                    and (node.result or {}).get("status") == "completed"
+                    and not (node.result or {}).get("probe")
+                )
+                plan = self.technique_agent.propose_transfer_exploration(
+                    self.task_analysis,
+                    base.plan or "",
+                    score,
+                    measured_alternatives=measured_context,
+                    plateau_evidence=json.dumps(self._plateau_state(), default=str),
+                    residual_evidence=self._architect_residual_evidence(),
+                )
             else:
                 measured_context = "\n".join(
                     f"- {self.node_label(node.node_id)}: operator={node.operator}; "
@@ -1479,23 +1500,23 @@ class ManagerAgent:
             )
         return self._execute_planning_action(planning)
 
-    def _architect(self, node: NodeState, *, trigger: str) -> NodeState | None:
-        """Measure one custom neural counterfactual against the selected control."""
-        if not self._can_attempt("architect") or not node.result:
+    def _architect(self, node: NodeState, *, trigger: str, operator: str = "architect") -> NodeState | None:
+        """Measure one custom neural or transfer counterfactual against the selected control."""
+        if not self._can_attempt(operator) or not node.result:
             return None
-        planning = self._pending_action(node, "architect")
+        planning = self._pending_action(node, operator)
         if planning is None:
             planning = self._create_planning_node(
-                "Design a bounded task-invented neural architecture from observed evidence; "
+                "Design a bounded task-invented neural architecture or pretrained transfer model from observed evidence; "
                 "materialize only when selected by the architecture coverage policy.",
-                operator="architect",
+                operator=operator,
                 parent=node,
                 executed=False,
                 priority=1.25,
                 base=node,
             )
         planning.config["architecture_trigger"] = trigger[:1000]
-        planning.config["architecture_track"] = "custom_neural"
+        planning.config["architecture_track"] = "custom_neural" if operator == "architect" else "established_neural"
         return self._execute_planning_action(planning)
 
     def _merge_two_nodes(self, first: NodeState, second: NodeState, custom_plan: str = "") -> NodeState | None:
@@ -2003,8 +2024,9 @@ class ManagerAgent:
                     "Architecture coverage intervention before merge/finalize: "
                     f"{architecture_trigger}."
                 )
+                op = "transfer" if transfer_learning_applicable(self.task_analysis.modalities) else "architect"
                 architecture_node = self._architect(
-                    self.all_nodes[self.best_node_id], trigger=architecture_trigger
+                    self.all_nodes[self.best_node_id], trigger=architecture_trigger, operator=op
                 )
                 if architecture_node is not None:
                     continue
@@ -2061,8 +2083,22 @@ class ManagerAgent:
                 architected = self._architect(
                     self.all_nodes[self.best_node_id],
                     trigger=str(reasoning or "LLM identified a missing architecture experiment"),
+                    operator="architect",
                 )
                 if architected is not None:
+                    continue
+
+            if (
+                action == "transfer"
+                and self.best_node_id is not None
+                and self._can_attempt("transfer")
+            ):
+                transfered = self._architect(
+                    self.all_nodes[self.best_node_id],
+                    trigger=str(reasoning or "LLM identified a missing transfer experiment"),
+                    operator="transfer",
+                )
+                if transfered is not None:
                     continue
 
             if action in {"tune", "refine"} and target_ids:

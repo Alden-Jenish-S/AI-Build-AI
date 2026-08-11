@@ -65,6 +65,12 @@ def predictive_modality_inventory(
     }
 
 
+def transfer_learning_applicable(modalities: Iterable[str]) -> bool:
+    """Return True if the modalities justify transfer learning (image, text, audio, video)."""
+    applicable = {"image", "text", "audio", "video", "structured_text"}
+    return any(str(mod).casefold() in applicable for mod in modalities)
+
+
 def validate_modality_ablation_report(
     payload: Mapping[str, Any],
     modalities: Iterable[str],

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 import queue
@@ -428,11 +429,26 @@ def expose_task_data(
         target.parent.mkdir(parents=True, exist_ok=True)
         if target.exists() or target.is_symlink():
             raise FileExistsError(f"Node input path is already occupied: {target}")
-        shutil.copy2(source, target)
-        try:
-            target.chmod(0o444)
-        except OSError:
-            pass
+        
+        if should_copy:
+            shutil.copy2(source, target)
+            try:
+                target.chmod(0o444)
+            except OSError:
+                pass
+        else:
+            try:
+                os.symlink(source, target)
+            except (OSError, NotImplementedError) as exc:
+                logging.warning(
+                    "Symlink failed for %s -> %s: %s. Falling back to copy.",
+                    source, target, exc
+                )
+                shutil.copy2(source, target)
+                try:
+                    target.chmod(0o444)
+                except OSError:
+                    pass
         linked.append(target)
     return linked
 

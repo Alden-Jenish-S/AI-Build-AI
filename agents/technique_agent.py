@@ -35,7 +35,7 @@ _DECISION_SCHEMA: dict[str, Any] = {
     "properties": {
         "action": {
             "type": "string",
-            "enum": ["merge", "tune", "refine", "diversify", "architect", "finalize"],
+            "enum": ["merge", "tune", "refine", "diversify", "architect", "transfer", "finalize"],
         },
         "target_node_ids": {"type": "array", "items": {"type": "string"}},
         "thinking": {"type": "string"},
@@ -177,13 +177,13 @@ class TechniqueAgent:
             "   c. Novel & Task-Tailored Techniques: Where appropriate, think through domain-specific data augmentations, metric-aligned loss functions, and specialized feature representations.\n"
             "   d. Neural Counterfactual: Explicitly assess whether learned representations could capture signal that tree or linear libraries cannot. Distinguish an established neural baseline from a task-invented computation graph built from primitive trainable operations. If rejecting both, cite concrete data-size, structure, compute, or validation evidence.\n"
             "   e. Modality Necessity: If more than one predictive modality is present, do not assume fusion helps. Plan identical-fold comparisons for full fusion, credible single-modality controls, and leave-one-modality-out variants; allow a single modality to win.\n"
-            "   f. Model Size & Complexity vs Customization: Note that smaller/lighter custom architectures with tailored modules, custom augmentations, or domain features often outperform heavy generic off-the-shelf pre-trained models. Reason through the right tradeoff for this dataset.\n"
+            "   f. Model Size & Complexity vs Customization: Compare lightweight custom architectures with tailored modules against fine-tuning pretrained standard backbones. Reason through the right tradeoff for this dataset.\n"
             "   g. Portfolio Design: Select the approaches with the strongest expected value and information gain under the observed resource budget. Include a simple baseline only when it is a useful measured control; do not force an architecture progression.\n\n"
             "2. PROPOSAL REQUIREMENTS:\n"
             f"   Propose {count} executable approaches for this task. Each approach must explain how to load observed paths dynamically from input/, build an honest local validation score matching {analysis.metric} ({analysis.direction}), fit/train, tune, and write the requested deliverable.\n"
             "   STRICT REQUIREMENT: Use a materially DIFFERENT model family / algorithm in each plan. "
             "Start each plan with a `Model family: <name>` line naming the family you select. "
-            "When two or more plans are requested and neural training is resource-feasible, at least one plan must measure a compact neural or custom-neural counterfactual rather than returning only tree ensembles. A custom plan must describe the actual computation graph and ablation; naming TabNet, an MLP, or a transformer alone is not custom architecture design. "
+            "When two or more plans are requested and neural training is resource-feasible, at least one plan must measure a neural counterfactual. A neural plan can either describe a custom computation graph, or measure pretrained-fine-tune as a first-class counterfactual. "
             "DO NOT repeat the same model family across plans. Return sections labelled "
             "PLAN 1:, PLAN 2:, and so on, preceded by your <thinking> ... </thinking> block."
         )
@@ -340,9 +340,8 @@ class TechniqueAgent:
             "transformations, interaction/routing mechanism, residual paths, output head, loss, "
             "regularization, optimizer, batching, early stopping, and inference.\n"
             "4. Build the primary predictor as a self-contained PyTorch `nn.Module` from primitive "
-            "layers and tensor operations. Do not use TabNet, FT-Transformer, TabTransformer, an "
-            "off-the-shelf pretrained architecture, or a renamed plain MLP as the proposal. It may "
-            "use a plain MLP as an ablation/control only.\n"
+            "layers and tensor operations. Do not use TabNet, FT-Transformer, TabTransformer, or a "
+            "renamed plain MLP as the proposal. It may use a plain MLP as an ablation/control only.\n"
             "5. The architecture must be derived adaptively from the observed evidence; do not copy "
             "a canned modality template. Keep parameter count and training bounded, work on CPU, and "
             "optionally accelerate on an available GPU.\n"
@@ -377,12 +376,80 @@ class TechniqueAgent:
                 "Use primitive layers and tensor operations to encode the strongest observed inductive "
                 "bias, with explicit input projections, a learned interaction or gating module, residual "
                 "paths where justified, and a metric-appropriate output head. Do not instantiate TabNet, "
-                "FT-Transformer, TabTransformer, a pretrained architecture, or a renamed plain MLP as the "
+                "FT-Transformer, TabTransformer, or a renamed plain MLP as the "
                 "primary model. Keep a plain MLP and the measured parent as controls. Train with bounded "
                 "batches, regularization, deterministic seeds, early stopping, and CPU fallback under the "
                 "same validation protocol. Ablate the custom interaction module and retain the architecture "
                 "only if it produces a repeatable score improvement. Do not claim global novelty; record "
                 "which component-level literature searches would be needed. "
+                f"Planning service note: {exc}"
+            )[:7500]
+
+    def propose_transfer_exploration(
+        self,
+        analysis: TaskAnalysis,
+        parent_plan: str,
+        score: float,
+        *,
+        measured_alternatives: str = "",
+        plateau_evidence: str = "",
+        residual_evidence: str = "",
+    ) -> str:
+        """Design one measured transfer-learning experiment using a pretrained backbone."""
+        track = "established_neural"
+        revision = (
+            "\n# Residual error analysis from the previous measurement\n"
+            + residual_evidence[-4000:]
+            + "\nExplain which validation samples/behaviors the previous network solved "
+            "or failed on, and design THIS revision around the residual errors.\n"
+            if residual_evidence
+            else ""
+        )
+        print(
+            f"TechniqueAgent: Designing a transfer-learning experiment after measured model-family saturation.",
+            flush=True,
+        )
+        prompt = (
+            f"{analysis.prompt_context(11000)}\n\n"
+            f"{self._council_context(10000)}\n\n"
+            f"Measured control plan:\n{parent_plan[:4500]}\n\n"
+            f"Control score: {score} ({analysis.direction}).\n"
+            f"Plateau evidence:\n{plateau_evidence[-3000:]}\n\n"
+            f"Previously measured alternatives:\n{measured_alternatives[-5000:]}\n\n"
+            f"{revision}"
+            "TRANSFER-LAB INSTRUCTIONS:\n"
+            "1. Re-inspect the observed modality (image, text, audio), sample count, metric, CPU/GPU inventory, and time budget.\n"
+            "2. Select a suitable pretrained foundation backbone (e.g., EfficientNet, ResNet, ViT, BERT, Wav2Vec).\n"
+            "3. Design the computation graph explicitly: load the pretrained backbone, add a custom metric-appropriate output head or attention pooling layer, define the loss, optimizer, batching, early stopping, and inference.\n"
+            "4. Build the primary predictor as a self-contained PyTorch `nn.Module` that wraps the pretrained backbone and the custom head. Do not just call a high-level library without explicit custom head/interaction code.\n"
+            "5. Ensure the plan includes a fallback if external downloads fail (e.g., attempt fetch, then gracefully skip or fallback to a bundled cache/dummy network without crashing).\n"
+            "6. Use the exact shared split and metric. Compare the transfer network against the measured parent.\n"
+            "7. Do not plagiarize known competition solutions; design an honest transfer counterfactual.\n\n"
+            f"Return one concrete executable plan for a pretrained-fine-tune transfer architecture. Include an `Architecture specification:` "
+            "section and an `Ablation and stopping rule:` section."
+        )
+        try:
+            response = call_llm(
+                "You are a transfer-learning lead in a senior ML lab. You fine-tune pretrained backbones on measured task evidence and test them skeptically.",
+                prompt,
+                model=self.model_name,
+                temperature=0.3,
+            )
+            cleaned = re.sub(r"(?s)<thinking>.*?</thinking>", "", response).strip()
+            if len(cleaned.split()) < 20:
+                raise ValueError("architecture plan was empty or too short")
+            return (
+                f"Architecture exploration track: {track}\n"
+                + cleaned[:7000]
+            )
+        except Exception as exc:
+            return (
+                f"Architecture exploration track: {track}\n"
+                "Construct a resource-bounded transfer-learning PyTorch `nn.Module`. Wrap a suitable "
+                "pretrained backbone (e.g. EfficientNet, BERT) and add a custom output head or attention "
+                "layer. Train with bounded batches, regularization, deterministic seeds, early stopping, and CPU fallback under the "
+                "same validation protocol. Compare the transfer network against the measured parent. "
+                "Include a graceful fallback if pretrained weights cannot be downloaded. "
                 f"Planning service note: {exc}"
             )[:7500]
 
@@ -584,8 +651,8 @@ class TechniqueAgent:
             "3. STRICT ANTI-REPETITION: DO NOT repeat any model family, algorithm, or pipeline component that has already been attempted in previous nodes. Review the 'plan_summary' in Executed Nodes History carefully to identify what models have been used.\n"
             "4. Tuning a node (hyperparameters, extra layers, or preprocessing) is FREE and does NOT deduct from the main budget.\n"
             "5. If a tuned node fails to improve upon its parent score, it will be automatically stopped and pruned immediately to save budget for high-performing nodes.\n"
-            "6. If conventional tuning/refining plateaus and no neural architecture has been measured, prefer `architect` before another merge. A merge cannot reveal whether a different representation learns missing interactions.\n"
-            "7. `architect` means a bounded custom PyTorch nn.Module derived from observed inductive biases, with a plain neural ablation and the current best model as controls. It must not be a renamed off-the-shelf architecture. Do not claim global novelty without prior-art evidence.\n"
+            "6. If conventional tuning/refining plateaus and no neural architecture has been measured, prefer `transfer` (if applicable for image/text/audio) or `architect` (for tabular) before another merge. A merge cannot reveal whether a different representation learns missing interactions.\n"
+            "7. `architect` means a bounded custom PyTorch nn.Module derived from observed inductive biases. `transfer` means fine-tuning a pretrained backbone (e.g. EfficientNet). Do not claim global novelty without prior-art evidence.\n"
             "8. On multimodal tasks, use measured modality-ablation scores: keep full fusion only when it beats credible single and leave-one-out controls on identical folds. Do not merge modalities merely because they are available.\n"
             "9. Use `merge` only when at least two independently strong, genuinely complementary representations exist and architecture coverage is not the larger evidence gap.\n\n"
             "Select the single best strategic action to execute next:\n"
@@ -594,11 +661,12 @@ class TechniqueAgent:
             "3. `refine`: Perform targeted structural/feature refinement on a specific node.\n"
             "4. `diversify`: Propose a fundamentally NEW model family or SOTA architecture not tried before.\n"
             "5. `architect`: Design and measure a task-tailored neural computation graph from primitive trainable operations.\n"
-            "6. `finalize`: Stop search and build final submission/ensemble if scores are saturated.\n\n"
+            "6. `transfer`: Design and measure a pretrained-fine-tune transfer network (if image/text/audio modality).\n"
+            "7. `finalize`: Stop search and build final submission/ensemble if scores are saturated.\n\n"
             "Respond strictly with a JSON object containing:\n"
             "{\n"
             '  "thinking": "step-by-step reasoning analysis",\n'
-            '  "action": "merge" | "tune" | "refine" | "diversify" | "architect" | "finalize",\n'
+            '  "action": "merge" | "tune" | "refine" | "diversify" | "architect" | "transfer" | "finalize",\n'
             '  "target_node_ids": ["node_id_1", "node_id_2"],\n'
             '  "reasoning": "concise explanation of why this step is chosen over others",\n'
             '  "plan": "concise execution plan for this action"\n'
@@ -616,7 +684,7 @@ class TechniqueAgent:
             )
             if isinstance(decision, dict) and "action" in decision:
                 action = str(decision.get("action", "")).lower()
-                if action in {"merge", "tune", "refine", "diversify", "architect", "finalize"}:
+                if action in {"merge", "tune", "refine", "diversify", "architect", "transfer", "finalize"}:
                     decision["action"] = action
                     if not isinstance(decision.get("target_node_ids"), list):
                         decision["target_node_ids"] = [best_node_id] if best_node_id else []
