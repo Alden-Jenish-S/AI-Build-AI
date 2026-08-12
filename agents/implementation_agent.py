@@ -34,16 +34,61 @@ from .task_analyzer import TaskAnalysis
 from .web_search import search_web
 
 
+def _parses_as_python(code: str) -> bool:
+    try:
+        ast.parse(code)
+        return True
+    except SyntaxError:
+        return False
+
+
+def _trim_python_tail(code: str, max_attempts: int = 250) -> str:
+    """Drop trailing prose lines until the code parses (or give up unchanged)."""
+    if not code.strip() or _parses_as_python(code):
+        return code
+    lines = code.splitlines()
+    for cut in range(1, min(max_attempts, len(lines)) + 1):
+        candidate = "\n".join(lines[:-cut])
+        if not candidate.strip():
+            break
+        if _parses_as_python(candidate):
+            return candidate
+    return code
+
+
+def _trim_python_head(code: str, max_attempts: int = 150) -> str:
+    """Drop leading prose lines until the code parses (or give up unchanged)."""
+    if not code.strip() or _parses_as_python(code):
+        return code
+    lines = code.splitlines()
+    for skip in range(1, min(max_attempts, len(lines)) + 1):
+        candidate = "\n".join(lines[skip:])
+        if not candidate.strip():
+            break
+        if _parses_as_python(candidate):
+            return candidate
+    return code
+
+
 def _python_source(response: str) -> str:
-    fenced = re.findall(r"```(?:python|py)?\s*\n(.*?)```", response, flags=re.DOTALL | re.IGNORECASE)
-    if fenced:
-        return max(fenced, key=len).strip() + "\n"
-    text = response.strip()
-    if text.startswith("```"):
-        text = text.split("\n", 1)[-1]
-        if text.endswith("```"):
-            text = text[:-3]
-    text = re.sub(r"(?s)<thinking>.*?</thinking>", "", text).strip()
+    text = re.sub(r"(?s)<thinking>.*?</thinking>", "", response).strip()
+    candidates: list[str] = []
+    for match in re.finditer(
+        r"```(?:python|py)?[^\n]*\n(.*?)```", text, flags=re.DOTALL | re.IGNORECASE
+    ):
+        candidates.append(match.group(1).strip())
+    opener = re.search(r"```(?:python|py)?[^\n]*\n", text)
+    if opener is not None and not candidates:
+        candidates.append(text[opener.end():].strip())
+    if candidates:
+        for candidate in sorted((item for item in candidates if item), key=len, reverse=True):
+            fixed = _trim_python_tail(candidate)
+            fixed = _trim_python_head(fixed)
+            if fixed.strip():
+                return fixed + "\n"
+        return candidates[0] + "\n"
+    text = _trim_python_tail(text)
+    text = _trim_python_head(text)
     return text.strip() + "\n"
 
 
@@ -526,7 +571,7 @@ ARCHITECTURE EXPERIMENT CONTRACT (mandatory):
             architecture_contract = """
 ARCHITECTURE EXPERIMENT CONTRACT (mandatory):
 - Implement the primary candidate as an explicit custom PyTorch `nn.Module` that wraps a pretrained backbone (e.g. EfficientNet) and adds a custom head/attention layer.
-- Ensure weights can be downloaded safely. Implement a fallback mechanism if downloads fail (e.g. catch Exception and fall back to a dummy network or cached model).
+- Network egress is UNAVAILABLE in this runtime (see RUNTIME FACTS): pretrained-weight downloads always fail. Never attempt to download weights, never add retry loops for downloads, and never treat a failed download as a repairable error.
 - Reuse identical validation indices for the measured parent/control and custom network. Report scores in diagnostics and choose the final predictor by that comparison.
 - Bound epochs and parameter count, use deterministic seeds and early stopping, select CUDA/MPS only when available, and always provide a CPU path.
 """
@@ -545,6 +590,23 @@ MULTIMODAL CONTRIBUTION CONTRACT (mandatory):
   "fold_scores": [...], "validation_indices_hash": "same-hash-for-all-variants"}}`.
 - Select the smallest modality subset within validation uncertainty of the best score.
    It is valid—and preferred when supported—for one modality to beat full fusion.
+"""
+        detected_modalities = ", ".join(modalities) if modalities else "none detected"
+        modality_fidelity = f"""
+MODALITY FIDELITY CONTRACT (mandatory):
+- Predictive modalities detected for THIS task: {detected_modalities}. Work ONLY with
+  these modalities, exactly as the task provides them.
+- NEVER convert one modality into another. For example, do not turn images into handcrafted
+  tabular feature rows (pixel statistics, color histograms, hashes) and classify those as a
+  "tabular" model; do not embed text into static vectors and call that a separate modality.
+  Feature engineering inside the native model is fine; a fabricated second modality is not.
+- Identifier/join columns (image_id, id, filename, ...) are KEYS, not features. A table that
+  contains only keys plus the target/output columns is a label file, NOT a tabular modality.
+- If exactly one modality (or none) is detected: do NOT build fusion models, do NOT run
+  modality ablations, do NOT report `modality_ablation_scores`, and do NOT waste time on
+  other-modality pipelines. Do not extract features from files into a separate table and
+  model that table as if it were provided data.
+- Train and predict using only the files and modalities observed under `input/`.
 """
         probe_contract = ""
         if probe:
@@ -607,6 +669,20 @@ HARDWARE / DEVICE CONTRACT (mandatory):
 - If CPU training is too slow for the time budget, reduce epochs/batches or subsample instead of
   assuming a GPU exists.
 """
+        runtime_facts = """
+RUNTIME FACTS (mandatory; these are true for every execution):
+- The isolated runtime has NO network egress. Every external HTTP(S) request fails with a
+  connection error: torch.hub weight downloads, timm/huggingface model downloads,
+  download.pytorch.org, and pip installs from inside the program are impossible. Do NOT attempt
+  them, do NOT write retry/fallback download code, and do NOT spend attempts "fixing" refused
+  connections. Build every model from random initialization or weights that are already present
+  locally in the runtime. If a library function would download weights, pass the argument that
+  skips downloading (e.g. `weights=None`, plain constructors) instead.
+- The installed PyTorch is a modern 2.x release unless proven otherwise at runtime. Never pass
+  removed or deprecated keyword arguments: no `verbose=` on `ReduceLROnPlateau`, no
+  `pretrained=True` on torchvision model constructors (use the `weights=` enum or no argument),
+  no `model_name_or_path` download triggers.
+"""
 # Prompt layout is prefix-cache friendly: per-run static content
         # (analysis, council contract, standing contracts, input paths, rules)
         # is contiguous and first so provider-side caching covers every node
@@ -622,6 +698,7 @@ Write one complete, self-contained Python program for this task.
 
 {prediction_contract}
 {hardware_contract}
+{runtime_facts}
 Exact runtime input paths available under input/:
 {exact_paths}
 
@@ -657,7 +734,7 @@ RESULT/OUTPUT CONTRACT (this execution):
 Implementation plan:
 {plan[:3000]}
 {parent}{companion}
-{architecture_contract}{modality_contract}{probe_contract}{abort_section}{tune_contract}
+{architecture_contract}{modality_contract}{modality_fidelity}{probe_contract}{abort_section}{tune_contract}
 {repair}{research}
 
 3. OUTPUT FORMAT:

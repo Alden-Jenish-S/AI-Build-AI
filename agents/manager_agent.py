@@ -36,7 +36,7 @@ from .implementation_agent import ImplementationAgent
 from .submission_validator import SubmissionValidator
 from .task_analyzer import TaskAnalysis, TaskAnalyzer
 from .technique_agent import TechniqueAgent
-from .modality_policy import transfer_learning_applicable
+from .modality_policy import predictive_modality_inventory, transfer_learning_applicable
 
 
 class ManagerAgent:
@@ -2024,7 +2024,10 @@ class ManagerAgent:
                     "Architecture coverage intervention before merge/finalize: "
                     f"{architecture_trigger}."
                 )
-                op = "transfer" if transfer_learning_applicable(self.task_analysis.modalities) else "architect"
+                modalities = self.task_analysis.modalities or predictive_modality_inventory(
+                    self.task_analysis.files
+                )["modalities"]
+                op = "transfer" if transfer_learning_applicable(modalities) else "architect"
                 architecture_node = self._architect(
                     self.all_nodes[self.best_node_id], trigger=architecture_trigger, operator=op
                 )

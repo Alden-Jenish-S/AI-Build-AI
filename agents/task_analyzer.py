@@ -17,6 +17,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .modality_policy import predictive_modality_inventory
+
 
 _TABLE_EXTENSIONS = {".csv", ".tsv", ".parquet", ".feather"}
 _TEXT_EXTENSIONS = {
@@ -222,6 +224,7 @@ class TaskAnalysis:
     description: str = ""
     submission: dict[str, Any] | None = None
     task_facts: dict[str, Any] = field(default_factory=dict)
+    modalities: list[str] = field(default_factory=list)
 
     @property
     def report(self) -> str:
@@ -232,6 +235,7 @@ class TaskAnalysis:
             f"Target: {self.target}",
             f"Expected output: {self.expected_output}",
             f"Score: {self.metric} ({self.direction})",
+            f"Predictive modalities: {'; '.join(self.modalities) if self.modalities else 'none detected'}",
             "",
             "## Files & Data Modalities",
             "",
@@ -336,6 +340,7 @@ class TaskAnalysis:
             "description": self.description,
             "submission": self.submission,
             "task_facts": self.task_facts,
+            "modalities": self.modalities,
         }
 
 
@@ -569,6 +574,7 @@ class TaskAnalyzer:
             description=description,
             submission=submission,
             task_facts=task_facts,
+            modalities=predictive_modality_inventory(files)["modalities"],
         )
 
     def resolve(self, task_dir: Path) -> TaskAnalysis:

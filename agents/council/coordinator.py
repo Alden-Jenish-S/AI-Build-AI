@@ -905,213 +905,213 @@ Member reports:
                 )
             except Exception as exc:
                 warnings.append(f"Additional member failed: {type(exc).__name__}: {exc}")
-            try:
-                protocol = EvaluationProtocol.from_mapping(
-                        review_synthesis.get("evaluation_protocol"),
-                        metric=analysis.metric,
-                        direction=analysis.direction,
-                    )
-                hypotheses = [
-                    annotate_hypothesis(dict(item))
-                    for item in review_synthesis.get("hypotheses", [])
-                    if isinstance(item, dict)
+        try:
+            protocol = EvaluationProtocol.from_mapping(
+                    review_synthesis.get("evaluation_protocol"),
+                    metric=analysis.metric,
+                    direction=analysis.direction,
+                )
+            hypotheses = [
+                annotate_hypothesis(dict(item))
+                for item in review_synthesis.get("hypotheses", [])
+                if isinstance(item, dict)
+            ]
+            valid_evidence_ids = {
+                "local_preflight",
+                *(f"diag_{member_id}" for member_id in investigations),
+                *(str(source.get("source_id")) for source in sources),
+            }
+            for hypothesis in hypotheses:
+                claimed = [str(item) for item in hypothesis.get("evidence_ids", [])]
+                hypothesis["evidence_ids"] = [
+                    item for item in claimed if item in valid_evidence_ids
                 ]
-                valid_evidence_ids = {
-                    "local_preflight",
-                    *(f"diag_{member_id}" for member_id in investigations),
-                    *(str(source.get("source_id")) for source in sources),
-                }
-                for hypothesis in hypotheses:
-                    claimed = [str(item) for item in hypothesis.get("evidence_ids", [])]
-                    hypothesis["evidence_ids"] = [
-                        item for item in claimed if item in valid_evidence_ids
-                    ]
-                    removed = sorted(set(claimed) - valid_evidence_ids)
-                    if removed:
-                        warnings.append(
-                            f"Hypothesis {hypothesis.get('hypothesis_id')} cited unknown evidence IDs: "
-                            + ", ".join(removed)
-                        )
-                if fingerprint.get("is_multimodal") and not any(
-                    item.get("modality_scope") == "modality_ablation"
-                    for item in hypotheses
-                ):
-                    modalities = [
-                        str(item) for item in fingerprint.get("predictive_modalities", [])
-                    ]
-                    hypotheses.append(
-                        {
-                            "hypothesis_id": "H_modality_contribution_audit",
-                            "title": "Measured modality contribution and fusion audit",
-                            "model_family": (
-                                "task-selected per-modality controls with validation-selected fusion"
-                            ),
-                            "rationale": (
-                                "Providing multiple modalities does not establish that each contributes "
-                                "independent predictive signal. Controlled ablations can select a simpler, "
-                                "stronger, or more robust modality subset."
-                            ),
-                            "evidence_ids": ["local_preflight"],
-                            "experiment": (
-                                "Using identical validation indices, compare the full fusion model, "
-                                "credible models using each modality alone, and leave-one-modality-out "
-                                f"variants for: {', '.join(modalities)}. Match capacity where practical."
-                            ),
-                            "expected_signal": (
-                                "A ranked modality subset showing whether fusion adds repeatable value "
-                                "beyond the strongest single modality."
-                            ),
-                            "estimated_cost": "moderate; reuse cached preprocessing and embeddings",
-                            "risks": [
-                                "Fusion capacity can confound modality contribution.",
-                                "Unequal folds can make ablation scores incomparable.",
-                            ],
-                            "stopping_rule": (
-                                "Prefer the smallest modality subset whose score is within validation "
-                                "uncertainty of the best variant; retain fusion only for repeatable gain."
-                            ),
-                            "compatible_with": [],
-                            "architecture_track": "representation",
-                            "architecture_spec": "",
-                            "novelty_test": "Not a novelty claim; this is a contribution ablation.",
-                            "modality_scope": "modality_ablation",
-                            "modality_ablation": (
-                                "Full fusion, each credible single modality, and every leave-one-out "
-                                "variant on the exact shared folds."
-                            ),
-                            "selection_policy": (
-                                "Injected because multiple predictive modalities require measured "
-                                "necessity rather than an assumption of useful fusion."
-                            ),
-                        }
+                removed = sorted(set(claimed) - valid_evidence_ids)
+                if removed:
+                    warnings.append(
+                        f"Hypothesis {hypothesis.get('hypothesis_id')} cited unknown evidence IDs: "
+                        + ", ".join(removed)
                     )
-                selected_ids = {
-                    str(item) for item in review_synthesis.get("selected_hypothesis_ids", [])
-                }
-                selected = [
-                    item
-                    for item in hypotheses
-                    if str(item.get("hypothesis_id")) in selected_ids
-                    and item.get("evidence_ids")
+            if fingerprint.get("is_multimodal") and not any(
+                item.get("modality_scope") == "modality_ablation"
+                for item in hypotheses
+            ):
+                modalities = [
+                    str(item) for item in fingerprint.get("predictive_modalities", [])
                 ]
-                if not selected:
-                    selected = [item for item in hypotheses if item.get("evidence_ids")][:1]
-                    if selected:
-                        warnings.append(
-                            "Chair selected no traceable hypothesis; retained the first evidence-linked proposal."
-                        )
-                if not selected:
-                    raise ValueError("Council synthesis produced no evidence-linked hypothesis")
-                selected_tracks = {
-                    str(item.get("architecture_track") or "") for item in selected
-                }
-                packages = (
-                    fingerprint.get("resource_inventory", {}).get("packages_available", {})
-                    if isinstance(fingerprint.get("resource_inventory"), Mapping)
-                    else {}
-                )
-                torch_available = bool(
-                    packages.get("torch") if isinstance(packages, Mapping) else False
-                )
-                promoted_architecture = False
-                if (
-                    torch_available
-                    and not selected_tracks.intersection(
-                        {"established_neural", "custom_neural"}
-                    )
-                ):
-                    architecture_candidate = next(
-                        (
-                            item
-                            for item in hypotheses
-                            if item not in selected
-                            and item.get("evidence_ids")
-                            and item.get("architecture_track")
-                            in {"established_neural", "custom_neural"}
+                hypotheses.append(
+                    {
+                        "hypothesis_id": "H_modality_contribution_audit",
+                        "title": "Measured modality contribution and fusion audit",
+                        "model_family": (
+                            "task-selected per-modality controls with validation-selected fusion"
                         ),
-                        None,
-                    )
-                    if architecture_candidate is not None:
-                        architecture_candidate["selection_policy"] = (
-                            "Promoted as a bounded architecture counterfactual so the initial "
-                            "portfolio is not restricted to conventional library models."
-                        )
-                        insertion = min(1, len(selected))
-                        selected.insert(insertion, architecture_candidate)
-                        if len(selected) > 4:
-                            selected.pop()
-                        promoted_architecture = True
-                promoted_modality = False
-                if fingerprint.get("is_multimodal") and not any(
-                    item.get("modality_scope") == "modality_ablation"
-                    for item in selected
-                ):
-                    modality_candidate = next(
-                        (
-                            item
-                            for item in hypotheses
-                            if item.get("modality_scope") == "modality_ablation"
-                            and item.get("evidence_ids")
+                        "rationale": (
+                            "Providing multiple modalities does not establish that each contributes "
+                            "independent predictive signal. Controlled ablations can select a simpler, "
+                            "stronger, or more robust modality subset."
                         ),
-                        None,
-                    )
-                    if modality_candidate is not None:
-                        insertion = min(1, len(selected))
-                        selected.insert(insertion, modality_candidate)
-                        if len(selected) > 4:
-                            selected.pop()
-                        promoted_modality = True
-                recommended_roots = int(
-                    review_synthesis.get("recommended_root_count", len(selected)) or 1
-                )
-                if promoted_architecture or promoted_modality:
-                    recommended_roots = max(2, recommended_roots)
-                brief = CouncilBrief(
-                    task_name=analysis.task_name,
-                    status="degraded" if warnings else "completed",
-                    problem_fingerprint=fingerprint,
-                    allowed_input_paths=allowed,
-                    prohibited_inputs=prohibited,
-                    evaluation_protocol=protocol,
-                    evidence=[
-                        {
-                            "evidence_id": "local_preflight",
-                            "kind": "local_diagnostics",
-                            "hash": diagnostics.get("diagnostics_hash"),
-                            "summary": diagnostics,
-                        },
-                        *[
-                            {
-                                "evidence_id": f"diag_{member_id}",
-                                "kind": "focused_diagnostic",
-                                "hash": content_hash(result),
-                                "summary": result,
-                            }
-                            for member_id, result in sorted(investigations.items())
+                        "evidence_ids": ["local_preflight"],
+                        "experiment": (
+                            "Using identical validation indices, compare the full fusion model, "
+                            "credible models using each modality alone, and leave-one-modality-out "
+                            f"variants for: {', '.join(modalities)}. Match capacity where practical."
+                        ),
+                        "expected_signal": (
+                            "A ranked modality subset showing whether fusion adds repeatable value "
+                            "beyond the strongest single modality."
+                        ),
+                        "estimated_cost": "moderate; reuse cached preprocessing and embeddings",
+                        "risks": [
+                            "Fusion capacity can confound modality contribution.",
+                            "Unequal folds can make ablation scores incomparable.",
                         ],
-                    ],
-                    sources=sources,
-                    member_reports=reports,
-                    hypotheses=hypotheses,
-                    selected_portfolio=selected,
-                    rejected_hypotheses=[
-                        dict(item)
-                        for item in review_synthesis.get("rejected_hypotheses", [])
-                        if isinstance(item, dict)
-                    ],
-                    unresolved_questions=[
-                        str(item) for item in review_synthesis.get("unresolved_questions", [])
-                    ],
-                    warnings=warnings,
-                    recommended_root_count=recommended_roots,
+                        "stopping_rule": (
+                            "Prefer the smallest modality subset whose score is within validation "
+                            "uncertainty of the best variant; retain fusion only for repeatable gain."
+                        ),
+                        "compatible_with": [],
+                        "architecture_track": "representation",
+                        "architecture_spec": "",
+                        "novelty_test": "Not a novelty claim; this is a contribution ablation.",
+                        "modality_scope": "modality_ablation",
+                        "modality_ablation": (
+                            "Full fusion, each credible single modality, and every leave-one-out "
+                            "variant on the exact shared folds."
+                        ),
+                        "selection_policy": (
+                            "Injected because multiple predictive modalities require measured "
+                            "necessity rather than an assumption of useful fusion."
+                        ),
+                    }
                 )
-            except Exception as exc:
-                warnings.append(f"Council synthesis failed: {type(exc).__name__}: {exc}")
-                brief = self._fallback_brief(
-                    analysis, fingerprint, diagnostics, allowed, prohibited, warnings
+            selected_ids = {
+                str(item) for item in review_synthesis.get("selected_hypothesis_ids", [])
+            }
+            selected = [
+                item
+                for item in hypotheses
+                if str(item.get("hypothesis_id")) in selected_ids
+                and item.get("evidence_ids")
+            ]
+            if not selected:
+                selected = [item for item in hypotheses if item.get("evidence_ids")][:1]
+                if selected:
+                    warnings.append(
+                        "Chair selected no traceable hypothesis; retained the first evidence-linked proposal."
+                    )
+            if not selected:
+                raise ValueError("Council synthesis produced no evidence-linked hypothesis")
+            selected_tracks = {
+                str(item.get("architecture_track") or "") for item in selected
+            }
+            packages = (
+                fingerprint.get("resource_inventory", {}).get("packages_available", {})
+                if isinstance(fingerprint.get("resource_inventory"), Mapping)
+                else {}
+            )
+            torch_available = bool(
+                packages.get("torch") if isinstance(packages, Mapping) else False
+            )
+            promoted_architecture = False
+            if (
+                torch_available
+                and not selected_tracks.intersection(
+                    {"established_neural", "custom_neural"}
                 )
-                brief.sources = sources
-                brief.member_reports = reports
+            ):
+                architecture_candidate = next(
+                    (
+                        item
+                        for item in hypotheses
+                        if item not in selected
+                        and item.get("evidence_ids")
+                        and item.get("architecture_track")
+                        in {"established_neural", "custom_neural"}
+                    ),
+                    None,
+                )
+                if architecture_candidate is not None:
+                    architecture_candidate["selection_policy"] = (
+                        "Promoted as a bounded architecture counterfactual so the initial "
+                        "portfolio is not restricted to conventional library models."
+                    )
+                    insertion = min(1, len(selected))
+                    selected.insert(insertion, architecture_candidate)
+                    if len(selected) > 4:
+                        selected.pop()
+                    promoted_architecture = True
+            promoted_modality = False
+            if fingerprint.get("is_multimodal") and not any(
+                item.get("modality_scope") == "modality_ablation"
+                for item in selected
+            ):
+                modality_candidate = next(
+                    (
+                        item
+                        for item in hypotheses
+                        if item.get("modality_scope") == "modality_ablation"
+                        and item.get("evidence_ids")
+                    ),
+                    None,
+                )
+                if modality_candidate is not None:
+                    insertion = min(1, len(selected))
+                    selected.insert(insertion, modality_candidate)
+                    if len(selected) > 4:
+                        selected.pop()
+                    promoted_modality = True
+            recommended_roots = int(
+                review_synthesis.get("recommended_root_count", len(selected)) or 1
+            )
+            if promoted_architecture or promoted_modality:
+                recommended_roots = max(2, recommended_roots)
+            brief = CouncilBrief(
+                task_name=analysis.task_name,
+                status="degraded" if warnings else "completed",
+                problem_fingerprint=fingerprint,
+                allowed_input_paths=allowed,
+                prohibited_inputs=prohibited,
+                evaluation_protocol=protocol,
+                evidence=[
+                    {
+                        "evidence_id": "local_preflight",
+                        "kind": "local_diagnostics",
+                        "hash": diagnostics.get("diagnostics_hash"),
+                        "summary": diagnostics,
+                    },
+                    *[
+                        {
+                            "evidence_id": f"diag_{member_id}",
+                            "kind": "focused_diagnostic",
+                            "hash": content_hash(result),
+                            "summary": result,
+                        }
+                        for member_id, result in sorted(investigations.items())
+                    ],
+                ],
+                sources=sources,
+                member_reports=reports,
+                hypotheses=hypotheses,
+                selected_portfolio=selected,
+                rejected_hypotheses=[
+                    dict(item)
+                    for item in review_synthesis.get("rejected_hypotheses", [])
+                    if isinstance(item, dict)
+                ],
+                unresolved_questions=[
+                    str(item) for item in review_synthesis.get("unresolved_questions", [])
+                ],
+                warnings=warnings,
+                recommended_root_count=recommended_roots,
+            )
+        except Exception as exc:
+            warnings.append(f"Council synthesis failed: {type(exc).__name__}: {exc}")
+            brief = self._fallback_brief(
+                analysis, fingerprint, diagnostics, allowed, prohibited, warnings
+            )
+            brief.sources = sources
+            brief.member_reports = reports
     
         (council_dir / "member_reports.json").write_text(
             json.dumps(reports, indent=2, ensure_ascii=False, default=str) + "\n",

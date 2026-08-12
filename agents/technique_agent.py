@@ -166,9 +166,20 @@ class TechniqueAgent:
         web_insights = self.search_for_new_ideas(analysis)
         web_section = f"\nWeb Search Literature & Solution Insights:\n{web_insights[:3000]}\n" if web_insights else ""
 
+        modality_inventory = predictive_modality_inventory(analysis.files)
+        detected_modalities = ", ".join(modality_inventory["modalities"]) or "none detected"
+        modality_statement = (
+            f"PREDICTIVE MODALITIES DETECTED FOR THIS TASK: {detected_modalities}.\n"
+            "Design plans for EXACTLY these modalities. Identifier columns (image_id, id, filename, ...) "
+            "and label-only tables are keys/labels, not a tabular modality. NEVER convert one modality "
+            "into another (do not turn images into CSV feature rows and model that as tabular). "
+            "Do not plan fusion or modality ablations unless more than one predictive modality was detected.\n"
+        )
+
         prompt = (
             f"{analysis.prompt_context(14000)}\n"
             f"{web_section}\n"
+            f"{modality_statement}\n"
             "CRITICAL REASONING & PLANNING INSTRUCTIONS:\n\n"
             "1. THINK BEFORE YOU DECIDE:\n"
             "   Begin your response with a <thinking> ... </thinking> block where you step-by-step:\n"
@@ -422,7 +433,7 @@ class TechniqueAgent:
             "2. Select a suitable pretrained foundation backbone (e.g., EfficientNet, ResNet, ViT, BERT, Wav2Vec).\n"
             "3. Design the computation graph explicitly: load the pretrained backbone, add a custom metric-appropriate output head or attention pooling layer, define the loss, optimizer, batching, early stopping, and inference.\n"
             "4. Build the primary predictor as a self-contained PyTorch `nn.Module` that wraps the pretrained backbone and the custom head. Do not just call a high-level library without explicit custom head/interaction code.\n"
-            "5. Ensure the plan includes a fallback if external downloads fail (e.g., attempt fetch, then gracefully skip or fallback to a bundled cache/dummy network without crashing).\n"
+            "5. The runtime has NO network egress: pretrained-weight downloads (torch.hub, timm, huggingface) always fail. Design the plan to use locally available weights or random initialization and to NEVER attempt downloads or download retries.\n"
             "6. Use the exact shared split and metric. Compare the transfer network against the measured parent.\n"
             "7. Do not plagiarize known competition solutions; design an honest transfer counterfactual.\n\n"
             f"Return one concrete executable plan for a pretrained-fine-tune transfer architecture. Include an `Architecture specification:` "
@@ -449,7 +460,7 @@ class TechniqueAgent:
                 "pretrained backbone (e.g. EfficientNet, BERT) and add a custom output head or attention "
                 "layer. Train with bounded batches, regularization, deterministic seeds, early stopping, and CPU fallback under the "
                 "same validation protocol. Compare the transfer network against the measured parent. "
-                "Include a graceful fallback if pretrained weights cannot be downloaded. "
+                "Network egress is unavailable, so never attempt weight downloads; use random-init weights. "
                 f"Planning service note: {exc}"
             )[:7500]
 
