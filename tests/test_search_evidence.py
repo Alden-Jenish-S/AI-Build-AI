@@ -226,6 +226,59 @@ class ManagerSearchRuleTests(unittest.TestCase):
         chosen_correlation = abs(pearson_correlation(pair[0].result["prediction_signature"], pair[1].result["prediction_signature"]))
         self.assertLess(chosen_correlation, best_correlation)
 
+    def test_merge_pair_respects_minimizing_metrics(self) -> None:
+        manager = self.bare_manager()
+        manager.metric_direction = "minimize"
+        manager.complementarity_weight = 0.4
+        aligned = [0.0, 1.0] * 4
+        decorrelated = [1.0, 1.0, -1.0, -1.0] * 2
+        nodes = []
+        for index, (score, signature) in enumerate(
+            [(0.10, aligned), (0.11, list(aligned)), (0.14, decorrelated)], start=1
+        ):
+            node = NodeState(
+                node_id=f"m{index}",
+                parent_id=None,
+                node_type="implementation",
+                plan="",
+                operator="root",
+                executed=True,
+                result={"score": score, "prediction_signature": signature},
+            )
+            nodes.append(node)
+        pair = manager._merge_pair(nodes)
+        self.assertIsNotNone(pair)
+        self.assertIn(nodes[0], pair)
+        self.assertIn(nodes[2], pair)
+
+    def test_failed_transfer_consumes_architecture_intervention(self) -> None:
+        manager = self.bare_manager()
+        manager.architecture_exploration_enabled = True
+        manager.architecture_min_budget = 3
+        manager.best_node_id = "best"
+        best = NodeState(
+            node_id="best",
+            parent_id="root",
+            node_type="implementation",
+            plan="Train a neural network.",
+            operator="root",
+            executed=True,
+            result={"status": "completed", "score": 0.8},
+        )
+        attempted = NodeState(
+            node_id="transfer",
+            parent_id="best",
+            node_type="implementation",
+            plan="Try transfer learning.",
+            operator="transfer",
+            executed=True,
+            result={"status": "failed", "score": None},
+        )
+        manager.all_nodes = {"best": best, "transfer": attempted}
+        coverage = manager._architecture_coverage()
+        self.assertTrue(coverage["dedicated_architect_attempted"])
+        self.assertIsNone(manager._architecture_intervention_reason(4))
+
 
 if __name__ == "__main__":
     unittest.main()

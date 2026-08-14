@@ -11,6 +11,7 @@ from agents.architecture_policy import classify_architecture
 from agents.council.contracts import CouncilBrief, EvaluationProtocol
 from agents.council.coordinator import CouncilCoordinator
 from agents.council.diagnostics import (
+    DiagnosticScriptRunner,
     build_problem_fingerprint,
     classify_input_access,
     validate_diagnostic_script,
@@ -183,6 +184,137 @@ Path('input/train.csv').write_text('changed')
         unsafe_open = "open('input/train.csv', 'w').write('changed')"
         errors = validate_diagnostic_script(unsafe_open)
         self.assertTrue(any("write-mode open" in error for error in errors))
+
+        safe_alias = """
+import json
+from pathlib import Path
+OUTPUT = Path('analysis_result.json')
+OUTPUT.write_text(json.dumps({'ok': True}))
+"""
+        self.assertEqual([], validate_diagnostic_script(safe_alias))
+
+        unsafe_reassigned_alias = """
+from pathlib import Path
+OUTPUT = Path('analysis_result.json')
+OUTPUT = Path('input/train.csv')
+OUTPUT.write_text('changed')
+"""
+        errors = validate_diagnostic_script(unsafe_reassigned_alias)
+        self.assertTrue(any("analysis_result.json" in error for error in errors))
+
+    def test_diagnostic_gate_rejects_unbounded_model_sweeps(self) -> None:
+        looped_cv = """
+from sklearn.model_selection import cross_val_score
+for feature_set in ['a', 'b']:
+    scores = cross_val_score(model, X, y)
+"""
+        self.assertTrue(
+            any("cannot run inside a loop" in error for error in validate_diagnostic_script(looped_cv))
+        )
+        nested_fit = """
+for model in models:
+    for feature_set in feature_sets:
+        for train_index, valid_index in folds:
+            model.fit(X[train_index], y[train_index])
+"""
+        self.assertTrue(
+            any("nested loops" in error for error in validate_diagnostic_script(nested_fit))
+        )
+        parallel = """
+from sklearn.ensemble import RandomForestClassifier
+model = RandomForestClassifier(n_jobs=-1)
+"""
+        self.assertTrue(
+            any("n_jobs=1" in error for error in validate_diagnostic_script(parallel))
+        )
+
+    def test_failed_council_diagnostic_is_repaired_with_execution_feedback(self) -> None:
+        (self.task_dir / "train.csv").write_text("x,y\n1,0\n", encoding="utf-8")
+        runner = DiagnosticScriptRunner("python")
+        code = (
+            "import json\n"
+            "from pathlib import Path\n"
+            "Path('analysis_result.json').write_text(json.dumps({"
+            "'question':'q','method':'m','findings':{},'limitations':'',"
+            "'suggested_next_questions':[]}))\n"
+        )
+        calls = 0
+
+        def execute(_command, *, cwd: Path, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                (Path(cwd) / "analysis_result.json").write_text(
+                    json.dumps(
+                        {
+                            "question": "q",
+                            "method": "repaired",
+                            "findings": {},
+                            "limitations": "",
+                            "suggested_next_questions": [],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            return SupervisedProcessResult(
+                args=("python", "diagnostic.py"),
+                returncode=1 if calls == 1 else 0,
+                stdout="",
+                stderr="ValueError: broken fold" if calls == 1 else "",
+                elapsed_seconds=0.01,
+                stalled=False,
+                hard_limit_reached=False,
+                termination_reason=None,
+                progress_events=1,
+                last_progress_source="process_output",
+                last_progress_age_seconds=0.0,
+            )
+
+        with (
+            patch.object(runner, "_generate", return_value=code) as generate,
+            patch(
+                "agents.council.diagnostics.run_supervised_process",
+                side_effect=execute,
+            ),
+        ):
+            result = runner.run(
+                "baseline",
+                "compare candidates",
+                self.analysis(),
+                {"resources": {"packages_available": []}},
+                self.root / "council",
+                ("train.csv",),
+            )
+        self.assertEqual("completed", result["status"])
+        self.assertEqual(2, result["attempts"])
+        self.assertIn("broken fold", generate.call_args_list[1].kwargs["feedback"])
+
+    def test_completed_diagnostic_artifact_is_a_reusable_checkpoint(self) -> None:
+        work = self.root / "council" / "work" / "baseline"
+        work.mkdir(parents=True)
+        (work / "analysis_result.json").write_text(
+            json.dumps(
+                {
+                    "question": "q",
+                    "method": "m",
+                    "findings": {},
+                    "limitations": "none",
+                    "suggested_next_questions": [],
+                    "measured_baseline": {
+                        "model": "Linear",
+                        "model_family": "linear",
+                        "score": 0.8,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        cached = CouncilCoordinator._cached_investigation(
+            "baseline", self.root / "council", self.analysis()
+        )
+        self.assertEqual("completed", cached["status"])
+        self.assertTrue(cached["reused"])
+        self.assertEqual("ROC AUC", cached["result"]["measured_baseline"]["metric"])
 
     def test_problem_fingerprint_removes_task_file_and_column_identity(self) -> None:
         diagnostics = {
@@ -560,6 +692,89 @@ Path('input/train.csv').write_text('changed')
         self.assertIn("Hypothesis ID: H_grouped_gbdt", plans[0])
         self.assertIn(brief.evaluation_protocol.protocol_hash, plans[0])
 
+    def test_council_context_views_are_role_scoped_valid_json_and_bounded(self) -> None:
+        brief = self.brief()
+        active = dict(brief.selected_portfolio[0])
+        active["evidence_ids"] = ["diag_active", "paper_active"]
+        irrelevant = {
+            **active,
+            "hypothesis_id": "H_irrelevant",
+            "title": "IRRELEVANT_SECRET_TITLE",
+            "evidence_ids": ["diag_irrelevant"],
+        }
+        brief.selected_portfolio = [active, irrelevant]
+        brief.evidence = [
+            {
+                "evidence_id": "diag_active",
+                "kind": "focused_diagnostic",
+                "summary": {
+                    "status": "completed",
+                    "result": {"method": "active method", "findings": "A" * 20_000},
+                },
+            },
+            {
+                "evidence_id": "diag_irrelevant",
+                "kind": "focused_diagnostic",
+                "summary": {
+                    "status": "completed",
+                    "result": {"method": "IRRELEVANT_METHOD", "findings": "B" * 20_000},
+                },
+            },
+        ]
+        brief.sources = [
+            {
+                "source_id": "paper_active",
+                "title": "active paper",
+                "claim": "C" * 20_000,
+            },
+            {
+                "source_id": "paper_irrelevant",
+                "title": "IRRELEVANT_SOURCE",
+                "claim": "D" * 20_000,
+            },
+        ]
+
+        search = brief.search_context(6000)
+        implementation = brief.implementation_context("H_grouped_gbdt", 6000)
+        json.loads(search)
+        json.loads(implementation)
+        self.assertLessEqual(len(search), 6000)
+        self.assertLessEqual(len(implementation), 6000)
+        self.assertIn("H_grouped_gbdt", implementation)
+        self.assertIn("active method", implementation)
+        self.assertNotIn("IRRELEVANT_METHOD", implementation)
+        self.assertNotIn("IRRELEVANT_SOURCE", implementation)
+
+    def test_strongest_measured_baseline_is_first_and_does_not_hide_portfolio(self) -> None:
+        brief = self.brief()
+        brief.measured_baselines = [
+            {
+                "model": "RandomForest",
+                "model_family": "tree",
+                "score": 0.71,
+                "metric": "ROC AUC",
+                "direction": "maximize",
+                "source": "tabular",
+            },
+            {
+                "model": "LogisticRegression",
+                "model_family": "linear",
+                "score": 0.83,
+                "metric": "ROC AUC",
+                "direction": "maximize",
+                "source": "shift_check",
+                "diagnostic_method": "scaled features inside each fold",
+            },
+        ]
+        plans = TechniqueAgent(council_brief=brief).generate_initial_approaches(
+            self.analysis(), count=3
+        )
+        self.assertEqual(2, len(plans))
+        self.assertIn("LogisticRegression", plans[0])
+        self.assertIn("Architecture track: conventional", plans[0])
+        self.assertIn("scaled features inside each fold", plans[0])
+        self.assertIn("Hypothesis ID: H_grouped_gbdt", plans[1])
+
     def test_architecture_policy_distinguishes_custom_networks_from_tree_libraries(self) -> None:
         self.assertEqual(
             "conventional",
@@ -881,6 +1096,35 @@ class GatedInteractionNet(nn.Module):
         self.assertIn("single-modality controls", prompt)
         self.assertIn("modality_ablation_scores", prompt)
 
+    def test_single_modality_plan_is_not_silently_expanded_to_fusion(self) -> None:
+        analysis = self.analysis()
+        analysis.files.append(
+            {
+                "path": "images/example.png",
+                "kind": "image",
+                "extension": ".png",
+                "bytes": 1,
+            }
+        )
+        prompt = ImplementationAgent()._prompt(
+            analysis,
+            (
+                "Modality scope: single_modality\n"
+                "Modality ablation: Use only tabular features; no image input."
+            ),
+            None,
+            None,
+            None,
+            "",
+            "",
+            self.brief(),
+            "root",
+        )
+        self.assertIn("PLAN-SCOPE CONTRACT", prompt)
+        self.assertNotIn("MULTIMODAL CONTRIBUTION CONTRACT", prompt)
+        self.assertNotIn("Also include `modality_ablation_scores`", prompt)
+        self.assertIn("num_workers=0", prompt)
+
     def test_implementation_prompt_lays_static_prefix_first_for_caching(self) -> None:
         analysis = self.analysis()
         brief = self.brief()
@@ -982,10 +1226,101 @@ class GatedInteractionNet(nn.Module):
     def test_brief_writes_machine_and_human_readable_artifacts(self) -> None:
         council_dir = self.root / "council"
         brief = self.brief()
+        brief.measured_baselines = [
+            {
+                "model": "LogisticRegression",
+                "model_family": "linear",
+                "score": 0.83,
+                "metric": "ROC AUC",
+                "direction": "maximize",
+            }
+        ]
         json_path, report_path = brief.write(council_dir)
         payload = json.loads(json_path.read_text(encoding="utf-8"))
         self.assertEqual(payload["brief_hash"], brief.brief_hash)
+        self.assertEqual("LogisticRegression", payload["measured_baselines"][0]["model"])
+        restored = CouncilBrief.from_mapping(payload)
+        self.assertEqual(brief.brief_hash, restored.brief_hash)
+        self.assertEqual(0.83, restored.measured_baselines[0]["score"])
         self.assertIn("Selected research portfolio", report_path.read_text(encoding="utf-8"))
+
+    def test_old_brief_recovers_nested_measured_baselines_on_resume(self) -> None:
+        payload = self.brief().to_dict()
+        payload.pop("measured_baselines", None)
+        payload["evidence"] = [
+            {
+                "evidence_id": "diag_shift",
+                "kind": "focused_diagnostic",
+                "summary": {
+                    "status": "completed",
+                    "result": {
+                        "method": "standardized fold-local pipeline",
+                        "measured_baseline": {
+                            "model": "LogisticRegression",
+                            "model_family": "linear",
+                            "score": 0.88,
+                        },
+                    },
+                },
+            }
+        ]
+        restored = CouncilBrief.from_mapping(payload)
+        self.assertEqual(1, len(restored.measured_baselines))
+        self.assertEqual("LogisticRegression", restored.measured_baselines[0]["model"])
+        self.assertEqual(
+            "standardized fold-local pipeline",
+            restored.measured_baselines[0]["diagnostic_method"],
+        )
+
+    def test_resume_audit_executes_selected_hypotheses_missing_from_tree(self) -> None:
+        manager = object.__new__(ManagerAgent)
+        brief = self.brief()
+        brief.selected_portfolio = [
+            {"hypothesis_id": "H_a"},
+            {"hypothesis_id": "H_b"},
+        ]
+        manager.council_brief = brief
+        manager.initial_fanout = 1
+        manager.task_analysis = self.analysis()
+
+        class Plans:
+            @staticmethod
+            def generate_initial_approaches(_analysis, _count):
+                return [
+                    "Hypothesis ID: H_a\nFirst experiment: a",
+                    "Hypothesis ID: H_b\nFirst experiment: b",
+                ]
+
+        manager.technique_agent = Plans()
+        manager.all_nodes = {
+            "root": NodeState(
+                node_id="root",
+                parent_id=None,
+                node_type="planning",
+                executed=True,
+            ),
+            "node1": NodeState(
+                node_id="node1",
+                parent_id="root",
+                node_type="implementation",
+                plan="Hypothesis ID: H_a",
+                operator="root",
+                executed=True,
+                config={"hypothesis_id": "H_a"},
+                result={"status": "failed"},
+            ),
+        }
+        manager._can_attempt = lambda _operator: True
+        attempted: list[str] = []
+        manager._run_root_plan = (
+            lambda plan, replacement=False: attempted.append(plan)
+        )
+        with patch.dict(
+            os.environ, {"AIBUILDAI_REQUIRE_ALL_COUNCIL_ROOTS": "1"}
+        ):
+            manager._execute_missing_council_roots()
+        self.assertEqual(1, len(attempted))
+        self.assertIn("Hypothesis ID: H_b", attempted[0])
 
     def test_council_degrades_to_auditable_control_when_llm_is_unavailable(self) -> None:
         (self.task_dir / "train.csv").write_text(

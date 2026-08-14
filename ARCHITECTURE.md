@@ -60,10 +60,12 @@ eval/run_search.py            command-line entrypoint and Markdown result summar
 - Every root, tuning, architecture, merge, and recovery action is represented by a planning
   node followed by its implementation child.
 - Every completed score is compared in the task's inferred direction.
-- A node is completed only after its output passes validation. CSV/TSV, JSON,
-  JSON Lines, NumPy arrays, images, ZIP files, and common text/bioinformatics
-  formats receive safe semantic checks. Unknown formats receive structural
-  checks and can add validators through the suffix registry.
+- A node is completed only after its native output passes validation or, for a
+  supported numeric table task, its aligned OOF/test prediction bundle passes
+  central validation and score recomputation. CSV/TSV, JSON, JSON Lines, NumPy
+  arrays, images, ZIP files, and common text/bioinformatics formats receive safe
+  semantic checks. Unknown formats receive structural checks and can add
+  validators through the suffix registry.
 - Only completed root, recovery, refinement, diversity, architecture, and merge
   implementations consume the configured budget. Tuning is budget-free and is
   bounded independently by tune depth and tuning/implementation attempt caps.
@@ -134,13 +136,13 @@ eval/run_search.py            command-line entrypoint and Markdown result summar
   scores and may intentionally retain only the strongest modality subset.
 - Once two candidates are within the high-performance band, the manager may
   request a merge before remaining roots are finished.
-- Before finalization, a single budget-free final ensemble step may run: when
-  the protocol is cross-validation and two or more measured nodes stored
-  `oof_predictions.npz`, the strongest set loads the stored out-of-fold/test
-  predictions, optimizes non-negative blend weights over the simplex on the
-  shared validation rows, and replaces the best node's deliverable only if the
-  blend beats it within evaluation noise. Nodes without stored predictions
-  (holdout, task-native, generation, RL, ...) simply skip this step.
+- Before finalization, a single budget-free numeric ensemble step may run when
+  two or more unique nodes stored centrally scorable, aligned prediction bundles.
+  The manager fits regularized non-negative weights with outer cross-fitting and
+  accepts a non-trivial blend within an uncertainty-scaled robustness tolerance.
+  Pruning controls expansion, not ensemble eligibility. Incompatible, task-native,
+  generation, control, and structured-output tasks keep their declared evaluator
+  and validated native-output fallback.
 - Remaining budget is spent on the current best implementation, not on weak
   lineages.
 

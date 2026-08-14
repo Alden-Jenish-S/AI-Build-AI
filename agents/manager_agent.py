@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 from runtime_utils import (
     absolute_path_without_symlink_resolution,
     run_supervised_process,
@@ -25,6 +27,12 @@ from search_evidence import (
     relative_noise_floor,
     score_noise_estimate,
     signature_from_result,
+)
+from prediction_evidence import (
+    PredictionEvidence,
+    cross_fitted_blend,
+    evidence_compatible,
+    inspect_prediction_evidence,
 )
 from tree.node import NodeState
 from tree.scheduler import UCB1Scheduler
@@ -111,7 +119,12 @@ class ManagerAgent:
             submission_validator=self.submission_validator,
         )
         self.aggregator_agent = AggregatorAgent()
-        self.scheduler = UCB1Scheduler(total_budget)
+        self.scheduler = UCB1Scheduler(
+            total_budget,
+            exploration=max(
+                0.0, self._env_float("AIBUILDAI_UCB_EXPLORATION", 0.35)
+            ),
+        )
 
         search_root = NodeState(
             node_id="root",
@@ -141,7 +154,9 @@ class ManagerAgent:
         # Two independent roots are enough to establish diversity for larger
         # searches; additional budget is more valuable on measured refinement.
         self.initial_fanout = min(2, max(1, self.total_budget // 3))
-        self.max_tune_depth = 1
+        self.max_tune_depth = max(
+            1, self._env_int("AIBUILDAI_MAX_TUNE_DEPTH", 2)
+        )
         self.architecture_exploration_enabled = self._env_enabled(
             "AIBUILDAI_ARCHITECTURE_EXPLORATION", default=True
         )
@@ -161,6 +176,12 @@ class ManagerAgent:
         # Tuning is free with respect to the idea budget, but independent caps
         # guarantee termination under persistent external/generated failures.
         self.tuning_attempt_limit = max(1, self.total_budget)
+        self.exploitation_attempt_limit = max(
+            1,
+            self._env_int(
+                "AIBUILDAI_EXPLOIT_ATTEMPTS", math.ceil(self.total_budget * 0.4)
+            ),
+        )
         self.attempt_limit = max(self.total_budget * 5, self.total_budget + 12)
         # Cheap screening probes are also budget-free but bounded; they let the
         # search rank candidates before spending a full idea on them.
@@ -197,6 +218,8 @@ class ManagerAgent:
         self.max_architect_iterations = max(
             1, self._env_int("AIBUILDAI_MAX_ARCHITECT_ITERATIONS", 2)
         )
+        for warning in self.task_analysis.contract_warnings:
+            self._log(f"Task contract warning: {warning}")
         self._log(
             f"Prepared task '{self.task_name}' with {len(self.task_analysis.files)} files; "
             f"metric={self.metric_name} ({self.metric_direction}); budget={self.total_budget}."
@@ -324,6 +347,7 @@ class ManagerAgent:
             "completed_implementations": self.completed_implementations,
             "tuning_attempts": self.tuning_attempts,
             "tuning_attempt_limit": self.tuning_attempt_limit,
+            "exploitation_attempt_limit": self.exploitation_attempt_limit,
             "probe_attempts": self.probe_attempts,
             "probe_attempt_limit": self.probe_attempt_limit,
             "ensemble_attempts": self.ensemble_attempts,
@@ -346,6 +370,7 @@ class ManagerAgent:
                         self.council_brief.evaluation_protocol.protocol_hash
                     ),
                     "artifact": str(self.run_root / "council" / "council_brief.json"),
+                    **self._council_execution_status(),
                 }
                 if self.council_brief is not None
                 else None
@@ -359,6 +384,33 @@ class ManagerAgent:
         temporary.write_text(json.dumps(payload, indent=2, default=str) + "\n", encoding="utf-8")
         temporary.replace(path)
         return path
+
+    def _council_execution_status(self) -> dict[str, list[str]]:
+        """Expose selected/full-attempt coverage in every progress snapshot."""
+        if self.council_brief is None:
+            return {}
+        selected = [
+            str(item.get("hypothesis_id"))
+            for item in self.council_brief.selected_portfolio
+            if item.get("hypothesis_id")
+        ]
+        attempted = {
+            str((node.config or {}).get("hypothesis_id"))
+            for node in self.all_nodes.values()
+            if node.node_type == "implementation"
+            and node.executed
+            and node.operator != "probe"
+            and (node.config or {}).get("hypothesis_id")
+        }
+        return {
+            "selected_hypothesis_ids": selected,
+            "full_attempted_hypothesis_ids": [
+                hypothesis_id for hypothesis_id in selected if hypothesis_id in attempted
+            ],
+            "pending_hypothesis_ids": [
+                hypothesis_id for hypothesis_id in selected if hypothesis_id not in attempted
+            ],
+        }
 
     def _restore_tree_state(self) -> None:
         """Rebuild mutable state from the on-disk tree_state.json snapshot.
@@ -469,10 +521,37 @@ class ManagerAgent:
                 reward *= 0.5
             self.scheduler.backpropagate(node.node_id, reward, restored)
         self._resumed = True
+        self._restore_council_brief()
         self._log(
             f"Resumed {len(restored)} nodes from {path.name}; "
             f"best={self.node_label(self.best_node_id)}; "
             f"budget={self.experiments_executed}/{self.total_budget}."
+        )
+
+    def _restore_council_brief(self) -> None:
+        """Reload the persisted council contract for an interrupted run."""
+        path = self.run_root / "council" / "council_brief.json"
+        if not path.is_file():
+            return
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            brief = CouncilBrief.from_mapping(payload)
+            if brief.task_name != self.task_name:
+                raise ValueError(
+                    f"brief task {brief.task_name!r} does not match {self.task_name!r}"
+                )
+        except (OSError, ValueError, TypeError) as exc:
+            self._log(f"Could not restore the persisted council brief: {exc}")
+            return
+        self.council_brief = brief
+        self.technique_agent.set_council_brief(brief)
+        self.initial_fanout = min(
+            self.total_budget,
+            max(1, int(brief.recommended_root_count)),
+        )
+        self._log(
+            f"Restored council brief with {len(brief.selected_portfolio)} selected "
+            f"hypotheses and {len(brief.measured_baselines)} measured baselines."
         )
 
     def _pick_best_from_restored(self) -> str | None:
@@ -663,6 +742,11 @@ class ManagerAgent:
         for node in self.all_nodes.values():
             if node.node_type != "implementation" or not node.executed:
                 continue
+            # An intervention is consumed by an actual attempt, successful or
+            # not. Otherwise one failed/underperforming transfer can retrigger
+            # the same mandatory coverage rule until the whole budget is gone.
+            if node.operator in {"architect", "transfer"}:
+                dedicated_attempted = True
             result = node.result or {}
             if result.get("status") != "completed" or result.get("score") is None:
                 continue
@@ -670,8 +754,6 @@ class ManagerAgent:
                 continue
             # A completed custom-network measurement counts as coverage; a failed
             # or invalidated architect attempt must not disable the intervention.
-            if node.operator == "architect":
-                dedicated_attempted = True
             code_track = classify_architecture(node.code or "")
             track = (
                 code_track
@@ -1822,6 +1904,16 @@ class ManagerAgent:
             reverse=self.metric_direction != "minimize",
         )
         pool = pool[:8]
+        oriented = [
+            (-float(node.result["score"]) if self.metric_direction == "minimize" else float(node.result["score"]))
+            for node in pool
+        ]
+        low, high = min(oriented), max(oriented)
+        scale = max(high - low, 1e-12)
+        quality = {
+            node.node_id: (value - low) / scale
+            for node, value in zip(pool, oriented)
+        }
         best_key = float("-inf")
         best_pair: tuple[NodeState, NodeState] | None = None
         for index in range(len(pool)):
@@ -1829,9 +1921,11 @@ class ManagerAgent:
                 first = pool[index]
                 second = pool[other]
                 correlation = self._pair_correlation(first, second)
-                score_sum = float(first.result["score"]) + float(second.result["score"])
-                key = score_sum * (
-                    1.0 + self.complementarity_weight * (1.0 - abs(correlation))
+                pair_quality = 0.75 * (
+                    quality[first.node_id] + quality[second.node_id]
+                ) / 2.0
+                key = pair_quality + self.complementarity_weight * (
+                    1.0 - abs(correlation)
                 )
                 if key > best_key:
                     best_key = key
@@ -1839,15 +1933,17 @@ class ManagerAgent:
         return best_pair
 
     def _plan_initial_roots(self) -> None:
-        """Probe a broad candidate portfolio, then promote the strongest
-        measured plans to full implementations (successive halving)."""
+        """Probe candidates and promote a bounded evidence-ranked root set.
+
+        Council selection defines the screening portfolio, not a promise to run
+        every expensive candidate. Exhaustive full-root coverage remains an
+        explicit opt-in for audits that need it.
+        """
         if self.council_brief is not None:
-            candidate_count = min(
-                self.total_budget,
-                max(
-                    self.initial_fanout,
-                    len(self.council_brief.selected_portfolio),
-                ),
+            candidate_count = max(
+                self.initial_fanout,
+                len(self.council_brief.selected_portfolio)
+                + (1 if self.council_brief.measured_baselines else 0),
             )
         else:
             candidate_count = min(3, max(2, self.initial_fanout + 1))
@@ -1871,8 +1967,14 @@ class ManagerAgent:
                     "while preserving the shared score and requested output."
                 ),
             ][:candidate_count]
-        primary = list(plans[: self.initial_fanout])
-        self._backup_plans = list(plans[self.initial_fanout :])
+        if self.council_brief is not None:
+            primary = list(plans)
+            self._backup_plans = []
+        else:
+            primary = list(plans[: self.initial_fanout])
+            self._backup_plans = list(plans[self.initial_fanout :])
+        plans = primary + self._backup_plans
+
         self._log(
             f"Received {len(plans)} root plans: {len(primary)} primary and "
             f"{len(self._backup_plans)} recovery backups."
@@ -1903,10 +2005,21 @@ class ManagerAgent:
                     key=lambda pair: float(pair[0].result["score"]),
                     reverse=self.metric_direction != "minimize",
                 )
-                promote_count = min(self.initial_fanout, len(probed))
+                promote_count = (
+                    min(
+                        len(probed),
+                        max(1, min(self.initial_fanout, math.ceil(self.total_budget * 0.3))),
+                    )
+                    if self.council_brief is not None
+                    else min(self.initial_fanout, len(probed))
+                )
                 self._log(
                     f"Probe screening produced {len(probed)} runnable candidates; "
-                    f"promoting the top {promote_count} to full implementations."
+                    + (
+                        f"promoting the top {promote_count} under the exploration quota."
+                        if self.council_brief is not None
+                        else f"promoting the top {promote_count} to full implementations."
+                    )
                 )
                 for probe_node, candidate_plan in probed[:promote_count]:
                     if not self._can_attempt("root"):
@@ -1914,7 +2027,28 @@ class ManagerAgent:
                     root = self._promote_probe(probe_node, candidate_plan)
                     if root.result and root.result.get("status") == "completed":
                         root_nodes.append(root)
-        if not root_nodes:
+        if self.council_brief is not None and self._env_enabled(
+            "AIBUILDAI_REQUIRE_ALL_COUNCIL_ROOTS", default=False
+        ):
+            attempted_ids = {
+                (node.config or {}).get("hypothesis_id")
+                for node in self.all_nodes.values()
+                if node.node_type == "implementation"
+                and node.executed
+                and node.operator != "probe"
+            }
+            remaining = [
+                plan
+                for plan in plans
+                if self._hypothesis_id(plan) not in attempted_ids
+            ]
+            for plan in remaining:
+                if not self._can_attempt("root"):
+                    break
+                root = self._run_root_plan(plan)
+                if root.result and root.result.get("status") == "completed":
+                    root_nodes.append(root)
+        elif not root_nodes:
             # All probes failed (or probing was unavailable); fall back to the
             # direct full baseline path so a screening failure never blocks.
             self._log(
@@ -1946,13 +2080,66 @@ class ManagerAgent:
                 self._log("No runnable baseline yet; invoking failure-informed recovery.")
                 self._run_recovery()
 
-        # Give every displaced root exactly one model-locked rescue tune, then
-        # prune it if the measured result remains weak.
+        # Prune stale nodes but don't force mandatory rescue tuning.
         self._prune_stale_frontier()
-        for root in root_nodes:
-            if self._can_attempt("tune") and not self._high_performer(float(root.result["score"])):
-                self._log(f"Running mandatory rescue tuning for weak {self.node_label(root.node_id)}.")
-                self._tune(root)
+
+    def _execute_missing_council_roots(self) -> None:
+        """Resume full attempts for selected hypotheses absent from the tree."""
+        if self.council_brief is None or not self._env_enabled(
+            "AIBUILDAI_REQUIRE_ALL_COUNCIL_ROOTS", default=False
+        ):
+            return
+        count = max(
+            self.initial_fanout,
+            len(self.council_brief.selected_portfolio)
+            + (1 if self.council_brief.measured_baselines else 0),
+        )
+        plans = self.technique_agent.generate_initial_approaches(
+            self.task_analysis, count
+        )
+        attempted_ids = {
+            (node.config or {}).get("hypothesis_id")
+            for node in self.all_nodes.values()
+            if node.node_type == "implementation"
+            and node.executed
+            and node.operator != "probe"
+        }
+        missing = [
+            plan
+            for plan in plans
+            if self._hypothesis_id(plan) not in attempted_ids
+        ]
+        if missing:
+            self._log(
+                f"Resume audit found {len(missing)} council-selected full attempt(s) "
+                "missing from the persisted tree; scheduling them now."
+            )
+        for plan in missing:
+            if not self._can_attempt("root"):
+                self._log(
+                    "Council execution audit stopped at the configured idea/attempt budget."
+                )
+                break
+            self._run_root_plan(plan, replacement=True)
+
+    def _next_exploitation_action(self) -> NodeState | None:
+        """Prefer bounded tuning of the strongest measured configurations.
+
+        This is intentionally metric- and modality-agnostic. It operates on the
+        measured leaderboard and queued actions, while architecture/model details
+        remain owned by the task-specific implementation.
+        """
+        if self.tuning_attempts >= getattr(
+            self, "exploitation_attempt_limit", max(1, self.total_budget // 2)
+        ):
+            return None
+        if not self._can_attempt("tune"):
+            return None
+        for candidate in self._successful_nodes()[:2]:
+            pending = self._pending_action(candidate, "tune")
+            if pending is not None:
+                return pending
+        return None
 
     def run_tree_search(self) -> str | None:
         """Run council-directed planning and measured implementation search."""
@@ -1961,12 +2148,26 @@ class ManagerAgent:
         self._log("=" * 62)
 
         if self._resumed:
-            # The council brief is not serialized for reload; re-running the
-            # council on resume would duplicate costly research work. Existing
-            # nodes already carry their protocol hashes in config.
-            self._log(
-                "Skipping initial root planning; executing the restored frontier instead."
-            )
+            if self.council_brief is None:
+                self._log(
+                    "The prior run stopped during council preparation; resuming from "
+                    "checkpointed council artifacts."
+                )
+                self._prepare_research_council()
+                has_implementation = any(
+                    node.node_type == "implementation"
+                    for node in self.all_nodes.values()
+                )
+                if self.council_brief is not None and not has_implementation:
+                    self._plan_initial_roots()
+                elif self.council_brief is not None:
+                    self._execute_missing_council_roots()
+            else:
+                self._log(
+                    "Skipping council research rerun; auditing the restored portfolio "
+                    "before executing the remaining frontier."
+                )
+                self._execute_missing_council_roots()
         else:
             self._prepare_research_council()
             self._plan_initial_roots()
@@ -1977,6 +2178,16 @@ class ManagerAgent:
             actions += 1
             self._prune_stale_frontier()
 
+            exploitation = self._next_exploitation_action()
+            if exploitation is not None:
+                base_id = str((exploitation.config or {}).get("base_node_id"))
+                self._log(
+                    "Exploitation quota selected focused tuning of "
+                    f"{self.node_label(base_id)} before another architecture family."
+                )
+                self._execute_planning_action(exploitation)
+                continue
+
             # Collect executed node results for LLM evaluation (cheap screening
             # probes are internal evidence and are excluded from the LLM history).
             nodes_history = []
@@ -1984,8 +2195,6 @@ class ManagerAgent:
                 if nid == "root" or not node.executed:
                     continue
                 res = node.result or {}
-                if res.get("probe"):
-                    continue
                 nodes_history.append(
                     {
                         "node_id": nid,
@@ -2000,6 +2209,7 @@ class ManagerAgent:
                             "modality_ablation_scores"
                         ),
                         "plan_summary": self._clean_plan_text(node.plan)[:400],
+                        "probe": res.get("probe", False),
                     }
                 )
 
@@ -2027,14 +2237,22 @@ class ManagerAgent:
                 modalities = self.task_analysis.modalities or predictive_modality_inventory(
                     self.task_analysis.files
                 )["modalities"]
-                op = "transfer" if transfer_learning_applicable(modalities) else "architect"
+                # Transfer is the first neural counterfactual only when neural
+                # evidence is absent. Once an established neural model exists,
+                # a missing-custom-graph trigger must actually run `architect`.
+                op = (
+                    "transfer"
+                    if transfer_learning_applicable(modalities)
+                    and not architecture_coverage.get("neural_attempted")
+                    else "architect"
+                )
                 architecture_node = self._architect(
                     self.all_nodes[self.best_node_id], trigger=architecture_trigger, operator=op
                 )
                 if architecture_node is not None:
                     continue
 
-            # Analyze state with LLM Manager Agent and decide next action
+            measured_baselines = getattr(self.council_brief, "measured_baselines", None) if self.council_brief else None
             decision = self.technique_agent.decide_next_step(
                 self.task_analysis,
                 nodes_history=nodes_history,
@@ -2043,6 +2261,7 @@ class ManagerAgent:
                 experiments_remaining=experiments_remaining,
                 plateau_state=plateau_state,
                 architecture_coverage=architecture_coverage,
+                measured_baselines=measured_baselines,
             )
 
             action = decision.get("action", "diversify")
@@ -2182,6 +2401,13 @@ class ManagerAgent:
         against the same node inputs checks that the reported evaluation is
         reproducible. A mismatch only warns and preserves the validated deliverable.
         """
+        evidence_summary = (node.result or {}).get("prediction_evidence") or {}
+        if evidence_summary.get("centrally_scored"):
+            self._log(
+                f"Skipping destructive re-training of {self.node_label(node.node_id)}; "
+                "its stored OOF evidence was centrally verified."
+            )
+            return
         if not self._env_enabled("AIBUILDAI_FINAL_VERIFY", default=True):
             return
         try:
@@ -2258,90 +2484,274 @@ class ManagerAgent:
             )
 
     def _ensemble_candidates(self) -> list[NodeState]:
-        """Completed measured nodes that stored OOF predictions on disk."""
+        """Valid measured candidates, independent of search-expansion pruning."""
         candidates: list[NodeState] = []
-        for node in self._successful_nodes():
-            if node.operator == "ensemble":
+        seen_hashes: set[str] = set()
+        for node in self.all_nodes.values():
+            result = node.result or {}
+            if (
+                node.node_type != "implementation"
+                or not node.executed
+                or node.operator in {"ensemble", "probe"}
+                or result.get("status") != "completed"
+            ):
                 continue
-            oof_path = (node.result or {}).get("oof_predictions")
-            if oof_path and Path(str(oof_path)).is_file():
-                candidates.append(node)
-        return candidates
+            oof_path = result.get("oof_predictions")
+            if not oof_path:
+                continue
+            evidence = inspect_prediction_evidence(oof_path, self.metric_name)
+            if not evidence.blendable or not evidence.prediction_hash:
+                continue
+            if evidence.prediction_hash in seen_hashes:
+                continue
+            seen_hashes.add(evidence.prediction_hash)
+            result["prediction_evidence"] = evidence.summary()
+            result["reported_score"] = result.get("reported_score", result.get("score"))
+            result["score"] = float(evidence.score)
+            if evidence.fold_scores:
+                result["fold_scores"] = list(evidence.fold_scores)
+            candidates.append(node)
+        direction = getattr(self, "metric_direction", None)
+        if direction is None:
+            direction = getattr(getattr(self, "task_analysis", None), "direction", "maximize")
+        return sorted(
+            candidates,
+            key=lambda item: float(item.result["score"]),
+            reverse=direction != "minimize",
+        )
+
+    def _prediction_evidence_for(self, node: NodeState) -> PredictionEvidence | None:
+        path = (node.result or {}).get("oof_predictions")
+        if not path:
+            return None
+        evidence = inspect_prediction_evidence(path, self.metric_name)
+        return evidence if evidence.blendable else None
+
+    def _materialize_prediction_table(
+        self,
+        prediction: np.ndarray,
+        test_index: np.ndarray,
+        node_dir: Path,
+    ) -> Path:
+        """Materialize the numeric table adapter when the sample proves its schema."""
+        import pandas as pd
+
+        submission = self.task_analysis.submission or {}
+        if str(submission.get("kind") or "").casefold() != "table":
+            raise ValueError("the final output is not a table prediction contract")
+        suffix = str(submission.get("extension") or "").casefold()
+        if suffix not in {".csv", ".tsv"}:
+            raise ValueError("numeric table finalization supports CSV and TSV contracts")
+        reference = self.task_dir / str(submission.get("path") or "")
+        separator = "\t" if suffix == ".tsv" else ","
+        frame = pd.read_csv(reference, sep=separator)
+        values = np.asarray(prediction)
+        if len(frame) != len(values):
+            raise ValueError("test predictions do not match the sample-output row count")
+
+        columns = list(frame.columns)
+        if values.ndim == 1 and len(columns) == 2:
+            output_columns = columns[1:]
+            values = values[:, None]
+        elif values.ndim == 2 and values.shape[1] == len(columns) - 1:
+            output_columns = columns[1:]
+        else:
+            raise ValueError(
+                "prediction width does not match the sample-output numeric columns"
+            )
+
+        if output_columns != columns and test_index is not None:
+            sample_ids = frame[columns[0]].to_numpy()
+            stored_ids = np.asarray(test_index)
+            if not np.array_equal(sample_ids, stored_ids):
+                lookup = {str(value): index for index, value in enumerate(stored_ids)}
+                if len(lookup) != len(stored_ids) or any(
+                    str(value) not in lookup for value in sample_ids
+                ):
+                    raise ValueError("test prediction identifiers do not match the sample output")
+                order = [lookup[str(value)] for value in sample_ids]
+                values = values[order]
+        for offset, column in enumerate(output_columns):
+            # Replace the placeholder series so integer-valued sample files can
+            # safely receive floating-point predictions on current and future pandas.
+            frame[column] = values[:, offset]
+        destination_dir = node_dir / "submission"
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        destination = destination_dir / ("submission.csv" if suffix == ".csv" else "submission.tsv")
+        frame.to_csv(destination, sep=separator, index=False)
+        return destination
 
     def _build_final_ensemble(self) -> NodeState | None:
-        """Blend the stored OOF predictions of the strongest measured nodes."""
+        """Build a deterministic, capability-gated, cross-fitted ensemble."""
         if not self._can_attempt("ensemble"):
             return None
         candidates = self._ensemble_candidates()
         if len(candidates) < 2:
             self._log(
-                "Final ensemble skipped: fewer than two measured nodes stored "
-                "OOF predictions (expected when tasks have no labeled validation set)."
+                "Final numeric ensemble skipped: fewer than two unique, centrally "
+                "scored prediction bundles are available."
             )
             return None
-        top = candidates[:5]
-        first = top[0]
-        pair = self._merge_pair(top)
-        second = pair[1] if pair is not None and pair[1] is not first else top[1]
-        path_lines = []
-        for node in top:
-            path_lines.append(
-                f"- ../{node.node_id}/oof_predictions.npz (arrays `oof_pred`, "
-                "`oof_index`, `test_pred`, `test_index`)"
+
+        best = candidates[0]
+        best_score = float(best.result["score"])
+        # Rank bounds compute, while cross-fitting—not an arbitrary score band—
+        # decides usefulness. A locally weaker top model can carry complementary
+        # signal under shift (as in the node37/node44 failure that motivated this).
+        candidate_pool = candidates[:5]
+        best_evidence = self._prediction_evidence_for(best)
+        if best_evidence is None:
+            return None
+        top = [best]
+        evidence_items = [best_evidence]
+        for candidate in candidate_pool[1:]:
+            evidence = self._prediction_evidence_for(candidate)
+            if evidence is not None and evidence_compatible([*evidence_items, evidence]):
+                top.append(candidate)
+                evidence_items.append(evidence)
+        if len(top) < 2:
+            self._log(
+                "Final numeric ensemble skipped: no second top-ranked "
+                "prediction bundle is aligned with the strongest candidate."
             )
-        plan = (
-            "FINAL ENSEMBLE STEP (mandatory):\n"
-            "- Each measured parent below saved out-of-fold and test predictions:\n"
-            + "\n".join(path_lines)
-            + "\n- Load every parent's `oof_pred`/`oof_index` and the labels for those "
-            "validation rows from the council-approved inputs exactly as the parents did "
-            "(inspect the parent code).\n"
-            "- Optimize non-negative blend weights over the parents on the shared metric "
-            f"({self.metric_name} {self.metric_direction}) with a bounded search "
-            "(random/grid over the simplex, at most 300 evaluations, early stopping), "
-            "preferring simpler weight vectors.\n"
-            "- Compare the winning blend against every parent on the identical validation "
-            "rows; if it does not beat the best parent, emit the best parent's `test_pred` "
-            "unchanged.\n"
-            f"- Apply the chosen weights to the parents' `test_pred`/`test_index` and write "
-            "the requested deliverable with the same sample schema (inspect each "
-            "`../{node_id}/submission*` directory for the exact contract).\n"
-            "- Write `result.json` with the shared `evaluation_protocol_hash`, `fold_scores`, "
-            "`validation_sample_count`, and the chosen score."
+            return None
+
+        blend = cross_fitted_blend(
+            evidence_items, self.metric_name, self.metric_direction
         )
+        fold_count = max(2, len(blend.fold_scores))
+        acceptance_tolerance = max(
+            1e-9,
+            abs(best_score) * 0.02,
+            self._noise_for(best) / math.sqrt(fold_count),
+        )
+        acceptable = (
+            blend.score <= best_score + acceptance_tolerance
+            if self.metric_direction == "minimize"
+            else blend.score >= best_score - acceptance_tolerance
+        )
+        if not acceptable:
+            self._log(
+                f"Cross-fitted ensemble score {blend.score:.8g} fell outside the "
+                f"robustness tolerance around {best_score:.8g}; keeping the strongest "
+                "task-native candidate."
+            )
+            return None
+
+        plan = "Deterministic cross-fitted ensemble over centrally verified prediction evidence."
         self._log(
             f"Building final OOF ensemble over {len(top)} stored prediction sets."
         )
         planning = self._create_planning_node(
             plan,
             operator="ensemble",
-            parent=first,
+            parent=best,
             executed=True,
             priority=0.0,
-            base=first,
-            companion=second,
+            base=best,
+            companion=top[1],
             merge_sources=[node.node_id for node in top],
         )
-        child = self._execute(
-            plan,
-            operator="ensemble",
-            parent=planning,
-            base=first,
-            companion=second,
+        self.ensemble_attempts += 1
+        node_id = self._new_node_id("ensemble")
+        node_dir = self.run_root / node_id
+        node_dir.mkdir(parents=True, exist_ok=True)
+        output = self._materialize_prediction_table(
+            blend.test_pred, evidence_items[0].test_index, node_dir
         )
+        evidence_path = node_dir / "oof_predictions.npz"
+        np.savez_compressed(
+            evidence_path,
+            oof_pred=blend.oof_pred,
+            oof_target=evidence_items[0].oof_target,
+            oof_index=evidence_items[0].oof_index,
+            oof_fold=(
+                evidence_items[0].oof_fold
+                if evidence_items[0].oof_fold is not None
+                else np.arange(len(blend.oof_pred)) % fold_count
+            ),
+            test_pred=blend.test_pred,
+            test_index=evidence_items[0].test_index,
+        )
+        audit = inspect_prediction_evidence(evidence_path, self.metric_name)
+        result = {
+            "status": "completed",
+            "score": float(blend.score),
+            "metric": self.metric_name,
+            "direction": self.metric_direction,
+            "output": str(output),
+            "fold_scores": blend.fold_scores,
+            "validation_sample_count": len(blend.oof_pred),
+            "oof_predictions": str(evidence_path),
+            "prediction_evidence": audit.summary(),
+            "ensemble_members": [node.node_id for node in top],
+            "ensemble_weights": [float(value) for value in blend.weights],
+            "budget_charged": False,
+            "operator": "ensemble",
+        }
+        child = NodeState(
+            node_id=node_id,
+            parent_id=planning.node_id,
+            node_type="implementation",
+            plan=plan,
+            operator="ensemble",
+            executed=True,
+            config={
+                "base_node_id": best.node_id,
+                "companion_node_id": top[1].node_id,
+                "architecture_track": "other",
+            },
+            result=result,
+        )
+        self.all_nodes[node_id] = child
+        planning.children_ids.append(node_id)
+        manifest = {
+            "strategy": "cross_fitted_numeric_blend",
+            "metric": self.metric_name,
+            "direction": self.metric_direction,
+            "score": float(blend.score),
+            "members": [node.node_id for node in top],
+            "weights": [float(value) for value in blend.weights],
+            "member_scores": [float(node.result["score"]) for node in top],
+            "prediction_hashes": [item.prediction_hash for item in evidence_items],
+        }
+        (self.run_root / "ensemble_manifest.json").write_text(
+            json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+        )
+        (node_dir / "result.json").write_text(
+            json.dumps(result, indent=2, default=str) + "\n", encoding="utf-8"
+        )
+        self._mark_dirty(planning.node_id, child.node_id)
         self._persist_tree_state()
         return child
 
+    def _cleanup_intermediate_outputs(self) -> None:
+        """Remove node-level deliverables after the one final copy is validated."""
+        for node_id, node in self.all_nodes.items():
+            if node_id == "root" or node.node_type != "implementation":
+                continue
+            node_dir = self.run_root / node_id
+            submission_dir = node_dir / "submission"
+            if submission_dir.is_dir():
+                shutil.rmtree(submission_dir)
+            root_submission = node_dir / "submission.csv"
+            if root_submission.is_file():
+                root_submission.unlink()
+            if node.result and node.result.get("output"):
+                node.result["intermediate_output_removed"] = True
+                if hasattr(self, "_dirty_node_ids"):
+                    self._mark_dirty(node_id)
+
     def generate_final_submission(self, best_node_id: str) -> bool:
         node = self.all_nodes.get(best_node_id)
-        if node is None or not node.result or not node.result.get("output"):
+        if node is None or not node.result:
             return False
         chosen = node
-        if (
-            self.final_ensemble_enabled
-            and self.council_brief is not None
-            and self.council_brief.evaluation_protocol.mode == "cross_validation"
-        ):
+        audited_candidates = self._ensemble_candidates()
+        if audited_candidates:
+            chosen = audited_candidates[0]
+            self.best_node_id = chosen.node_id
+        if self.final_ensemble_enabled and len(audited_candidates) >= 2:
             try:
                 ensemble_node = self._build_final_ensemble()
             except Exception as exc:
@@ -2353,23 +2763,28 @@ class ManagerAgent:
                 and ensemble_node.result.get("status") == "completed"
                 and ensemble_node.result.get("score") is not None
             ):
-                ensemble_score = float(ensemble_node.result["score"])
-                best_score = float(node.result["score"])
-                if self._improved(
-                    ensemble_score, best_score, noise=self._noise_for(node)
-                ):
-                    chosen = ensemble_node
-                    self.best_node_id = ensemble_node.node_id
-                    self._log(
-                        f"Final ensemble {self.node_label(ensemble_node.node_id)} "
-                        f"improved the best deliverable ({best_score:.8g} -> "
-                        f"{ensemble_score:.8g}); using its output."
+                chosen = ensemble_node
+                self.best_node_id = ensemble_node.node_id
+                self._log(
+                    f"Using robustness-qualified ensemble {self.node_label(ensemble_node.node_id)} "
+                    f"with score {float(ensemble_node.result['score']):.8g}."
+                )
+        if not chosen.result.get("output"):
+            evidence = self._prediction_evidence_for(chosen)
+            if evidence is None:
+                self._log("Selected candidate has neither a native output nor finalizable predictions.")
+                return False
+            try:
+                chosen.result["output"] = str(
+                    self._materialize_prediction_table(
+                        evidence.test_pred,
+                        evidence.test_index,
+                        self.run_root / chosen.node_id,
                     )
-                else:
-                    self._log(
-                        f"Final ensemble scored {ensemble_score:.8g} without beating "
-                        f"the best node ({best_score:.8g}); keeping the best deliverable."
-                    )
+                )
+            except Exception as exc:
+                self._log(f"Could not materialize deferred final output: {exc}")
+                return False
         self._verify_final_node(chosen)
         validation = self.submission_validator.validate(
             str(chosen.result["output"]),
@@ -2388,6 +2803,7 @@ class ManagerAgent:
             validation.output_path, self.run_root
         )
         self._log(f"Final output copied to {self.final_output_path}.")
+        self._cleanup_intermediate_outputs()
         self._persist_tree_state()
         return True
 

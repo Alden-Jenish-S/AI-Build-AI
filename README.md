@@ -1,8 +1,10 @@
 # AIBuildAI
 
-AIBuildAI inspects an arbitrary task directory, asks an LLM to write direct
-implementations for the observed data, executes and repairs them, and keeps the
-best locally scored deliverable.
+AIBuildAI inspects a task directory, asks an LLM to write direct implementations
+for the observed data, executes and repairs them, and keeps the best locally
+scored deliverable. The search is modality-adaptive, but it requires a locally
+measurable scalar objective to rank nodes; it is not a universal executor for
+tasks whose quality cannot be evaluated locally.
 
 ## Workflow
 
@@ -21,20 +23,25 @@ best locally scored deliverable.
    is still produced so the tree can continue.
    When multiple predictive modalities are detected, the council reserves a
    modality-contribution hypothesis instead of assuming full fusion is necessary.
-4. `TechniqueAgent` converts the selected hypotheses into initial roots. Root
-   count is adaptive and budget-bounded; it is no longer fixed at two.
-   Cheap, budget-free screening probes are run first (bounded subsets/epochs),
-   the candidate portfolio is ranked by measured score, and only the strongest
-   plans are promoted to full-data implementations (successive halving).
-   If every probe fails, the search falls back to direct full roots.
+4. `TechniqueAgent` converts the selected hypotheses into initial roots and
+   prepends the globally strongest measured diagnostic control. Diagnostic
+   controls are ranked by the task metric direction, so report order or model
+   complexity cannot displace a better measured baseline. Cheap, budget-free
+   screening probes run first (bounded subsets/epochs). For a council-selected
+   portfolio, probe scores determine execution order and only the strongest
+   bounded set is promoted by default. This keeps full training focused while
+   preserving controlled family coverage; an opt-in environment switch can run
+   every council-selected root when exhaustive coverage is desired.
 5. Each root, tuning, architecture, merge, or recovery proposal is stored as a planning node;
    its following numbered child is the implementation node.
 6. `ImplementationAgent` writes one self-contained `algorithm.py` per
    implementation node. Only council-approved task files are exposed under
-   `input/`; generated code uses those files directly and writes its deliverable
-   under `submission/`.
-7. Every deliverable passes a format-adaptive validator before its score is
-   accepted. Supplied sample outputs define structure; otherwise arbitrary
+   `input/`. Centrally auditable numeric table tasks retain aligned OOF/test
+   prediction evidence and defer their deliverable; other tasks write their
+   native artifact under `submission/`.
+7. Every native deliverable passes a format-adaptive validator before its score is
+   accepted, while deferred numeric candidates pass central prediction-evidence
+   validation. Supplied sample outputs define structure; otherwise arbitrary
    non-empty files or directory bundles are accepted, with safe semantic checks
    for recognized formats. Validation failures enter the repair loop.
 8. A score is rankable only when `result.json` reports the exact council protocol
@@ -43,6 +50,9 @@ best locally scored deliverable.
 9. A failed execution is repaired from its real code and stdout/stderr. Stale
    deliverables are removed between attempts, documentation search is available
    during repair, and transient provider responses are retried with backoff.
+   Focused council diagnostics use the same bounded repair principle: AST
+   rejection, runtime failure, or invalid JSON is fed back into up to three
+   task-scoped repair attempts by default.
 10. `ManagerAgent` uses a lineage-aware UCB frontier over lazy `refine`, `tune`,
     and `diversify` planning nodes. Every "is this an improvement?" decision is
     evaluation-noise aware: fold-score dispersion, then repeated-seed dispersion,
@@ -57,8 +67,10 @@ best locally scored deliverable.
     or merge candidate also receives one focused rescue tune before pruning.
     Improving descendants receive new actions; stale ancestors do not expand.
     Root, recovery, refinement, diversity, architecture, and merge implementations consume the
-    configured new-idea budget. Tuning implementations are free and use separate
-    depth/attempt safety limits.
+    configured new-idea budget. Tuning does not consume an idea slot, but a
+    separate exploitation quota and depth/attempt limits bound its real compute.
+    The strongest two measured configurations receive focused tuning before more
+    architecture-family expansion.
 11. Model-family diversity is a hard constraint: every plan is fingerprinted
     with the model family it proposes, and a `diversify` proposal that repeats
     an already measured family is sent back to the planner once before being
@@ -93,13 +105,25 @@ best locally scored deliverable.
 16. Pending frontier actions whose measured parent is decorrelated with the
     incumbent best receive a complementarity bonus, steering remaining budget
     toward new signal rather than more of the same representation.
-17. Before finalization, when two or more measured nodes stored out-of-fold
-    predictions, a single budget-free final ensemble step loads the stored
-    predictions, optimizes non-negative blend weights on the shared validation
-    rows, and replaces the best node only if the blend beats it within noise.
-    Otherwise the best node's deliverable is kept.
-18. The selected node's native deliverable is validated again, then copied to
-    `submission.csv` or `final_output/` at the run root.
+17. Supervised candidates may store a capability-gated prediction bundle with
+    OOF predictions, their exact targets/indices/fold IDs, and aligned test
+    predictions. For unambiguous built-in metrics, the manager recomputes the
+    score from that bundle and replaces inconsistent self-reported scores.
+    Task-native metrics and structured outputs remain under their declared evaluator.
+18. Before finalization, two or more unique, compatible prediction bundles enter
+    a deterministic cross-fitted blend. Search-pruned models remain ensemble-eligible,
+    duplicate predictions are removed, weights are regularized and must be non-trivial,
+    and the blend is used when it remains within an uncertainty-scaled robustness
+    tolerance of the strongest honest candidate.
+19. Eligible candidate nodes defer numeric CSV/TSV construction. The selected prediction
+    strategy is materialized and validated once at the run root; intermediate node
+    deliverables are removed after the final copy. Non-composable task-native outputs
+    retain the existing validated single-output fallback.
+20. On `--resume`, the persisted council brief is restored (including measured
+    baselines, with migration for older schema-v1 artifacts) and the tree is
+    audited for selected hypothesis IDs that never reached a full implementation
+    node. The audit is reported; missing full attempts are scheduled only when
+    `AIBUILDAI_REQUIRE_ALL_COUNCIL_ROOTS=1` disables the default exploration quota.
 
 Manager, planner, implementation-attempt, generated-program stdout/stderr,
 tuning, pruning, merging, promotion, web-repair, and finalization progress are
@@ -113,6 +137,47 @@ evidence. Bounded inputs are copied read-only; larger collections use allowliste
 links to avoid multiplying benchmark storage.
 The generated implementation still owns task-native training and output
 construction, but every search node shares the council's validation contract.
+
+## Task and output portability
+
+The inventory and implementation layers do not require classification or CSV.
+They support tabular, image, text/sequence, audio, mixed-modality, and unknown
+file collections; evaluation can be cross-validation, holdout, or task-native.
+Outputs can be files or directory bundles. CSV/TSV, JSON/JSONL, NumPy, images,
+archives, and common scientific text formats receive built-in checks.
+
+Two boundaries are intentionally explicit:
+
+- Search requires a finite scalar score with a known direction. For generation,
+  simulation, control, retrieval, structure construction, or optimization, the
+  supplied instructions/configuration must define a deterministic task-native
+  evaluator or measurable proxy. Otherwise the analyzer emits a contract warning
+  and reliable method ranking is not possible.
+- Unknown output formats are safety- and structure-checked, but domain semantics
+  cannot be inferred from a file extension. Supply a sample output and preferably
+  a `task_config.json` `output_contract`; register a domain validator when semantic
+  correctness (for example molecular/protein structure validity) must be proven.
+
+## Council artifacts and LLM context
+
+The JSON/JSONL files under `runs/<task>/council/` are an audit ledger, not a prompt
+bundle. Council construction uses each artifact only at the stage that needs it:
+preflight for member design, focused diagnostic plus relevant sources for each
+member, and member summaries/source index for the one-time chair synthesis.
+
+Downstream node calls never ingest every council artifact. They use valid-JSON,
+role-scoped views generated from `council_brief.json`:
+
+- search/ideation receives at most 6,000 characters containing the immutable
+  protocol, compact problem fingerprint, measured baselines, selected IDs, and
+  unresolved questions;
+- implementation receives at most 6,000 characters containing the active
+  hypothesis, its cited evidence/source claims, the protocol, and measured controls.
+
+Large unrelated evidence, full retrieved paper text, member reports, query audit,
+and research JSONL ledgers are excluded from per-node prompts. Context degradation
+removes optional sections while retaining valid JSON and the protocol hash; it
+never slices a JSON document mid-object.
 
 ## How the search flows
 
@@ -213,12 +278,20 @@ when a task has no labeled validation set, fold scores, or repeated seeds:
   noise standard deviations (default `2.0`).
 - `AIBUILDAI_COMPLEMENTARITY_WEIGHT` — how strongly decorrelated (vs. the
   incumbent) pending branches are favored (default `0.4`); `0` disables it.
+- `AIBUILDAI_UCB_EXPLORATION` — residual frontier exploration after probe ranking
+  and focused exploitation (default `0.35`).
 - `AIBUILDAI_DIVERSIFY_PROBE=0` disables the cheap-probe gate before full
   `diversify` runs (enabled by default). The model-family fingerprint guard is
   always on.
 - `AIBUILDAI_FINAL_ENSEMBLE=0` disables the final out-of-fold blending step
-  (enabled by default); it only runs for cross-validation protocols when two or
-  more measured nodes stored OOF predictions.
+  (enabled by default); it runs only when two or more unique prediction bundles
+  provide targets, aligned OOF/test rows, and a centrally supported metric.
+- `AIBUILDAI_MAX_TUNE_DEPTH` bounds tuning descendants per lineage (default `2`),
+  and `AIBUILDAI_EXPLOIT_ATTEMPTS` bounds focused top-candidate tuning (default
+  `40%` of the idea budget, rounded up).
+- `AIBUILDAI_REQUIRE_ALL_COUNCIL_ROOTS=1` opts out of successive halving and gives
+  every council-selected hypothesis a full attempt. By default, probes rank the
+  portfolio and only the exploration quota is promoted.
 - `AIBUILDAI_FINAL_VERIFY=0` disables re-running the winning program (or the
   final ensemble) during finalization.
 
@@ -286,14 +359,17 @@ Each `runs/<task>/` contains only:
   provenance, and a complete accepted/rejected query audit;
 - `node1`, `node2`, … directly under the run root. Planning-node folders contain
   `node_state.json`; implementation-node folders additionally contain
-  `algorithm.py`, `attempt_<n>.log`, the small `result.json`, inputs, and the
-  native deliverable. Council runs also include `evaluation_protocol.json` and a
+  `algorithm.py`, `attempt_<n>.log`, the small `result.json`, inputs, and reusable
+  evaluation evidence/checkpoints. Intermediate native deliverables are removed
+  after successful finalization. Council runs also include `evaluation_protocol.json` and a
   brief reference in every implementation node. Supervised nodes may store
-  `oof_predictions.npz` (out-of-fold and test prediction arrays) and a
+  `oof_predictions.npz` (OOF targets/predictions/indices/folds plus aligned test
+  predictions/indices) and a
   `prediction_signature` / `seed_scores` in `result.json`; these power
   complementarity-aware selection and the final ensemble, and their absence for
   other task types is expected.
 - `submission.csv` or `final_output/` from the selected node;
+- `ensemble_manifest.json` when deterministic numeric blending was used;
 - `results.md`: score, pruning, runtime, and token summary;
 - `tree_state.json`: compact final/progress tree state without source code,
   including new-idea budget and free-tuning counts;

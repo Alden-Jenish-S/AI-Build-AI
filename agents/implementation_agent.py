@@ -22,6 +22,7 @@ from runtime_utils import (
     verify_task_dir_unchanged,
 )
 from search_evidence import valid_signature
+from prediction_evidence import inspect_prediction_evidence
 
 from .council.contracts import CouncilBrief, EvaluationProtocol
 from .llm_utils import call_llm
@@ -241,6 +242,15 @@ def _metric_stdout_pattern(metric: str) -> str | None:
     return None
 
 
+def _metric_name_token(value: object) -> str:
+    """Canonical token for comparing metric names across write aliases.
+
+    Generated programs legitimately write ``log_loss`` while the council
+    protocol spells it ``log loss``; both must compare equal.
+    """
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").casefold())
+
+
 def _parse_stdout_score(stdout: str, pattern: str) -> float | None:
     matches = re.findall(
         rf"(?i){pattern}\s*[:=]\s*(-?\d+(?:\.\d+)?(?:e[+-]?\d+)?)",
@@ -256,12 +266,7 @@ def _parse_stdout_score(stdout: str, pattern: str) -> float | None:
 
 
 def _score_from_stdout(stdout: str, metric: str | None, direction: str) -> float | None:
-    """Extract the last plausible score from program output.
-
-    The task metric's own stdout pattern is preferred so that a training log
-    ending in ``loss: 0.33`` cannot replace an ``accuracy`` value, and loss-like
-    patterns are never used as scores for maximize tasks.
-    """
+    """Extract the last plausible score from program output."""
     if metric:
         metric_pattern = _metric_stdout_pattern(metric)
         if metric_pattern is not None:
@@ -302,6 +307,24 @@ def _env_enabled(name: str, *, default: bool) -> bool:
     if value is None:
         return default
     return value.strip().casefold() not in {"0", "false", "no", "off"}
+
+
+def _plan_requests_modality_ablation(plan: str | None) -> bool:
+    """Return whether this specific plan requests cross-modality controls."""
+    text = str(plan or "")
+    scope = re.search(
+        r"(?im)^\s*modality\s+scope\s*:\s*([a-z_ -]+)", text
+    )
+    if scope is not None:
+        normalized_scope = re.sub(
+            r"[^a-z]+", "_", scope.group(1).casefold()
+        ).strip("_")
+        return normalized_scope in {"fused_multimodal", "modality_ablation"}
+    normalized = " ".join(re.sub(r"[^a-z]+", " ", text.casefold()).split())
+    return any(
+        marker in normalized
+        for marker in ("leave one modality out", "full fusion", "modality contribution")
+    )
 
 
 
@@ -363,7 +386,7 @@ class ImplementationAgent:
                 errors.append(f"result.json is missing required field {field!r}")
         if str(payload.get("evaluation_protocol_hash", "")) != protocol.protocol_hash:
             errors.append("evaluation_protocol_hash does not match evaluation_protocol.json")
-        if str(payload.get("metric", "")).strip().casefold() != protocol.metric.strip().casefold():
+        if _metric_name_token(payload.get("metric")) != _metric_name_token(protocol.metric):
             errors.append(
                 f"reported metric {payload.get('metric')!r} does not match {protocol.metric!r}"
             )
@@ -501,7 +524,10 @@ class ImplementationAgent:
         runtime_paths = [f"input/{path}" for path in runtime_inventory]
         modality_inventory = predictive_modality_inventory(analysis.files)
         modalities = [str(item) for item in modality_inventory["modalities"]]
-        requires_modality_ablation = bool(modality_inventory["is_multimodal"])
+        requires_modality_ablation = bool(
+            modality_inventory["is_multimodal"]
+            and _plan_requests_modality_ablation(plan)
+        )
         displayed_paths: list[str] = []
         displayed_chars = 0
         for path in runtime_paths:
@@ -519,13 +545,20 @@ class ImplementationAgent:
         council = ""
         result_contract = (
             "At the end, write a small `result.json` object containing `score`, "
-            "`metric`, `direction`, `output`, and `diagnostics`."
+            "`metric`, `direction`, and `diagnostics`. Include `output` when a "
+            "task-native deliverable was materialized."
         )
         if council_brief is not None:
             protocol = council_brief.evaluation_protocol
+            hypothesis_match = re.search(
+                r"(?im)^\s*Hypothesis ID:\s*([A-Za-z0-9_.-]+)", plan
+            )
+            active_hypothesis_id = (
+                hypothesis_match.group(1) if hypothesis_match is not None else None
+            )
             council = f"""
 ML RESEARCH COUNCIL CONTRACT (authoritative):
-{council_brief.prompt_context(18000)}
+{council_brief.implementation_context(active_hypothesis_id, 6000)}
 
 Only the exact input paths listed below are exposed. Prohibited inputs are unavailable
 by design. Follow `evaluation_protocol.json` exactly; do not choose a different split,
@@ -534,7 +567,7 @@ protocol is invalid even if it is numerically better.
 """
             result_contract = (
                 "At the end, write `result.json` containing `score`, `metric`, `direction`, "
-                "`output`, `diagnostics`, `evaluation_protocol_hash`, `fold_scores`, and "
+                "`diagnostics`, `evaluation_protocol_hash`, `fold_scores`, and "
                 "`validation_sample_count`. Set `evaluation_protocol_hash` to "
                 f"`{protocol.protocol_hash}`. `fold_scores` must have exactly "
                 f"{protocol.folds} numeric value(s), and `validation_sample_count` must be positive."
@@ -591,6 +624,15 @@ MULTIMODAL CONTRIBUTION CONTRACT (mandatory):
 - Select the smallest modality subset within validation uncertainty of the best score.
    It is valid—and preferred when supported—for one modality to beat full fusion.
 """
+        plan_scope_contract = """
+PLAN-SCOPE CONTRACT (mandatory):
+- The implementation plan is the experiment boundary. Do not add model families,
+  modalities, fusion branches, or ablations that the plan did not request.
+- A `single_modality` plan must remain single-modality even when other predictive
+  inputs exist. Use only the modality named by its experiment/ablation text.
+- A fused or modality-ablation plan must run the contribution controls specified
+  by the multimodal contract.
+"""
         detected_modalities = ", ".join(modalities) if modalities else "none detected"
         modality_fidelity = f"""
 MODALITY FIDELITY CONTRACT (mandatory):
@@ -608,15 +650,42 @@ MODALITY FIDELITY CONTRACT (mandatory):
   model that table as if it were provided data.
 - Train and predict using only the files and modalities observed under `input/`.
 """
+        robustness_contract = """
+ROBUST CODE CONTRACT (mandatory):
+- DataLoader batches are lists of item tensors. If a dataset yields (features, label)
+  tuples, iterate `for features, labels in loader:` (or `features, labels = batch`)
+  and call `.to(device)` on the TENSORS only, never on the batch container.
+- If an estimator performs an internal stratified validation split (for example
+  sklearn's HistGradientBoostingClassifier with early_stopping=True), the split size
+  must be >= the number of classes, and its folds must be class-balanced; otherwise
+  disable early stopping or lower validation_fraction so every class still appears.
+- When datasets have many classes relative to samples, prefer CV splits and estimators
+  that always expose one probability column per class; pass `labels` explicitly to
+  log_loss and align all probability arrays to the full class order.
+- In isolated or spawn-based runtimes, construct PyTorch DataLoaders with
+  `num_workers=0` unless an in-process smoke test proved worker startup safe.
+  Repair any worker crash by falling back to zero workers.
+- Create the deliverable directory before writing to it (e.g., `os.makedirs(Path(<out_dir>).parent, exist_ok=True)`
+  or `os.makedirs(<out_dir>, exist_ok=True)` if writing a directory). Writing into a non-existent directory aborts at the final step.
+- Always save trained models/checkpoints to disk immediately after training. If the script is re-executed (e.g. due to an error at the end), load the saved checkpoint from disk instead of retraining to save compute.
+"""
         probe_contract = ""
         if probe:
             probe_contract = """
 PROBE MODE (cheap screening pass — mandatory):
 - This is a cheap screening run, not the final submission run. Keep the SAME split,
   metric, evaluation_protocol_hash, and deliverable schema as the plan, but bound the work:
-  * Tabular / in-memory data: cap the training rows at 30% (random subset) when a full fit is expensive.
+  * If subsampling ROWS: ALWAYS subsample per class (stratified), keeping at least
+    5 samples of EVERY class. With many classes (roughly >25) or fewer than a few
+    thousand rows, do NOT subsample rows at all; bound cost with model size and
+    iterations instead. A random subsample that silently drops whole classes is invalid.
   * Iterative learners (neural, boosting, RL): use roughly 30-40% of the iterations/epochs/episodes.
   * Cheap one-shot fits may simply run as-is.
+- CLASS ALIGNMENT (mandatory for classification): every evaluation must cover ALL classes.
+  Score with log_loss(..., labels=<full class range in label order>), size OOF and
+  test-probability arrays to the FULL class count, and never broadcast or average a
+  prediction matrix with fewer columns than classes. If a training fold lacks a class,
+  fix the sampling above; do not silently drop that class's column.
 - Do NOT tune. Record the honest screening score in result.json. Still write the requested deliverable.
 """
         abort_section = ""
@@ -643,14 +712,25 @@ TUNING SEARCH (mandatory):
 - Do not run a single hand-picked configuration and call it a search.
 """
         prediction_contract = """
-PREDICTION EVIDENCE (optional, task-dependent):
-- Supervised tasks with a labeled validation set: also save `oof_predictions.npz` in the node
-  directory with arrays `oof_pred` (predictions for the validation rows), `oof_index` (the
-  validation row indices), `test_pred` (predictions for all submission rows), and `test_index`
-  (submission row ids). Include `prediction_signature` in result.json: up to 2048 finite floats
-  sampling those predictions (strided or aggregated), always aligned to the same fixed validation rows.
-- Tasks without a labeled validation set (RL, control, generation, unsupervised) or where such
-  files are impractical: omit them entirely. Never invent labels or validation rows.
+PREDICTION EVIDENCE (capability-gated):
+- Supervised tasks with machine-readable validation predictions: save `oof_predictions.npz`
+  with arrays `oof_pred`, `oof_target`, `oof_index`, `oof_fold`, `test_pred`, and `test_index`.
+  `oof_target` must be the labels/targets in exactly the same row order as `oof_pred`; `oof_fold`
+  identifies the validation fold for every row. For probability matrices, encode `oof_target`
+  as integer column indices 0..K-1. Store indices as numeric or fixed-width Unicode arrays,
+  never pickle-dependent object arrays. Test predictions should be the average of the
+  same fold/seed models that produced OOF evidence, not an unrelated final holdout model.
+- Recompute the reported score from the exact `oof_pred` saved to disk. Hyperparameter-search
+  trial scores are not a substitute for the stored winning candidate's OOF score.
+- When the requested final output is a numeric CSV/TSV table and this complete evidence bundle
+  is available, this search node MUST omit `submission/` and set `output` to null; the manager
+  will materialize the one final deliverable after selection. Do not run a separate final-model
+  training phase merely to create a per-node submission.
+- Include `prediction_signature` in result.json: up to 2048 finite floats sampled from OOF
+  predictions and aligned to the fixed validation rows.
+- Tasks without labeled validation data, with task-native metrics, or with structured/non-numeric
+  outputs should omit prediction evidence and write their native deliverable normally. Never
+  invent targets, folds, or numeric predictions merely to use this path.
 - For holdout-style or task-native protocols, optionally report `seed_scores`: at least 2 finite
   scores from independent repeated-seed evaluations.
 """
@@ -713,17 +793,20 @@ CRITICAL RULES & AGENT REASONING WORKFLOW:
    e. Lightweight vs Heavy Models: Keep in mind that well-tailored compact models with custom modules, custom augmentations, or domain features often outperform heavy generic off-the-shelf models. Choose the optimal tradeoff for validation score and execution efficiency.
    f. If repairing a failed run or tuning, analyze the execution traceback, diagnose why it failed, and verify if fixing/tuning the current model will improve performance vs refactoring the approach.
    g. Outline your end-to-end data pipeline, validation split strategy, model training, and exact output generation.
-   h. If more than one modality data is available, test them individually before combined analysis. Also do not convert one modality to another. 
+   h. Follow the plan's declared modality scope exactly. Test modalities individually
+      before combination only for a fused or modality-ablation experiment.
 
 2. RUNTIME & SUBMISSION CONSTRAINTS:
-   - For your first debug attempt, aggressively subsample the training dataset (e.g. 5%) to quickly verify end-to-end execution without wasting GPU time on full training loops. You can scale to 100% data once the pipeline logic is proven to work.
+   - For your first debug attempt, verify end-to-end execution on a small data slice: subsample PER CLASS (at least 5 samples of every class, and never fewer rows than the class count) so no class disappears. Scale to full data once the pipeline logic is proven.
    - The program runs from an isolated node directory. Every approved task file is available under `input/<inventory path>`.
    - Do NOT hardcode file names or column names. Inspect actual files and dataframes dynamically at runtime from `input/`.
    - Treat `input/` as immutable: never write, rename, move, or delete files in `input/`.
    - Do not import repository-internal modules (`evaluation`, `contracts`, `agents`, `core`, `modalities`). Use standard installed Python packages only.
    - Choose an honest local validation strategy matching the metric ({analysis.metric} {analysis.direction}); when a council contract is present, its protocol is mandatory.
    - Bound memory and runtime. Include graceful fallbacks if optional hardware/accelerators are unavailable.
-   - Produce the exact requested deliverable under `submission/`. For sample CSV deliverables, preserve row order and exact column headers.
+   - Produce the exact requested deliverable under `submission/` unless the capability-gated
+     prediction-evidence contract explicitly permits this search node to defer it. For sample
+     CSV deliverables, preserve row order and exact column headers.
    - A task-provided sample output is a structural contract, regardless of its file type. Without a sample, native non-empty files or directory bundles are allowed.
    - The agent validates the produced artifact independently. A successful process or self-reported score cannot make an invalid output eligible.
    - Follow the RESULT/OUTPUT CONTRACT below exactly.
@@ -734,7 +817,7 @@ RESULT/OUTPUT CONTRACT (this execution):
 Implementation plan:
 {plan[:3000]}
 {parent}{companion}
-{architecture_contract}{modality_contract}{modality_fidelity}{probe_contract}{abort_section}{tune_contract}
+{architecture_contract}{plan_scope_contract}{modality_contract}{modality_fidelity}{robustness_contract}{probe_contract}{abort_section}{tune_contract}
 {repair}{research}
 
 3. OUTPUT FORMAT:
@@ -996,7 +1079,10 @@ Implementation plan:
             Path(task_dir), node_dir, allowed_paths=allowed_paths
         )
         modality_inventory = predictive_modality_inventory(task_analysis.files)
-        requires_modality_ablation = bool(modality_inventory["is_multimodal"])
+        requires_modality_ablation = bool(
+            modality_inventory["is_multimodal"]
+            and _plan_requests_modality_ablation(plan)
+        )
         self._log(display_name, f"Exposed {len(linked_inputs)} task files under input/.")
         task_input_snapshot = task_dir_snapshot(Path(task_dir))
         if hard_limit_seconds is None:
@@ -1240,6 +1326,20 @@ Implementation plan:
 
             output = self._output_path(node_dir)
             payload = self._read_result(node_dir)
+            oof_path = node_dir / "oof_predictions.npz"
+            prediction_evidence = (
+                inspect_prediction_evidence(oof_path, task_analysis.metric)
+                if oof_path.is_file()
+                else None
+            )
+            submission = task_analysis.submission or {}
+            deferred_table_output = bool(
+                prediction_evidence is not None
+                and prediction_evidence.blendable
+                and str(submission.get("kind") or "").casefold() == "table"
+                and str(submission.get("extension") or "").casefold()
+                in {".csv", ".tsv"}
+            )
             payload_status = payload.get("status")
             status = str(payload_status or "completed")
             if status not in {"completed", "truncated"}:
@@ -1269,7 +1369,22 @@ Implementation plan:
                 f"Attempt {attempt} exited {completed.returncode} after {completed.elapsed_seconds:.1f}s.",
             )
 
-            if completed.returncode == 0 and (output is not None or status == "truncated"):
+            if prediction_evidence is not None and not prediction_evidence.valid:
+                feedback = _tail(
+                    "Prediction evidence validation failed:\n- "
+                    + "\n- ".join(prediction_evidence.errors)
+                )
+                diagnostics.append(f"attempt {attempt}: {feedback}")
+                with (node_dir / f"attempt_{attempt}.log").open(
+                    "a", encoding="utf-8"
+                ) as stream:
+                    stream.write(f"\nPREDICTION EVIDENCE:\n{feedback}\n")
+                self._log(display_name, "Generated prediction evidence was invalid.")
+                continue
+
+            if completed.returncode == 0 and (
+                output is not None or deferred_table_output or status == "truncated"
+            ):
                 validation = None
                 if output is not None:
                     validation = self.submission_validator.validate(
@@ -1335,6 +1450,17 @@ Implementation plan:
                         )
                         continue
                 output = validation.output_path if output is not None else None
+                if deferred_table_output and output is not None:
+                    # A generated implementation may ignore the deferral prompt. Once its
+                    # reusable evidence and optional output have both been checked, retain
+                    # only the evidence so candidate nodes cannot accumulate submissions.
+                    submission_dir = node_dir / "submission"
+                    if submission_dir.is_dir():
+                        shutil.rmtree(submission_dir)
+                    root_submission = node_dir / "submission.csv"
+                    if root_submission.is_file():
+                        root_submission.unlink()
+                    output = None
                 reported_metric = str(payload.get("metric") or task_analysis.metric)
                 reported_direction = str(payload.get("direction") or task_analysis.direction)
                 payload_score = payload.get("score")
@@ -1361,8 +1487,24 @@ Implementation plan:
                         self._log(display_name, feedback)
                         continue
                     score = 1e30 if reported_direction == "minimize" else -1e30
-                self._log(display_name, f"Accepted runnable output {output}; score={score:.8g}.")
-                oof_path = node_dir / "oof_predictions.npz"
+                reported_score = score
+                if prediction_evidence is not None and prediction_evidence.centrally_scored:
+                    score = float(prediction_evidence.score)
+                    tolerance = max(1e-8, abs(score) * 1e-5)
+                    if abs(reported_score - score) > tolerance:
+                        message = (
+                            f"Central evidence audit replaced reported score {reported_score:.8g} "
+                            f"with {score:.8g} recomputed from saved OOF predictions."
+                        )
+                        diagnostics.append(message)
+                        self._log(display_name, message)
+                accepted_artifact = (
+                    str(output) if output is not None else str(oof_path)
+                )
+                self._log(
+                    display_name,
+                    f"Accepted runnable candidate artifact {accepted_artifact}; score={score:.8g}.",
+                )
                 test_pred_path = node_dir / "test_predictions.npz"
                 return {
                     "status": status,
@@ -1370,6 +1512,7 @@ Implementation plan:
                     "metric": reported_metric,
                     "direction": reported_direction,
                     "output": str(output) if output is not None else None,
+                    "reported_score": reported_score,
                     "diagnostics": "\n\n".join(diagnostics)[-10000:],
                     "attempts": attempt,
                     "operator": operator,
@@ -1381,7 +1524,13 @@ Implementation plan:
                         if council_brief is not None
                         else None
                     ),
-                    "fold_scores": payload.get("fold_scores"),
+                    "fold_scores": (
+                        prediction_evidence.fold_scores
+                        if prediction_evidence is not None
+                        and prediction_evidence.centrally_scored
+                        and prediction_evidence.fold_scores
+                        else payload.get("fold_scores")
+                    ),
                     "validation_sample_count": payload.get("validation_sample_count"),
                     "modality_ablation_scores": payload.get(
                         "modality_ablation_scores"
@@ -1389,6 +1538,11 @@ Implementation plan:
                     "prediction_signature": payload.get("prediction_signature"),
                     "seed_scores": payload.get("seed_scores"),
                     "oof_predictions": str(oof_path) if oof_path.is_file() else None,
+                    "prediction_evidence": (
+                        prediction_evidence.summary()
+                        if prediction_evidence is not None
+                        else None
+                    ),
                     "test_predictions": (
                         str(test_pred_path) if test_pred_path.is_file() else None
                     ),

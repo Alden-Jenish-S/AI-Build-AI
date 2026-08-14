@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -229,6 +230,28 @@ def _clean_member_id(value: object, index: int) -> str:
     return normalized[:40] or f"member_{index}"
 
 
+def _rank_measured_baselines(
+    baselines: list[dict[str, Any]], direction: str
+) -> list[dict[str, Any]]:
+    """Return valid measurements with the strongest task score first."""
+    valid: list[dict[str, Any]] = []
+    for baseline in baselines:
+        try:
+            score = float(baseline.get("score"))
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(score):
+            continue
+        item = dict(baseline)
+        item["score"] = score
+        valid.append(item)
+    return sorted(
+        valid,
+        key=lambda item: float(item["score"]),
+        reverse=direction != "minimize",
+    )
+
+
 class CouncilCoordinator:
     """Coordinate independent investigators around a shared evidence ledger."""
 
@@ -250,6 +273,77 @@ class CouncilCoordinator:
     @staticmethod
     def _log(message: str) -> None:
         print(f"MLResearchCouncil: {message}", flush=True)
+
+    @staticmethod
+    def _read_json(path: Path) -> dict[str, Any] | None:
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        return dict(value) if isinstance(value, Mapping) else None
+
+    @staticmethod
+    def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return records
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, Mapping):
+                records.append(dict(value))
+        return records
+
+    @staticmethod
+    def _cached_investigation(
+        member_id: str,
+        council_dir: Path,
+        analysis: TaskAnalysis,
+    ) -> dict[str, Any] | None:
+        work_dir = Path(council_dir) / "work" / member_id
+        result_path = work_dir / "analysis_result.json"
+        try:
+            if result_path.stat().st_size > 1_000_000:
+                return None
+            payload = json.loads(result_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        required = {
+            "question", "method", "findings", "limitations", "suggested_next_questions"
+        }
+        if not isinstance(payload, dict) or not required.issubset(payload):
+            return None
+        baseline = payload.get("measured_baseline")
+        if isinstance(baseline, dict):
+            try:
+                score = float(baseline.get("score"))
+            except (TypeError, ValueError):
+                payload.pop("measured_baseline", None)
+            else:
+                if not math.isfinite(score):
+                    payload.pop("measured_baseline", None)
+                else:
+                    baseline["score"] = score
+                    baseline["metric"] = analysis.metric
+                    baseline["direction"] = analysis.direction
+                    baseline["source"] = member_id
+        return {
+            "member_id": member_id,
+            "status": "completed",
+            "script": str(work_dir / "diagnostic.py"),
+            "result": payload,
+            "elapsed_seconds": 0.0,
+            "attempts": 0,
+            "input_exposure": "reused_checkpoint",
+            "approved_input_bytes": 0,
+            "reused": True,
+        }
 
     def _design_members(
         self, analysis: TaskAnalysis, diagnostics: Mapping[str, Any]
@@ -533,6 +627,11 @@ Define one fixed validation protocol for every candidate. The split must respect
 observed entity, group, temporal, spatial, or source dependency. Choose cross-validation
 only when its cost and independence assumptions are credible. Use metric
 {analysis.metric!r} with direction {analysis.direction!r}.
+If no label-based split is meaningful (generation, simulation, control, structure
+construction, retrieval, optimization, or an external/task-native evaluator), choose
+`task_native`; never invent classification folds merely to satisfy the schema. A
+task-native protocol must name the deterministic local evaluator or measurable proxy,
+and unresolved evaluator semantics must remain an explicit warning.
 
 Problem fingerprint:
 {_bounded_json(fingerprint, 10000)}
@@ -567,12 +666,19 @@ Member reports:
     ) -> CouncilBrief:
         protocol = EvaluationProtocol.from_mapping(
             {
-                "mode": "cross_validation" if analysis.metric != "task score" else "holdout",
+                "mode": "cross_validation" if analysis.metric != "task score" else "task_native",
                 "folds": 5,
                 "seed": 42,
-                "split_strategy": "deterministic stratified or dependency-aware split after inspecting labels",
+                "split_strategy": (
+                    "deterministic stratified or dependency-aware split after inspecting labels"
+                    if analysis.metric != "task score"
+                    else "deterministic task-native evaluation defined by the supplied instructions"
+                ),
                 "leakage_unit": "sample or discovered group/entity",
-                "rationale": "Council synthesis was degraded; use a conservative shared protocol.",
+                "rationale": (
+                    "Council synthesis was degraded; use a conservative shared protocol. "
+                    "Do not invent supervised folds when the task exposes only a native evaluator."
+                ),
             },
             metric=analysis.metric,
             direction=analysis.direction,
@@ -647,9 +753,8 @@ Member reports:
         diagnostics_dir.mkdir(parents=True, exist_ok=True)
         research_sources_path = council_dir / "research_sources.jsonl"
         query_audit_path = council_dir / "query_audit.jsonl"
-        research_sources_path.write_text("", encoding="utf-8")
-        query_audit_path.write_text("", encoding="utf-8")
         warnings: list[str] = []
+        stored_fingerprint = self._read_json(council_dir / "problem_fingerprint.json")
         try:
             diagnostics, allowed, prohibited = collect_base_diagnostics(analysis)
         except Exception as exc:
@@ -665,6 +770,10 @@ Member reports:
                 f"Bounded preflight failed: {type(exc).__name__}: {exc}"
             )
         fingerprint = build_problem_fingerprint(analysis, diagnostics)
+        reuse_checkpoint = stored_fingerprint == fingerprint
+        if not reuse_checkpoint:
+            research_sources_path.write_text("", encoding="utf-8")
+            query_audit_path.write_text("", encoding="utf-8")
         (diagnostics_dir / "preflight.json").write_text(
             json.dumps(diagnostics, indent=2, ensure_ascii=False, default=str) + "\n",
             encoding="utf-8",
@@ -674,8 +783,16 @@ Member reports:
             encoding="utf-8",
         )
         try:
-            self._log("Designing evidence-gap-specific member mandates.")
-            design = self._design_members(analysis, diagnostics)
+            design = (
+                self._read_json(council_dir / "council_design.json")
+                if reuse_checkpoint
+                else None
+            )
+            if not design or not isinstance(design.get("members"), list):
+                self._log("Designing evidence-gap-specific member mandates.")
+                design = self._design_members(analysis, diagnostics)
+            else:
+                self._log("Reusing the checkpointed council design.")
             members = list(design["members"])
             (council_dir / "council_design.json").write_text(
                 json.dumps(design, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
@@ -702,32 +819,39 @@ Member reports:
         audit: list[dict[str, Any]] = []
         if self.enable_web:
             try:
-                self._log("Planning multiple de-identified primary-literature searches.")
-                research_requests = self._research_plan(fingerprint, members)
-                (council_dir / "research_plan.json").write_text(
-                    json.dumps(
-                        {"requests": research_requests},
-                        indent=2,
-                        ensure_ascii=False,
-                        default=str,
-                    )
-                    + "\n",
-                    encoding="utf-8",
-                )
-                retriever = ResearchRetriever(
-                    analysis.task_name,
-                    council_dir,
-                    forbidden_terms=self._protected_terms(analysis),
-                )
-                if retriever.openalex_enabled:
+                sources = self._read_jsonl(research_sources_path) if reuse_checkpoint else []
+                audit = self._read_jsonl(query_audit_path) if reuse_checkpoint else []
+                if sources and (council_dir / "research_plan.json").is_file():
                     self._log(
-                        "Literature provider: OpenAlex (API key detected; secret redaction enabled)."
+                        f"Reusing {len(sources)} checkpointed research sources."
                     )
                 else:
-                    self._log(
-                        "OpenAlex disabled: OPENALEX_API_KEY was not found; using bounded web fallbacks."
+                    self._log("Planning multiple de-identified primary-literature searches.")
+                    research_requests = self._research_plan(fingerprint, members)
+                    (council_dir / "research_plan.json").write_text(
+                        json.dumps(
+                            {"requests": research_requests},
+                            indent=2,
+                            ensure_ascii=False,
+                            default=str,
+                        )
+                        + "\n",
+                        encoding="utf-8",
                     )
-                sources, audit = retriever.collect(research_requests)
+                    retriever = ResearchRetriever(
+                        analysis.task_name,
+                        council_dir,
+                        forbidden_terms=self._protected_terms(analysis),
+                    )
+                    if retriever.openalex_enabled:
+                        self._log(
+                            "Literature provider: OpenAlex (API key detected; secret redaction enabled)."
+                        )
+                    else:
+                        self._log(
+                            "OpenAlex disabled: OPENALEX_API_KEY was not found; using bounded web fallbacks."
+                        )
+                    sources, audit = retriever.collect(research_requests)
                 if not sources:
                     warnings.append("No primary literature source survived query and provenance checks.")
             except Exception as exc:
@@ -754,9 +878,28 @@ Member reports:
 
         investigations: dict[str, dict[str, Any]] = {}
         if self.enable_generated_diagnostics:
-            self._log(f"Running {len(members)} focused local diagnostic investigations.")
+            if reuse_checkpoint:
+                for member in members:
+                    member_id = str(member["member_id"])
+                    cached = self._cached_investigation(
+                        member_id, council_dir, analysis
+                    )
+                    if cached is not None:
+                        investigations[member_id] = cached
+            pending_members = [
+                member
+                for member in members
+                if str(member["member_id"]) not in investigations
+            ]
+            if investigations:
+                self._log(
+                    f"Reusing {len(investigations)} completed diagnostic checkpoint(s)."
+                )
+            self._log(
+                f"Running {len(pending_members)} remaining focused local diagnostic investigation(s)."
+            )
             runner = DiagnosticScriptRunner(self.python, self.model_name)
-            with ThreadPoolExecutor(max_workers=min(4, len(members))) as pool:
+            with ThreadPoolExecutor(max_workers=max(1, min(4, len(pending_members)))) as pool:
                 future_map = {
                     pool.submit(
                         runner.run,
@@ -767,7 +910,7 @@ Member reports:
                         council_dir,
                         allowed,
                     ): str(member["member_id"])
-                    for member in members
+                    for member in pending_members
                 }
                 for future in as_completed(future_map):
                     member_id = future_map[future]
@@ -779,6 +922,17 @@ Member reports:
                             "status": "worker_failed",
                             "error": f"{type(exc).__name__}: {exc}",
                         }
+            failed_members = [
+                member_id
+                for member_id, result in investigations.items()
+                if result.get("status") != "completed"
+            ]
+            if failed_members:
+                warnings.append(
+                    "Focused diagnostics failed after bounded repair for: "
+                    + ", ".join(sorted(failed_members))
+                    + ". The chair must treat their conclusions as unresolved."
+                )
         else:
             warnings.append("Generated diagnostics were disabled; only the bounded preflight was used.")
 
@@ -838,13 +992,14 @@ Member reports:
                     "mode": (
                         "cross_validation"
                         if analysis.metric != "task score"
-                        else "holdout"
+                        else "task_native"
                     ),
                     "folds": 5,
                     "seed": 42,
                     "split_strategy": (
-                        "deterministic stratified or dependency-aware split after "
-                        "inspecting labels"
+                        "deterministic stratified or dependency-aware split after inspecting labels"
+                        if analysis.metric != "task score"
+                        else "deterministic task-native evaluation defined by supplied instructions"
                     ),
                     "leakage_unit": "sample or discovered group/entity",
                     "rationale": (
@@ -1066,6 +1221,26 @@ Member reports:
             )
             if promoted_architecture or promoted_modality:
                 recommended_roots = max(2, recommended_roots)
+                
+            measured_baselines = []
+            for member_id, investigation in sorted(investigations.items()):
+                payload = (
+                    investigation.get("result", {})
+                    if isinstance(investigation, dict)
+                    else {}
+                )
+                if isinstance(payload, dict) and "measured_baseline" in payload:
+                    baseline = dict(payload["measured_baseline"])
+                    # Preserve enough experimental detail for a later root to
+                    # reproduce the measurement instead of guessing a pipeline
+                    # from only a model-family label.
+                    baseline.setdefault("diagnostic_method", payload.get("method", ""))
+                    baseline.setdefault("source", member_id)
+                    measured_baselines.append(baseline)
+            measured_baselines = _rank_measured_baselines(
+                measured_baselines, analysis.direction
+            )
+                    
             brief = CouncilBrief(
                 task_name=analysis.task_name,
                 status="degraded" if warnings else "completed",
@@ -1090,6 +1265,7 @@ Member reports:
                         for member_id, result in sorted(investigations.items())
                     ],
                 ],
+                measured_baselines=measured_baselines,
                 sources=sources,
                 member_reports=reports,
                 hypotheses=hypotheses,

@@ -6,6 +6,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import numpy as np
+
 from agents.aggregator_agent import AggregatorAgent
 from agents.implementation_agent import ImplementationAgent
 from agents.manager_agent import ManagerAgent
@@ -256,6 +258,95 @@ class SubmissionValidatorTests(unittest.TestCase):
             (self.node / "attempt_1.log").read_text(encoding="utf-8"),
         )
 
+    def test_verified_numeric_candidate_can_defer_submission(self) -> None:
+        submission = self.write_sample_csv(
+            "id,class_0,class_1\na,0.5,0.5\nb,0.5,0.5\n"
+        )
+        analysis = self.analysis(submission=submission)
+        analysis.metric = "log loss"
+        analysis.direction = "minimize"
+
+        def execute(_command, *, cwd: Path, **_kwargs):
+            cwd = Path(cwd)
+            (cwd / "submission").mkdir()
+            (cwd / "submission" / "submission.csv").write_text(
+                "id,class_0,class_1\na,0.7,0.3\nb,0.4,0.6\n",
+                encoding="utf-8",
+            )
+            np.savez_compressed(
+                cwd / "oof_predictions.npz",
+                oof_pred=np.asarray([[0.8, 0.2], [0.2, 0.8]]),
+                oof_target=np.asarray([0, 1]),
+                oof_index=np.asarray([0, 1]),
+                oof_fold=np.asarray([0, 1]),
+                test_pred=np.asarray([[0.7, 0.3], [0.4, 0.6]]),
+                test_index=np.asarray(["a", "b"]),
+            )
+            (cwd / "result.json").write_text(
+                json.dumps(
+                    {
+                        "score": 0.9,
+                        "metric": "log loss",
+                        "direction": "minimize",
+                        "output": "submission/submission.csv",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return SupervisedProcessResult(
+                args=("python", "algorithm.py"),
+                returncode=0,
+                stdout="score=0.9\n",
+                stderr="",
+                elapsed_seconds=0.01,
+                stalled=False,
+                hard_limit_reached=False,
+                termination_reason=None,
+                progress_events=1,
+                last_progress_source="process_output",
+                last_progress_age_seconds=0.0,
+            )
+
+        generated_code = "\n".join(
+            ["from pathlib import Path", "# generated implementation"]
+            + [f"VALUE_{index} = {index}" for index in range(20)]
+        )
+        agent = ImplementationAgent(submission_validator=self.validator)
+        with (
+            patch("agents.implementation_agent.call_llm", return_value=generated_code),
+            patch("agents.implementation_agent.run_supervised_process", side_effect=execute),
+        ):
+            result = agent.run(
+                self.node,
+                "write prediction evidence",
+                self.task,
+                analysis,
+                max_debug_attempts=1,
+                stall_seconds=1,
+            )
+        self.assertEqual("completed", result["status"])
+        self.assertIsNone(result["output"])
+        self.assertAlmostEqual(result["score"], -np.log(0.8))
+        self.assertTrue(result["prediction_evidence"]["centrally_scored"])
+        self.assertFalse((self.node / "submission").exists())
+
+    def test_deferred_table_materializer_aligns_identifiers(self) -> None:
+        submission = self.write_sample_csv(
+            "id,class_0,class_1\na,0.5,0.5\nb,0.5,0.5\n"
+        )
+        manager = object.__new__(ManagerAgent)
+        manager.task_dir = self.task
+        manager.task_analysis = self.analysis(submission=submission)
+        output = manager._materialize_prediction_table(
+            np.asarray([[0.2, 0.8], [0.7, 0.3]]),
+            np.asarray(["b", "a"]),
+            self.node,
+        )
+        self.assertEqual(
+            "id,class_0,class_1\na,0.7,0.3\nb,0.2,0.8\n",
+            output.read_text(encoding="utf-8"),
+        )
+
     def test_winner_is_revalidated_before_final_materialization(self) -> None:
         submission = self.write_sample_csv()
         run_root = self.root / "run"
@@ -285,6 +376,7 @@ class SubmissionValidatorTests(unittest.TestCase):
         output.write_text("id,prediction\na,0.2\nb,0.8\n", encoding="utf-8")
         self.assertTrue(manager.generate_final_submission("node1"))
         self.assertTrue((run_root / "submission.csv").is_file())
+        self.assertFalse(output.exists())
 
     def test_task_analyzer_discovers_non_csv_sample_output(self) -> None:
         (self.task / "sample_output.json").write_text('{"predictions": []}', encoding="utf-8")
@@ -293,6 +385,37 @@ class SubmissionValidatorTests(unittest.TestCase):
         self.assertIsNotNone(analysis.submission)
         self.assertEqual("sample_output.json", analysis.submission["path"])
         self.assertIn("matching the observed sample output", analysis.expected_output)
+
+    def test_task_analyzer_does_not_convert_tsv_output_contract_to_csv(self) -> None:
+        (self.task / "sample_output.tsv").write_text(
+            "id\tprediction\na\t0.5\n", encoding="utf-8"
+        )
+        analysis = TaskAnalyzer().analyze(self.task)
+        self.assertEqual(".tsv", analysis.submission["extension"])
+        self.assertIn("`.tsv`", analysis.expected_output)
+        self.assertNotIn("submission.csv", analysis.expected_output)
+
+    def test_task_analyzer_surfaces_ambiguous_metric_and_output_contracts(self) -> None:
+        (self.task / "README.md").write_text(
+            "Generate a biologically plausible protein candidate.", encoding="utf-8"
+        )
+        analysis = TaskAnalyzer().analyze(self.task)
+        self.assertEqual("task score", analysis.metric)
+        self.assertTrue(any("scalar metric" in item for item in analysis.contract_warnings))
+        self.assertTrue(any("structural validation" in item for item in analysis.contract_warnings))
+        self.assertIn("Contract warnings", analysis.report)
+
+    def test_task_analyzer_recognizes_structure_metric_and_sample_output(self) -> None:
+        (self.task / "README.md").write_text(
+            "Predict the protein structure; evaluation uses RMSD.", encoding="utf-8"
+        )
+        (self.task / "sample_output.pdb").write_text(
+            "ATOM      1  CA  GLY A   1       0.0 0.0 0.0\n", encoding="utf-8"
+        )
+        analysis = TaskAnalyzer().analyze(self.task)
+        self.assertEqual("RMSD", analysis.metric)
+        self.assertEqual("minimize", analysis.direction)
+        self.assertEqual("sample_output.pdb", analysis.submission["path"])
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import json
+import math
 from typing import Any, TYPE_CHECKING
 
 from .architecture_policy import classify_architecture
@@ -17,7 +18,16 @@ if TYPE_CHECKING:
 
 def _plan_requests_modality_ablation(plan: str | None) -> bool:
     """Detect a modality-contribution request without relying on literal markers."""
-    normalized = re.sub(r"[^a-z]+", " ", str(plan or "").casefold())
+    text = str(plan or "")
+    scope = re.search(
+        r"(?im)^\s*modality\s+scope\s*:\s*([a-z_ -]+)", text
+    )
+    if scope is not None:
+        normalized_scope = re.sub(
+            r"[^a-z]+", "_", scope.group(1).casefold()
+        ).strip("_")
+        return normalized_scope in {"fused_multimodal", "modality_ablation"}
+    normalized = re.sub(r"[^a-z]+", " ", text.casefold())
     normalized = " ".join(normalized.split())
     if "modality scope modality ablation" in normalized:
         return True
@@ -61,15 +71,64 @@ class TechniqueAgent:
         if self.council_brief is None:
             return ""
         return (
-            "\n\n# ML Research Council brief (authoritative pre-search evidence)\n"
-            + self.council_brief.prompt_context(max_chars)
+            "\n\n# ML Research Council search context (role-scoped)\n"
+            + self.council_brief.search_context(min(max_chars, 6000))
         )
 
     def _portfolio_plans(self, count: int) -> list[str]:
         if self.council_brief is None:
             return []
         plans: list[str] = []
-        for hypothesis in self.council_brief.selected_portfolio[:count]:
+        measured: list[dict[str, Any]] = []
+        for baseline in getattr(self.council_brief, "measured_baselines", []):
+            try:
+                score_value = float(baseline.get("score"))
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(score_value):
+                measured.append(dict(baseline, score=score_value))
+        measured.sort(
+            key=lambda item: float(item["score"]),
+            reverse=self.council_brief.evaluation_protocol.direction != "minimize",
+        )
+        # One globally strongest measured control is mandatory evidence. Multiple
+        # investigators may report baselines, but weaker controls must not crowd
+        # selected hypotheses out of the executable portfolio.
+        for baseline in measured[:1]:
+            if count <= 0:
+                break
+            family = baseline.get("model_family", "unknown")
+            score = baseline.get("score", "unknown")
+            metric = baseline.get("metric", "unknown")
+            source = re.sub(
+                r"[^a-z0-9]+", "_", str(baseline.get("source") or family).casefold()
+            ).strip("_") or "control"
+            plan = "\n".join(
+                (
+                    f"Hypothesis ID: H_measured_baseline_{source}",
+                    f"Research direction: reproduce the measured {family} score {score} under the fixed evaluation protocol, then improve it",
+                    f"Model family or representation: {family}",
+                    "Architecture track: conventional",
+                    f"Architecture specification: Baseline reproduction of {baseline.get('model', 'unknown')}",
+                    f"Novelty/value test: Exceed baseline score of {score} {metric}",
+                    "Modality scope: not_applicable",
+                    "Modality ablation: ",
+                    "Evidence-backed rationale: A diagnostic measurement established this baseline.",
+                    f"First experiment: Replicate {family} baseline and verify score. Diagnostic method: {baseline.get('diagnostic_method', '')}",
+                    f"Expected signal: Attain at least {score} {metric}.",
+                    "Estimated cost: low",
+                    f"Risks: Overfitting to the baseline model. Diagnostic limitations: {baseline.get('limitations', '')}",
+                    "Stopping rule: Halt if baseline cannot be reproduced.",
+                    f"Council brief hash: {self.council_brief.brief_hash}",
+                    f"Evaluation protocol hash: {self.council_brief.evaluation_protocol.protocol_hash}",
+                    "Implement this discriminating experiment using only council-approved inputs. "
+                    "Preserve the fixed evaluation protocol and report fold-level evidence.",
+                )
+            )
+            plans.append(plan)
+            count -= 1
+
+        for hypothesis in self.council_brief.selected_portfolio[: max(0, count)]:
             plan = "\n".join(
                 (
                     f"Hypothesis ID: {hypothesis.get('hypothesis_id', 'unknown')}",
@@ -590,6 +649,7 @@ class TechniqueAgent:
         experiments_remaining: int,
         plateau_state: dict[str, Any] | None = None,
         architecture_coverage: dict[str, Any] | None = None,
+        measured_baselines: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """
         Analyze current tree search state and executed results, then use LLM to decide
@@ -610,10 +670,12 @@ class TechniqueAgent:
             architecture_track = n.get("architecture_track", "other")
             modality_evidence = n.get("modality_ablation_scores")
             plan_summary = n.get("plan_summary", "")
+            is_probe = n.get("probe", False)
+            probe_label = " [screening probe — may use reduced data; weak evidence]" if is_probe else ""
             is_best = " [BEST SCORE SO FAR]" if nid == best_node_id else ""
             score_str = f"{score:.5f}" if score is not None else "failed"
             history_lines.append(
-                f"- Node '{nid}' ({ntype}, operator='{op}', architecture_track='{architecture_track}', status='{status}'): score={score_str}{is_best}. Modality evidence: {json.dumps(modality_evidence, default=str)[:900] if modality_evidence else 'none'}. Plan summary: {plan_summary}"
+                f"- Node '{nid}' ({ntype}, operator='{op}', architecture_track='{architecture_track}', status='{status}'){probe_label}: score={score_str}{is_best}. Modality evidence: {json.dumps(modality_evidence, default=str)[:900] if modality_evidence else 'none'}. Plan summary: {plan_summary}"
             )
 
         history_text = "\n".join(history_lines) if history_lines else "No executed nodes yet."
@@ -645,9 +707,20 @@ class TechniqueAgent:
 
         web_section = f"\n# Web Search Discovery Insights for Task\n{web_insights}\n" if web_insights else ""
 
+        baselines_text = ""
+        if measured_baselines:
+            baselines_text = "\n# Measured Baselines (Diagnostic Ground Truth)\n"
+            for mb in measured_baselines:
+                family = mb.get("model_family", "unknown")
+                score = mb.get("score", "unknown")
+                metric = mb.get("metric", "unknown")
+                baselines_text += f"- {family} achieved {score} {metric}.\n"
+            baselines_text += "Consider these baselines as the incumbent models. Your generated architectures should aim to beat them.\n"
+
         prompt = (
             f"{analysis.prompt_context(10000)}\n\n"
             f"{self._council_context(8000)}\n\n"
+            f"{baselines_text}"
             f"# Execution History\n"
             f"Metric: {analysis.metric} ({analysis.direction})\n"
             f"Best Score so far: {best_score if best_score is not None else 'N/A'} (Node: {best_node_id})\n"

@@ -6,6 +6,7 @@ import ast
 import csv
 import importlib.util
 import json
+import logging
 import math
 import os
 import re
@@ -305,6 +306,9 @@ def _resource_inventory() -> dict[str, Any]:
         "librosa",
         "soundfile",
         "optuna",
+        "PIL",
+        "imageio",
+        "pyarrow",
     )
     memory_bytes = None
     try:
@@ -432,25 +436,26 @@ def collect_base_diagnostics(
     return diagnostics, allowed, prohibited
 
 
-_ALLOWED_IMPORT_ROOTS = {
+_SAFE_STDLIB_ROOTS = {
+    "os",
+    "sys",
+    "time",
+    "datetime",
+    "warnings",
+    "functools",
+    "operator",
+    "typing",
+    "contextlib",
     "collections",
-    "csv",
-    "hashlib",
-    "imageio",
     "itertools",
-    "json",
     "math",
-    "numpy",
-    "pandas",
-    "pathlib",
-    "PIL",
-    "pyarrow",
-    "random",
-    "re",
-    "scipy",
-    "sklearn",
-    "soundfile",
     "statistics",
+    "hashlib",
+    "json",
+    "csv",
+    "re",
+    "random",
+    "pathlib",
 }
 _DISALLOWED_CALL_NAMES = {
     "compile",
@@ -498,21 +503,121 @@ def _python_source(response: str) -> str:
     return re.sub(r"(?s)<thinking>.*?</thinking>", "", response).strip() + "\n"
 
 
-def validate_diagnostic_script(source: str) -> list[str]:
+def validate_diagnostic_script(source: str, available_packages: list[str] | None = None) -> list[str]:
     errors: list[str] = []
+    
+    allowed_roots = set(_SAFE_STDLIB_ROOTS)
+    if available_packages:
+        allowed_roots.update(available_packages)
+    else:
+        # Fallback if no packages are provided
+        allowed_roots.update({
+            "numpy", "pandas", "scipy", "sklearn", "PIL", "imageio", "soundfile", "pyarrow", "torch", "lightgbm"
+        })
+
     try:
         tree = ast.parse(source)
     except SyntaxError as exc:
         return [f"invalid Python syntax: {exc}"]
+    assignments: dict[str, list[ast.AST]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            value = node.value
+            if value is None:
+                continue
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    assignments.setdefault(target.id, []).append(value)
+
+    def safe_output_target(node: ast.AST | None, seen: set[str] | None = None) -> bool:
+        if isinstance(node, ast.Constant):
+            return node.value == "analysis_result.json"
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "Path"
+            and len(node.args) == 1
+        ):
+            return safe_output_target(node.args[0], seen)
+        if isinstance(node, ast.Name):
+            visited = set(seen or ())
+            if node.id in visited:
+                return False
+            visited.add(node.id)
+            values = assignments.get(node.id, [])
+            return bool(values) and all(safe_output_target(value, visited) for value in values)
+        return False
+
+    class ResourceBoundVisitor(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.loop_depth = 0
+
+        def visit_For(self, node: ast.For) -> None:
+            self.loop_depth += 1
+            self.generic_visit(node)
+            self.loop_depth -= 1
+
+        visit_AsyncFor = visit_For
+
+        def visit_While(self, node: ast.While) -> None:
+            self.loop_depth += 1
+            self.generic_visit(node)
+            self.loop_depth -= 1
+
+        def visit_Call(self, node: ast.Call) -> None:
+            name = (
+                node.func.id
+                if isinstance(node.func, ast.Name)
+                else node.func.attr
+                if isinstance(node.func, ast.Attribute)
+                else ""
+            )
+            if name in {"GridSearchCV", "RandomizedSearchCV"}:
+                errors.append(
+                    f"{name} is too open-ended for a bounded council diagnostic"
+                )
+            if name in {"cross_val_score", "cross_validate"} and self.loop_depth:
+                errors.append(
+                    f"{name} cannot run inside a loop; bound the diagnostic to at most "
+                    "two model configurations on one shared split/fold set"
+                )
+            if name == "fit" and self.loop_depth >= 3:
+                errors.append(
+                    "model fitting inside three nested loops is too expensive for a council "
+                    "diagnostic; flatten the comparison to at most 20 total fits"
+                )
+            for keyword in node.keywords:
+                if keyword.arg == "n_jobs":
+                    value: object = None
+                    if isinstance(keyword.value, ast.Constant):
+                        value = keyword.value.value
+                    elif (
+                        isinstance(keyword.value, ast.UnaryOp)
+                        and isinstance(keyword.value.op, ast.USub)
+                        and isinstance(keyword.value.operand, ast.Constant)
+                    ):
+                        try:
+                            value = -keyword.value.operand.value
+                        except TypeError:
+                            value = "dynamic"
+                    else:
+                        value = "dynamic"
+                    if value not in {None, 0, 1}:
+                        errors.append("council diagnostics must use n_jobs=1")
+            self.generic_visit(node)
+
+    ResourceBoundVisitor().visit(tree)
+
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             roots = {alias.name.split(".", 1)[0] for alias in node.names}
-            blocked = roots - _ALLOWED_IMPORT_ROOTS
+            blocked = roots - allowed_roots
             if blocked:
                 errors.append("disallowed import(s): " + ", ".join(sorted(blocked)))
         elif isinstance(node, ast.ImportFrom):
             root = str(node.module or "").split(".", 1)[0]
-            if not root or root not in _ALLOWED_IMPORT_ROOTS:
+            if not root or root not in allowed_roots:
                 errors.append(f"disallowed import: {node.module!r}")
         elif isinstance(node, ast.Call):
             if isinstance(node.func, ast.Name) and node.func.id in _DISALLOWED_CALL_NAMES:
@@ -528,14 +633,7 @@ def validate_diagnostic_script(source: str) -> list[str]:
                 and node.func.attr.casefold() in {"write_text", "write_bytes"}
             ):
                 owner = node.func.value
-                safe_output = (
-                    isinstance(owner, ast.Call)
-                    and isinstance(owner.func, ast.Name)
-                    and owner.func.id == "Path"
-                    and owner.args
-                    and isinstance(owner.args[0], ast.Constant)
-                    and owner.args[0].value == "analysis_result.json"
-                )
+                safe_output = safe_output_target(owner)
                 if not safe_output:
                     errors.append(
                         f"{node.func.attr} is allowed only on Path('analysis_result.json')"
@@ -559,18 +657,12 @@ def validate_diagnostic_script(source: str) -> list[str]:
                 if isinstance(mode, str) and any(flag in mode for flag in "wax+"):
                     target: object = None
                     if isinstance(node.func, ast.Name) and node.args:
-                        if isinstance(node.args[0], ast.Constant):
-                            target = node.args[0].value
+                        if safe_output_target(node.args[0]):
+                            target = "analysis_result.json"
                     elif isinstance(node.func, ast.Attribute):
                         owner = node.func.value
-                        if (
-                            isinstance(owner, ast.Call)
-                            and isinstance(owner.func, ast.Name)
-                            and owner.func.id == "Path"
-                            and owner.args
-                            and isinstance(owner.args[0], ast.Constant)
-                        ):
-                            target = owner.args[0].value
+                        if safe_output_target(owner):
+                            target = "analysis_result.json"
                     if str(target or "") != "analysis_result.json":
                         errors.append(
                             "write-mode open is allowed only for analysis_result.json"
@@ -585,7 +677,29 @@ class DiagnosticScriptRunner:
         self.python = str(python)
         self.model_name = model_name
 
-    def _generate(self, mandate: str, analysis: TaskAnalysis, diagnostics: Mapping[str, Any]) -> str:
+    def _generate(
+        self,
+        mandate: str,
+        analysis: TaskAnalysis,
+        diagnostics: Mapping[str, Any],
+        *,
+        previous_code: str = "",
+        feedback: str = "",
+    ) -> str:
+        repair = ""
+        if feedback:
+            repair = f"""
+The previous diagnostic failed. Repair the concrete failure without broadening
+the mandate or weakening the validation method.
+
+Previous code:
+```python
+{previous_code[-12000:]}
+```
+
+Failure evidence:
+{feedback[-5000:]}
+"""
         prompt = f"""
 You are the local evidence investigator for an ML research council.
 
@@ -604,9 +718,30 @@ program must not use the network, subprocesses, shell commands, dynamic imports,
 or modify input files. It may inspect at most 100,000 table rows per file and at
 most 100 media files. It must finish by writing `analysis_result.json` containing
 a JSON object with keys: question, method, findings, limitations, suggested_next_questions.
+Optionally include a top-level `measured_baseline` record: {{"model": str, "model_family": str, "score": float, "mode": str, "folds": int, "split_strategy": str, "sample_size": int, "limitations": str}}.
+When the investigation compares predictive models, include simple regularized
+linear models as credible candidates when applicable. Put estimator-specific
+preprocessing (scaling, encoding, imputation, feature selection) inside each
+validation fold with a Pipeline; do not handicap one family by applying the
+preprocessing preferred by another. The `measured_baseline` must be the best
+actually measured candidate according to the task metric direction, not the
+most complex model or the model named first in the mandate. State its exact
+preprocessing and key hyperparameters in `limitations` or the method text so a
+downstream implementation can reproduce it.
+The entire script may perform at most 20 model fits, with at most two credible
+model configurations evaluated on one shared split or at most five folds. Do not
+put `cross_val_score`, `cross_validate`, or model fitting inside a candidate,
+feature-subset, seed, or hyperparameter loop. Use `n_jobs=1`; expensive tuning and
+feature-subset sweeps belong in later search nodes, not council diagnostics.
 Findings must be measurements, never model recommendations. Write no other file;
 use either `open("analysis_result.json", "w")` or the direct literal
 `Path("analysis_result.json").write_text(...)`. Return only Python code.
+
+CRITICAL AST VALIDATION RULES:
+- Do NOT use `to_csv`, `to_pickle`, `to_parquet`, etc.
+- Do NOT write submission files or save models to disk.
+- If you violate these rules, the sandbox will REJECT your script.
+{repair}
 """.strip()
         response = call_llm(
             "You write safe, resource-bounded data investigation scripts for senior ML researchers.",
@@ -629,24 +764,8 @@ use either `open("analysis_result.json", "w")` or the direct literal
         if work_dir.exists():
             shutil.rmtree(work_dir)
         work_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            code = self._generate(mandate, analysis, diagnostics)
-        except Exception as exc:
-            return {
-                "member_id": member_id,
-                "status": "generation_failed",
-                "error": f"{type(exc).__name__}: {exc}"[:1000],
-            }
-        errors = validate_diagnostic_script(code)
+        available_packages = diagnostics.get("resources", {}).get("packages_available", [])
         source_path = work_dir / "diagnostic.py"
-        source_path.write_text(code, encoding="utf-8")
-        if errors:
-            return {
-                "member_id": member_id,
-                "status": "rejected",
-                "errors": errors,
-                "script": str(source_path),
-            }
         try:
             copy_limit = max(
                 0, int(os.getenv("AIBUILDAI_COUNCIL_COPY_LIMIT_BYTES", "33554432"))
@@ -677,55 +796,173 @@ use either `open("analysis_result.json", "w")` or the direct literal
                 "MKL_NUM_THREADS": "2",
             }
         )
-        completed = run_supervised_process(
-            [self.python, source_path.name],
-            cwd=work_dir,
-            env=env,
-            stall_seconds=90,
-            hard_limit_seconds=240,
-            activity_root=work_dir,
-            label=f"Council diagnostic {member_id}",
-        )
-        (work_dir / "diagnostic.log").write_text(
-            f"returncode: {completed.returncode}\n\nSTDOUT:\n{completed.stdout[-12000:]}"
-            f"\n\nSTDERR:\n{completed.stderr[-12000:]}\n",
-            encoding="utf-8",
-        )
         result_path = work_dir / "analysis_result.json"
-        if completed.returncode != 0 or not result_path.is_file():
-            return {
-                "member_id": member_id,
-                "status": "execution_failed",
-                "returncode": completed.returncode,
-                "stderr": completed.stderr[-2000:],
-                "script": str(source_path),
-            }
-        if result_path.stat().st_size > 1_000_000:
-            return {
-                "member_id": member_id,
-                "status": "rejected",
-                "errors": ["analysis_result.json exceeded 1 MB"],
-                "script": str(source_path),
-            }
         try:
-            payload = json.loads(result_path.read_text(encoding="utf-8"))
-            if not isinstance(payload, dict):
-                raise ValueError("analysis result must be a JSON object")
-        except Exception as exc:
+            max_attempts = max(
+                1, min(5, int(os.getenv("AIBUILDAI_COUNCIL_DIAGNOSTIC_ATTEMPTS", "3")))
+            )
+        except ValueError:
+            max_attempts = 3
+        try:
+            attempt_hard_limit = max(
+                30.0,
+                float(os.getenv("AIBUILDAI_COUNCIL_DIAGNOSTIC_HARD_LIMIT_SECONDS", "120")),
+            )
+        except ValueError:
+            attempt_hard_limit = 120.0
+        try:
+            total_execution_limit = max(
+                attempt_hard_limit,
+                float(os.getenv("AIBUILDAI_COUNCIL_DIAGNOSTIC_TOTAL_SECONDS", "240")),
+            )
+        except ValueError:
+            total_execution_limit = 240.0
+        previous_code = ""
+        feedback = ""
+        execution_seconds = 0.0
+        last_failure: dict[str, Any] = {
+            "member_id": member_id,
+            "status": "generation_failed",
+            "error": "no diagnostic attempt completed",
+        }
+        logs: list[str] = []
+        for attempt in range(1, max_attempts + 1):
+            if execution_seconds >= total_execution_limit:
+                last_failure["budget_exhausted"] = True
+                break
+            try:
+                code = self._generate(
+                    mandate,
+                    analysis,
+                    diagnostics,
+                    previous_code=previous_code,
+                    feedback=feedback,
+                )
+            except Exception as exc:
+                feedback = f"LLM generation failed: {type(exc).__name__}: {exc}"
+                logs.append(f"attempt {attempt}: {feedback}")
+                last_failure = {
+                    "member_id": member_id,
+                    "status": "generation_failed",
+                    "error": feedback[:1000],
+                }
+                continue
+            previous_code = code
+            source_path.write_text(code, encoding="utf-8")
+            errors = validate_diagnostic_script(code, available_packages)
+            if errors:
+                feedback = "AST validation failed:\n- " + "\n- ".join(errors)
+                logs.append(f"attempt {attempt}: {feedback}")
+                last_failure = {
+                    "member_id": member_id,
+                    "status": "rejected",
+                    "errors": errors,
+                    "script": str(source_path),
+                }
+                continue
+            try:
+                result_path.unlink()
+            except FileNotFoundError:
+                pass
+            completed = run_supervised_process(
+                [self.python, source_path.name],
+                cwd=work_dir,
+                env=env,
+                stall_seconds=90,
+                hard_limit_seconds=min(
+                    attempt_hard_limit,
+                    max(1.0, total_execution_limit - execution_seconds),
+                ),
+                activity_root=work_dir,
+                label=f"Council diagnostic {member_id} attempt {attempt}",
+            )
+            execution_seconds += completed.elapsed_seconds
+            attempt_log = (
+                f"attempt {attempt}; returncode: {completed.returncode}; "
+                f"termination_reason: {completed.termination_reason or 'process_exit'}; "
+                f"elapsed_seconds: {completed.elapsed_seconds:.2f}\n\n"
+                f"STDOUT:\n{completed.stdout[-12000:]}\n\n"
+                f"STDERR:\n{completed.stderr[-12000:]}\n"
+            )
+            logs.append(attempt_log)
+            if completed.returncode != 0 or not result_path.is_file():
+                feedback = (
+                    f"Execution failed with return code {completed.returncode}; "
+                    f"termination reason={completed.termination_reason or 'process_exit'}.\n"
+                    f"STDOUT:\n{completed.stdout[-2000:]}\n"
+                    f"STDERR:\n{completed.stderr[-3000:]}"
+                )
+                if completed.hard_limit_reached:
+                    feedback += (
+                        "\nThe diagnostic exceeded its hard runtime budget. Remove model/feature/"
+                        "seed sweeps, use n_jobs=1, and reduce the repair to at most two model "
+                        "configurations and 20 total fits. Do not merely increase a timeout."
+                    )
+                last_failure = {
+                    "member_id": member_id,
+                    "status": "execution_failed",
+                    "returncode": completed.returncode,
+                    "stderr": completed.stderr[-2000:],
+                    "script": str(source_path),
+                    "attempts": attempt,
+                    "termination_reason": completed.termination_reason,
+                    "execution_seconds": execution_seconds,
+                }
+                continue
+            if result_path.stat().st_size > 1_000_000:
+                feedback = "analysis_result.json exceeded 1 MB"
+                last_failure = {
+                    "member_id": member_id,
+                    "status": "rejected",
+                    "errors": [feedback],
+                    "script": str(source_path),
+                    "attempts": attempt,
+                }
+                continue
+            try:
+                payload = json.loads(result_path.read_text(encoding="utf-8"))
+                if not isinstance(payload, dict):
+                    raise ValueError("analysis result must be a JSON object")
+                mb = payload.get("measured_baseline")
+                if mb is not None:
+                    if not isinstance(mb, dict):
+                        logging.warning("measured_baseline is not a dict; dropping it.")
+                        payload.pop("measured_baseline")
+                    else:
+                        score = mb.get("score")
+                        if not isinstance(score, (int, float)) or not math.isfinite(score):
+                            logging.warning("measured_baseline has invalid score; dropping it.")
+                            payload.pop("measured_baseline")
+                        else:
+                            mb["metric"] = analysis.metric
+                            mb["direction"] = analysis.direction
+                            mb["source"] = member_id
+            except Exception as exc:
+                feedback = f"Invalid analysis_result.json: {type(exc).__name__}: {exc}"
+                last_failure = {
+                    "member_id": member_id,
+                    "status": "invalid_result",
+                    "error": feedback,
+                    "script": str(source_path),
+                    "attempts": attempt,
+                }
+                continue
+            (work_dir / "diagnostic.log").write_text(
+                "\n\n".join(logs), encoding="utf-8"
+            )
             return {
                 "member_id": member_id,
-                "status": "invalid_result",
-                "error": f"{type(exc).__name__}: {exc}",
+                "status": "completed",
                 "script": str(source_path),
+                "result": payload,
+                "elapsed_seconds": completed.elapsed_seconds,
+                "attempts": attempt,
+                "input_exposure": (
+                    "read_only_copies" if isolated_copies else "allowlisted_links"
+                ),
+                "approved_input_bytes": approved_size,
             }
-        return {
-            "member_id": member_id,
-            "status": "completed",
-            "script": str(source_path),
-            "result": payload,
-            "elapsed_seconds": completed.elapsed_seconds,
-            "input_exposure": (
-                "read_only_copies" if isolated_copies else "allowlisted_links"
-            ),
-            "approved_input_bytes": approved_size,
-        }
+        (work_dir / "diagnostic.log").write_text(
+            "\n\n".join(logs), encoding="utf-8"
+        )
+        return last_failure

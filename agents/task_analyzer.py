@@ -227,6 +227,29 @@ class TaskAnalysis:
     modalities: list[str] = field(default_factory=list)
 
     @property
+    def contract_warnings(self) -> list[str]:
+        """Surface where generic discovery cannot prove task semantics."""
+        warnings: list[str] = []
+        if self.metric == "task score" and not (
+            self.task_facts.get("metric") or self.task_facts.get("primary_metric")
+        ):
+            warnings.append(
+                "No explicit scalar metric was discovered. Search can run only with a "
+                "task-native measurable objective; declare metric and direction in task_config.json "
+                "for reliable node ranking."
+            )
+        configured_output = any(
+            self.task_facts.get(key) is not None
+            for key in ("output", "submission", "output_contract")
+        )
+        if self.submission is None and not configured_output:
+            warnings.append(
+                "No sample output or declarative output_contract was discovered. Unknown "
+                "formats will receive safety/structural validation only, not domain-semantic validation."
+            )
+        return warnings
+
+    @property
     def report(self) -> str:
         lines = [
             f"# Task inventory: {self.task_name}",
@@ -320,6 +343,9 @@ class TaskAnalysis:
             lines.extend(("", "## Explicit task facts", ""))
             for key, value in self.task_facts.items():
                 lines.append(f"- {key}: {_truncate(value, 800)}")
+        if self.contract_warnings:
+            lines.extend(("", "## Contract warnings", ""))
+            lines.extend(f"- {warning}" for warning in self.contract_warnings)
         return "\n".join(lines).strip() + "\n"
 
     def prompt_context(self, max_chars: int = 24000) -> str:
@@ -341,6 +367,7 @@ class TaskAnalysis:
             "submission": self.submission,
             "task_facts": self.task_facts,
             "modalities": self.modalities,
+            "contract_warnings": self.contract_warnings,
         }
 
 
@@ -497,15 +524,24 @@ class TaskAnalyzer:
 
         if submission is not None and submission.get("kind") == "table":
             rows = submission.get("profile", {}).get("rows")
+            sample_extension = str(submission.get("extension") or "").lower()
             if len(submission_columns) > 10:
                 col_str = f"{len(submission_columns)} columns ({', '.join(map(str, submission_columns[:3]))} ... {', '.join(map(str, submission_columns[-2:]))})"
             else:
                 col_str = f"columns {submission_columns}"
-            expected_output = (
-                f"Write `submission/submission.csv` with {col_str}"
-                + (f" and {rows} data rows" if rows is not None else "")
-                + ", following the provided sample submission."
-            )
+            if sample_extension == ".csv":
+                expected_output = (
+                    f"Write `submission/submission.csv` with {col_str}"
+                    + (f" and {rows} data rows" if rows is not None else "")
+                    + ", following the provided sample submission."
+                )
+            else:
+                expected_output = (
+                    "Write the requested tabular deliverable under `submission/`, "
+                    f"preserving the sample output type `{sample_extension or 'unknown'}` and {col_str}"
+                    + (f" with {rows} data rows" if rows is not None else "")
+                    + ", and record its path in `result.json`."
+                )
         elif submission is not None:
             expected_output = (
                 "Write the requested deliverable under `submission/`, matching the observed "
@@ -541,7 +577,20 @@ class TaskAnalyzer:
             (r"\bmean\s+average\s+precision\b", "mean average precision"),
             (r"\b(?:log\s*loss|logarithmic\s+loss|cross[\s_-]*entropy)\b", "log loss"),
             (r"\b(?:rmse|root\s+mean\s+squared\s+error)\b", "RMSE"),
+            (r"\b(?:mse|mean\s+squared\s+error)\b", "MSE"),
             (r"\b(?:mae|mean\s+absolute\s+error)\b", "MAE"),
+            (r"\b(?:matthews\s+correlation(?:\s+coefficient)?|mcc)\b", "Matthews correlation coefficient"),
+            (r"\bspearman(?:'s)?(?:\s+(?:rho|correlation))?\b", "Spearman correlation"),
+            (r"\bpearson(?:'s)?(?:\s+(?:r|correlation))?\b", "Pearson correlation"),
+            (r"\b(?:r2|r\^2|coefficient\s+of\s+determination)\b", "R2"),
+            (r"\b(?:rmsd|root\s+mean\s+square\s+deviation)\b", "RMSD"),
+            (r"\btm[\s_-]*score\b", "TM-score"),
+            (r"\bperplexity\b", "perplexity"),
+            (r"\bbleu\b", "BLEU"),
+            (r"\brouge(?:-[0-9l]+)?\b", "ROUGE"),
+            (r"\bexact\s+match\b", "exact match"),
+            (r"\bedit\s+distance\b", "edit distance"),
+            (r"\bconcordance\s+index\b", "concordance index"),
             (r"\baccuracy\b", "accuracy"),
             (r"\bf1(?:[\s_-]*score)?\b", "F1"),
             (r"\bdice(?:\s+(?:coefficient|score))?\b", "Dice"),
@@ -557,7 +606,10 @@ class TaskAnalyzer:
         configured_direction = str(task_facts.get("direction", "")).strip().lower()
         direction = (
             configured_direction if configured_direction in {"maximize", "minimize"}
-            else "minimize" if any(word in metric.lower() for word in ("loss", "rmse", "mae", "error"))
+            else "minimize" if any(
+                word in metric.lower()
+                for word in ("loss", "rmse", "rmsd", "mse", "mae", "error", "distance", "perplexity")
+            )
             else "maximize"
         )
 
